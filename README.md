@@ -27,6 +27,18 @@ For development and quick evaluation, double-click
 The launcher builds RepoPrompt CE from source, opens the debug app, and keeps a
 small terminal window available for rebuild, status, and stop controls.
 
+The debug launcher uses an available Apple Development signing identity. If
+your Mac does not have one, run the same debug app from Terminal with explicit
+ad-hoc signing:
+
+```bash
+ALLOW_ADHOC_SIGNING=1 ./conductor app relaunch
+```
+
+Ad-hoc debug builds use in-memory secure storage, so saved API keys and secure
+permission changes do not persist across launches. For a stable locally signed
+app under `/Applications`, use the local production installer below.
+
 > **Note:** If you use the debug app to modify RepoPrompt CE itself, validation
 > flows that launch the app or run live smoke checks may rebuild and relaunch it.
 > Expect the debug app to restart while those checks run.
