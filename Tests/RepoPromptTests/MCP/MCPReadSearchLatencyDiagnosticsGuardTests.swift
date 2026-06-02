@@ -25,6 +25,16 @@
                 "EditFlow.MCPToolCall.ProviderExecution",
                 "EditFlow.MCPToolCall.FormatResult",
                 "EditFlow.ReadFile.ResolveReadableFile",
+                "EditFlow.ReadFile.ExactPathIssueDetection",
+                "EditFlow.ReadFile.RootRefsLookup",
+                "EditFlow.ReadFile.FolderResolution",
+                "EditFlow.ReadFile.ExternalFolderGuard",
+                "EditFlow.ReadFile.ReadableServiceResolution",
+                "EditFlow.ReadFile.ExactCatalogLookupAwait",
+                "EditFlow.ReadFile.ExactCatalogLookupActorBody",
+                "EditFlow.ReadFile.ExplicitMaterialization",
+                "EditFlow.ReadFile.GeneralLookupFallback",
+                "EditFlow.ReadFile.ExternalFileFallback",
                 "EditFlow.ReadFile.WorkspaceContentLoad",
                 "EditFlow.ReadFile.SplitPreservingLineEndings",
                 "EditFlow.ReadFile.BuildSlice",
@@ -34,6 +44,50 @@
             ] {
                 XCTAssertTrue(perf.contains(stage), "Missing attribution stage: \(stage)")
             }
+        }
+
+        func testReadResolutionDecompositionHooksRemainOnExpectedLayers() throws {
+            let viewModel = try source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel.swift")
+            for hook in [
+                "resolveReadableFile",
+                "exactPathIssueDetection",
+                "rootRefsLookup",
+                "folderResolution",
+                "externalFolderGuard",
+                "readableServiceResolution"
+            ] {
+                XCTAssertTrue(viewModel.contains(hook), "Missing view-model read-resolution hook: \(hook)")
+            }
+
+            let readableService = try source("Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceReadableFileService.swift")
+            for hook in [
+                "exactCatalogLookupAwait",
+                "explicitMaterialization",
+                "generalLookupFallback",
+                "externalFileFallback"
+            ] {
+                XCTAssertTrue(readableService.contains(hook), "Missing readable-service resolution hook: \(hook)")
+            }
+
+            let store = try source("Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceFileContextStore.swift")
+            XCTAssertTrue(store.contains("exactCatalogLookupActorBody"))
+            XCTAssertTrue(store.contains("Dimensions(outcome:"))
+        }
+
+        func testReadResolutionDecompositionAvoidsOrdinaryReleaseOutcomeBookkeeping() throws {
+            let viewModel = try source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel.swift")
+            XCTAssertFalse(viewModel.contains("let readableServiceOutcome ="))
+            XCTAssertTrue(viewModel.contains("Dimensions(outcome: {\n                    switch readableFile"))
+
+            let readableService = try source("Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceReadableFileService.swift")
+            XCTAssertFalse(readableService.contains("let exactCatalogLookupOutcome ="))
+            XCTAssertFalse(readableService.contains("let explicitMaterializationOutcome ="))
+            XCTAssertTrue(readableService.contains("Dimensions(outcome: {\n                switch exactCatalogLookup"))
+            XCTAssertTrue(readableService.contains("Dimensions(outcome: {\n                switch materialization"))
+
+            let store = try source("Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceFileContextStore.swift")
+            XCTAssertTrue(store.contains("#if DEBUG || EDIT_FLOW_PERF\n            var exactCatalogLookupOutcome"))
+            XCTAssertTrue(store.contains("#if DEBUG || EDIT_FLOW_PERF\n                exactCatalogLookupOutcome ="))
         }
 
         func testInactiveCaptureFastPathRemainsAtomicAndUnusedOutputBytesIsAbsent() throws {

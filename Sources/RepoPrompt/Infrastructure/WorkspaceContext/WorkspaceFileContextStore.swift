@@ -1841,9 +1841,26 @@ actor WorkspaceFileContextStore {
         _ userPath: String,
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace
     ) -> WorkspaceExplicitCatalogFileLookupResult {
+        #if DEBUG || EDIT_FLOW_PERF
+            var exactCatalogLookupOutcome = "noCandidate"
+            let exactCatalogLookupActorBody = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.exactCatalogLookupActorBody)
+            defer {
+                EditFlowPerf.end(
+                    EditFlowPerf.Stage.ReadFile.exactCatalogLookupActorBody,
+                    exactCatalogLookupActorBody,
+                    EditFlowPerf.Dimensions(outcome: exactCatalogLookupOutcome)
+                )
+            }
+        #endif
+
         let trimmed = userPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return .noCandidate }
-        guard !StandardizedPath.containsNUL(trimmed) else { return .blocked }
+        guard !StandardizedPath.containsNUL(trimmed) else {
+            #if DEBUG || EDIT_FLOW_PERF
+                exactCatalogLookupOutcome = "blocked"
+            #endif
+            return .blocked
+        }
 
         let expanded = (trimmed as NSString).expandingTildeInPath
         let standardized = StandardizedPath.absolute(expanded)
@@ -1857,6 +1874,9 @@ actor WorkspaceFileContextStore {
             let relativePath = String(standardized.dropFirst(root.standardizedFullPath.count))
                 .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
             guard let file = file(rootID: root.id, relativePath: relativePath) else { return .noCandidate }
+            #if DEBUG || EDIT_FLOW_PERF
+                exactCatalogLookupOutcome = "matched"
+            #endif
             return .matched(file)
         }
 
@@ -1867,8 +1887,14 @@ actor WorkspaceFileContextStore {
         ) {
         case let .prefixed(root, _, remainder):
             guard let file = file(rootID: root.id, relativePath: remainder) else { return .noCandidate }
+            #if DEBUG || EDIT_FLOW_PERF
+                exactCatalogLookupOutcome = "matched"
+            #endif
             return .matched(file)
         case .ambiguous:
+            #if DEBUG || EDIT_FLOW_PERF
+                exactCatalogLookupOutcome = "ambiguous"
+            #endif
             return .ambiguous
         case .bareRoot, .notAliasPrefixed:
             break
@@ -1878,10 +1904,24 @@ actor WorkspaceFileContextStore {
         guard !relativePath.isEmpty,
               relativePath != "..",
               !relativePath.hasPrefix("../")
-        else { return .blocked }
+        else {
+            #if DEBUG || EDIT_FLOW_PERF
+                exactCatalogLookupOutcome = "blocked"
+            #endif
+            return .blocked
+        }
         let matches = roots.compactMap { file(rootID: $0.id, relativePath: relativePath) }
-        guard matches.count <= 1 else { return .ambiguous }
-        return matches.first.map(WorkspaceExplicitCatalogFileLookupResult.matched) ?? .noCandidate
+        guard matches.count <= 1 else {
+            #if DEBUG || EDIT_FLOW_PERF
+                exactCatalogLookupOutcome = "ambiguous"
+            #endif
+            return .ambiguous
+        }
+        guard let match = matches.first else { return .noCandidate }
+        #if DEBUG || EDIT_FLOW_PERF
+            exactCatalogLookupOutcome = "matched"
+        #endif
+        return .matched(match)
     }
 
     /// Resolves an exact file path that the caller explicitly requested, even when

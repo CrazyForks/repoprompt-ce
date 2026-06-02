@@ -340,6 +340,16 @@ enum EditFlowPerf {
 
         enum ReadFile {
             static let resolveReadableFile: StaticString = "EditFlow.ReadFile.ResolveReadableFile"
+            static let exactPathIssueDetection: StaticString = "EditFlow.ReadFile.ExactPathIssueDetection"
+            static let rootRefsLookup: StaticString = "EditFlow.ReadFile.RootRefsLookup"
+            static let folderResolution: StaticString = "EditFlow.ReadFile.FolderResolution"
+            static let externalFolderGuard: StaticString = "EditFlow.ReadFile.ExternalFolderGuard"
+            static let readableServiceResolution: StaticString = "EditFlow.ReadFile.ReadableServiceResolution"
+            static let exactCatalogLookupAwait: StaticString = "EditFlow.ReadFile.ExactCatalogLookupAwait"
+            static let exactCatalogLookupActorBody: StaticString = "EditFlow.ReadFile.ExactCatalogLookupActorBody"
+            static let explicitMaterialization: StaticString = "EditFlow.ReadFile.ExplicitMaterialization"
+            static let generalLookupFallback: StaticString = "EditFlow.ReadFile.GeneralLookupFallback"
+            static let externalFileFallback: StaticString = "EditFlow.ReadFile.ExternalFileFallback"
             static let workspaceContentLoad: StaticString = "EditFlow.ReadFile.WorkspaceContentLoad"
             static let splitPreservingLineEndings: StaticString = "EditFlow.ReadFile.SplitPreservingLineEndings"
             static let buildSlice: StaticString = "EditFlow.ReadFile.BuildSlice"

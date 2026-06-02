@@ -2920,22 +2920,60 @@ final class MCPServerViewModel: ObservableObject {
         let store = promptVM.workspaceFileContextStore
         let readableService = WorkspaceReadableFileService(store: store)
         let (roots, readableFile) = try await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.resolveReadableFile) {
-            if let issue = await store.exactPathResolutionIssue(for: path, kind: .either, rootScope: lookupRootScope) {
+            let exactPathIssueDetection = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.exactPathIssueDetection)
+            let exactPathIssue = await store.exactPathResolutionIssue(for: path, kind: .either, rootScope: lookupRootScope)
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.ReadFile.exactPathIssueDetection,
+                exactPathIssueDetection,
+                EditFlowPerf.Dimensions(outcome: exactPathIssue == nil ? "noIssue" : "issue")
+            )
+            if let issue = exactPathIssue {
                 throw MCPError.invalidParams(PathResolutionIssueRenderer.message(for: issue))
             }
 
+            let rootRefsLookup = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.rootRefsLookup)
             let roots = await store.rootRefs(scope: lookupRootScope)
+            EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.rootRefsLookup, rootRefsLookup)
+
+            let folderResolutionStage = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.folderResolution)
             let folderResolution = await store.resolveFolderInput(path, rootScope: lookupRootScope, profile: .mcpRead)
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.ReadFile.folderResolution,
+                folderResolutionStage,
+                EditFlowPerf.Dimensions(outcome: folderResolution.folder == nil ? "noFolder" : "folder")
+            )
             if let folder = folderResolution.folder {
                 let displayPath = folderResolution.displayPath ?? ClientPathFormatter.displayAbsolutePath(fullPath: folder.standardizedFullPath, visibleRoots: roots)
                 throw MCPError.invalidParams("'\(displayPath)' is a folder; read_file requires a file path. Use get_file_tree or file_search to find specific files.")
             }
 
-            if let externalFolderPath = readableService.resolveAlwaysReadableExternalFolderDisplayPath(path) {
+            let externalFolderGuard = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.externalFolderGuard)
+            let externalFolderPath = readableService.resolveAlwaysReadableExternalFolderDisplayPath(path)
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.ReadFile.externalFolderGuard,
+                externalFolderGuard,
+                EditFlowPerf.Dimensions(outcome: externalFolderPath == nil ? "noFolder" : "folder")
+            )
+            if let externalFolderPath {
                 throw MCPError.invalidParams("'\(externalFolderPath)' is a folder; read_file requires a file path. Use get_file_tree or file_search to find specific files.")
             }
 
+            let readableServiceResolution = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.readableServiceResolution)
             let readableFile = await readableService.resolveReadableFile(path, profile: .mcpRead, rootScope: lookupRootScope)
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.ReadFile.readableServiceResolution,
+                readableServiceResolution,
+                EditFlowPerf.Dimensions(outcome: {
+                    switch readableFile {
+                    case .some(.workspace):
+                        "workspace"
+                    case .some(.external):
+                        "external"
+                    case .none:
+                        "noCandidate"
+                    }
+                }())
+            )
             return (roots, readableFile)
         }
         let full: String
