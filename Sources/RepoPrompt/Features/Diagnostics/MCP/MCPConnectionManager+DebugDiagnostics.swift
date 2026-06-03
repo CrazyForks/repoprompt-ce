@@ -39,6 +39,8 @@ import MCP
                 return await debugWaitForReconnectToolPayload(op: op, connectionID: connectionID, arguments: arguments)
             case "clear_routing_state":
                 return debugClearRoutingStateToolPayload(op: op, connectionID: connectionID, arguments: arguments)
+            case "clear_persisted_routing_session":
+                return debugClearPersistedRoutingSessionToolPayload(op: op, arguments: arguments)
             case "seed_routing_affinity":
                 return await debugSeedRoutingAffinityToolPayload(op: op, connectionID: connectionID, arguments: arguments)
             case "shutdown_and_restart":
