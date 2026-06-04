@@ -351,6 +351,16 @@ struct WorkspaceFileSystemDeltaEvent: Equatable {
     let delta: FileSystemDelta
 }
 
+struct WorkspaceIngressBarrierSample: Equatable {
+    let rootID: UUID
+    let rootPath: String
+    let pendingRawEventCountBeforeFlush: Int
+    let acceptedWatcherWatermark: UInt64
+    let publishedServicePublicationSequence: UInt64
+    let appliedServicePublicationSequence: UInt64
+    let appliedWatcherWatermark: UInt64
+}
+
 struct WorkspaceAppliedIndexBatchEvent: Equatable {
     let rootID: UUID
     let rootPath: String

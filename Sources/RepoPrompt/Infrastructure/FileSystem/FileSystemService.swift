@@ -18,6 +18,8 @@ actor FileSystemService {
     // Internal for FileSystemService same-target extensions only.
     // These are not public API; preserve actor isolation when accessing them.
     let fileManager = FileManager.default
+    nonisolated let diagnosticRootToken = UUID()
+    nonisolated let watcherIngressMailbox: FileSystemWatcherIngressMailbox
     static let maxPendingRawEvents = 50000
     static let overflowRescanEventFlags = FSEventStreamEventFlags(
         kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagRootChanged
@@ -33,6 +35,53 @@ actor FileSystemService {
             guard Self.enableDebugLogging else { return }
             print(message())
         #endif
+    }
+
+    @discardableResult
+    func publishFileSystemDeltas(
+        _ deltas: [FileSystemDelta],
+        source: FileSystemDeltaPublicationSource,
+        watcherAcceptedWatermark: FileSystemWatcherIngressMailbox.Watermark? = nil
+    ) -> UInt64 {
+        guard !deltas.isEmpty || watcherAcceptedWatermark != nil || source == .watcherBarrierNoop else {
+            return lastServicePublicationSequence
+        }
+        nextServicePublicationSequence &+= 1
+        let servicePublicationSequence = nextServicePublicationSequence
+        lastServicePublicationSequence = servicePublicationSequence
+        if let watcherAcceptedWatermark {
+            lastPublishedWatcherAcceptedWatermark = max(lastPublishedWatcherAcceptedWatermark, watcherAcceptedWatermark)
+        }
+        let publication = FileSystemDeltaPublication(
+            servicePublicationSequence: servicePublicationSequence,
+            source: source,
+            watcherAcceptedWatermark: watcherAcceptedWatermark,
+            deltas: deltas
+        )
+        #if DEBUG || EDIT_FLOW_PERF
+            let publicationCorrelation = EditFlowPerf.makeLifecycleCorrelationIfActive()
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.FileSystem.servicePublish,
+                correlation: publicationCorrelation,
+                EditFlowPerf.Dimensions(
+                    status: source.rawValue,
+                    changeCount: deltas.count,
+                    rootToken: diagnosticRootToken.uuidString,
+                    ingressSequence: watcherAcceptedWatermark?.rawValue,
+                    barrierSequence: servicePublicationSequence
+                )
+            )
+            guard let publicationCorrelation else {
+                changePublisher.send(publication)
+                return servicePublicationSequence
+            }
+            EditFlowPerf.$currentFileSystemPublicationCorrelation.withValue(publicationCorrelation) {
+                changePublisher.send(publication)
+            }
+        #else
+            changePublisher.send(publication)
+        #endif
+        return servicePublicationSequence
     }
 
     #if DEBUG
@@ -59,6 +108,12 @@ actor FileSystemService {
 
         /// Test-only method to mock directory contents
         var mockDirectoryContents: ((String) -> [String])?
+
+        /// Test-only gate after a watcher batch leaves the pending buffer but before processing.
+        var watcherBatchWillProcessHandler: (@Sendable () async -> Void)?
+
+        /// Test-only hook invoked inside the real-filesystem off-actor content worker before each read.
+        var contentReadChunkHandler: (@Sendable (String) async -> Void)?
     #endif
 
     /// Tracks paths we know about, to detect additions/removals
@@ -70,8 +125,11 @@ actor FileSystemService {
     /// The FSEvent stream reference
     var fseventStreamRef: FSEventStreamRef?
 
-    /// Publishes arrays of deltas whenever changes occur
-    var changePublisher = PassthroughSubject<[FileSystemDelta], Never>()
+    /// Publishes ordered delta envelopes whenever changes or watcher progress occur.
+    var changePublisher = PassthroughSubject<FileSystemDeltaPublication, Never>()
+    var nextServicePublicationSequence: UInt64 = 0
+    var lastServicePublicationSequence: UInt64 = 0
+    var lastPublishedWatcherAcceptedWatermark = FileSystemWatcherIngressMailbox.Watermark.zero
     #if DEBUG
         var lastPublishedDeltaCoalescingDiagnostics: PublishedDeltaCoalescingDiagnostics?
     #endif
@@ -113,10 +171,16 @@ actor FileSystemService {
     var pendingIgnoreChangeDirs: Set<String> = []
 
     // A buffer for raw FSEvents + coalescing logic
-    var pendingFSEvents: [(String, FSEventStreamEventFlags, FSEventStreamEventId)] = []
+    var pendingFSEvents: [PendingFSEvent] = []
+    var pendingWatcherAcceptedHighWatermark: FileSystemWatcherIngressMailbox.Watermark?
+    var pendingWatcherPublicationSource: FileSystemDeltaPublicationSource = .watcher
     var hasPendingOverflowRescan = false
     var overflowChangedIgnoreDirs: Set<String> = []
     var coalescingTask: Task<Void, Never>?
+    var watcherBatchProcessingTask: Task<Void, Never>?
+    var watcherBatchProcessingToken: UInt64?
+    var nextWatcherBatchProcessingToken: UInt64 = 0
+    var watcherIngressGeneration: UInt64 = 0
     let coalescingDelay: TimeInterval = 0.2
 
     // MARK: - Event ID-based scan coalescing (prevents dropped events while deduping bursts)
@@ -187,6 +251,8 @@ actor FileSystemService {
         self.skipSymlinks = skipSymlinks
         self.enableHierarchicalIgnores = enableHierarchicalIgnores
 
+        watcherIngressMailbox = FileSystemWatcherIngressMailbox(maxQueuedRawEntries: Self.maxPendingRawEvents)
+
         // Configure parallelism caps based on available cores
         let cores = ProcessInfo.processInfo.activeProcessorCount
         maxParallelScansPerActor = max(2, min(4, cores / 2))
@@ -219,7 +285,8 @@ actor FileSystemService {
             isTestMode: Bool = false,
             fileManagerOverride: (any FileSystemProviding)? = nil,
             maxParallelScansOverride: Int? = nil,
-            maxFoldersPerBatchOverride: Int? = nil
+            maxFoldersPerBatchOverride: Int? = nil,
+            maxPendingWatcherIngressEntriesOverride: Int? = nil
         ) async throws {
             self.path = path
             rootURL = URL(fileURLWithPath: path).standardizedFileURL
@@ -231,6 +298,10 @@ actor FileSystemService {
             self.enableHierarchicalIgnores = enableHierarchicalIgnores
             self.isTestMode = isTestMode
             self.fileManagerOverride = fileManagerOverride
+
+            watcherIngressMailbox = FileSystemWatcherIngressMailbox(
+                maxQueuedRawEntries: maxPendingWatcherIngressEntriesOverride ?? Self.maxPendingRawEvents
+            )
 
             // Configure parallelism caps (allow test overrides)
             let cores = ProcessInfo.processInfo.activeProcessorCount

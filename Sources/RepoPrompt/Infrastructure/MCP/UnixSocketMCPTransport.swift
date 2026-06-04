@@ -9,6 +9,7 @@
 import Foundation
 import Logging
 import MCP
+import RepoPromptShared
 
 #if DEBUG
     private var unixSocketMCPTransportDebugLoggingEnabled = ProcessInfo.processInfo.environment["REPOPROMPT_MCP_DEBUG"] == "1"
@@ -52,9 +53,32 @@ public actor UnixSocketMCPTransport: Transport {
 
     /// Track fd that the read source is bound to (helps avoid closing wrong fd on reuse)
     private var readSourceFD: Int32?
+    private var readSourceToken: UInt64?
+    private var readSourceSocketOwnershipGeneration: UInt64?
+    private var nextReadSourceToken: UInt64 = 0
+
+    /// Retains cancelled readers until their delayed cancel handlers perform final close.
+    /// The transport retainer intentionally forms a temporary cycle so cleanup does not
+    /// depend on an external manager keeping this actor alive after disconnect returns.
+    private struct PendingReaderCancellation {
+        let fd: Int32
+        let socketOwnershipGeneration: UInt64
+        let reader: NewlineDelimitedSocketReader
+        let transportRetainer: UnixSocketMCPTransport
+    }
+
+    private var pendingReaderCancellations: [UInt64: PendingReaderCancellation] = [:]
+
+    /// Changes whenever socketFD is replaced or synchronously closed.
+    private var socketOwnershipGeneration: UInt64 = 0
 
     /// Optional error captured when read loop terminates (for diagnostics/logging)
     private var readError: Swift.Error?
+
+    #if DEBUG
+        /// Forces the adopted-FD startup path to fail after preparation but before reader ownership.
+        private var failNextExistingFDConnectBeforeReaderStart = false
+    #endif
 
     /// Generation counter that increments on each connection close/open cycle.
     /// Used to detect FD reuse races in the write path.
@@ -114,7 +138,17 @@ public actor UnixSocketMCPTransport: Transport {
         logger: Logger? = nil,
         writeStallTimeout: TimeInterval = 30.0,
         writePollIntervalMilliseconds: Int32 = 250
-    ) {
+    ) throws {
+        do {
+            try POSIXDescriptorSupport.setCloseOnExec(connectedFD)
+        } catch {
+            POSIXDescriptorSupport.shutdownSocketReadWrite(connectedFD)
+            if connectedFD >= 0 {
+                Darwin.close(connectedFD)
+            }
+            throw error
+        }
+
         socketURL = nil
         socketFD = connectedFD
         ownsExistingFD = true
@@ -204,12 +238,7 @@ public actor UnixSocketMCPTransport: Transport {
                     lastError = error
                 } catch {
                     // Other error - fail this connection attempt cleanly.
-                    isConnected = false
-                    isStopping = true
-                    if socketFD >= 0 {
-                        closeSocket()
-                    }
-                    transitionToClosed(error: error)
+                    tearDownSocket(error: error)
                     throw error
                 }
             }
@@ -224,21 +253,12 @@ public actor UnixSocketMCPTransport: Transport {
     }
 
     /// Disconnects from the UNIX socket.
-    /// Order: set flags → stop read source → transition to closed
-    /// The FD is closed by the read source's cancelHandler to avoid use-after-close races.
+    /// Order: shutdown socket → cancel reader → close directly only when no reader owns cleanup.
     public func disconnect() async {
         guard isConnected || !isStopping else { return }
-        isStopping = true
-        isConnected = false
 
         mcpConnectionLog("UnixSocketMCPTransport disconnecting")
-
-        // 1. Cancel read source - its cancelHandler will close the FD
-        stopReadSource()
-
-        // 2. Mark streams closed (idempotent)
-        transitionToClosed(error: MCPError.connectionClosed)
-
+        tearDownSocket(error: MCPError.connectionClosed)
         mcpConnectionLog("UnixSocketMCPTransport disconnect requested")
     }
 
@@ -300,6 +320,13 @@ public actor UnixSocketMCPTransport: Transport {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .ENOENT)
         }
 
+        do {
+            try POSIXDescriptorSupport.setCloseOnExec(fd)
+        } catch {
+            Darwin.close(fd)
+            throw error
+        }
+
         // Set up socket address
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
@@ -345,22 +372,41 @@ public actor UnixSocketMCPTransport: Transport {
             _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
         }
 
+        socketOwnershipGeneration &+= 1
         socketFD = fd
     }
 
-    /// Closes the socket if open.
+    /// Closes the socket if open. Callers that own teardown must issue shutdown first.
     private func closeSocket() {
         if socketFD >= 0 {
             Darwin.close(socketFD)
             socketFD = -1
+            socketOwnershipGeneration &+= 1
         }
+    }
+
+    /// Wakes blocked I/O and deterministically transfers final-close responsibility.
+    /// If a reader exists, its cancel handler remains the sole final-close owner to
+    /// avoid a stale callback closing a reused descriptor number.
+    private func tearDownSocket(error: Swift.Error?) {
+        isConnected = false
+        isStopping = true
+
+        if socketFD >= 0 {
+            POSIXDescriptorSupport.shutdownSocketReadWrite(socketFD)
+        }
+        stopReadSource()
+        if !pendingReaderCancellationOwnsCurrentSocket() {
+            closeSocket()
+        }
+        transitionToClosed(error: error)
     }
 
     private func connectExistingFD() throws {
         if isConnected {
             guard reader != nil else {
                 let error = MCPError.connectionClosed
-                transitionToClosed(error: error)
+                tearDownSocket(error: error)
                 throw error
             }
             return
@@ -368,7 +414,7 @@ public actor UnixSocketMCPTransport: Transport {
 
         guard !streamFinished, !closeSignaled, socketFD >= 0 else {
             let error = MCPError.connectionClosed
-            transitionToClosed(error: error)
+            tearDownSocket(error: error)
             throw error
         }
 
@@ -380,18 +426,38 @@ public actor UnixSocketMCPTransport: Transport {
             var noSigPipe: Int32 = 1
             setsockopt(socketFD, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
 
+            #if DEBUG
+                if failNextExistingFDConnectBeforeReaderStart {
+                    failNextExistingFDConnectBeforeReaderStart = false
+                    throw DebugExistingFDConnectFailure()
+                }
+            #endif
+
             try startReadSource(fd: socketFD)
             isConnected = true
             isStopping = false
             lastActivityTime = Date()
             unixSocketMCPTransportDebugLog("started with existing FD \(socketFD)")
         } catch {
-            isConnected = false
-            isStopping = true
-            transitionToClosed(error: error)
+            tearDownSocket(error: error)
             throw error
         }
     }
+
+    #if DEBUG
+        private struct DebugExistingFDConnectFailure: Swift.Error {}
+
+        func debugSocketHasCloseOnExec() -> Bool? {
+            guard socketFD >= 0 else { return nil }
+            let flags = fcntl(socketFD, F_GETFD)
+            guard flags >= 0 else { return nil }
+            return flags & FD_CLOEXEC != 0
+        }
+
+        func debugFailNextExistingFDConnectBeforeReaderStart() {
+            failNextExistingFDConnectBeforeReaderStart = true
+        }
+    #endif
 
     private nonisolated static func ensureNonBlocking(fd: Int32) throws {
         let flags = fcntl(fd, F_GETFL)
@@ -531,16 +597,7 @@ public actor UnixSocketMCPTransport: Transport {
 
     private func closeAfterSendFailure(_ error: Swift.Error) {
         logger.error("UnixSocketMCPTransport send failed; closing transport: \(String(describing: error))")
-        isConnected = false
-        isStopping = true
-        if socketFD >= 0 {
-            _ = shutdown(socketFD, SHUT_RDWR)
-        }
-        stopReadSource()
-        if reader == nil {
-            closeSocket()
-        }
-        transitionToClosed(error: error)
+        tearDownSocket(error: error)
     }
 
     private struct UnixSocketWriteStalledError: Swift.Error, CustomStringConvertible {
@@ -561,7 +618,11 @@ public actor UnixSocketMCPTransport: Transport {
         stopReadSource()
 
         // Track which FD this source is bound to
+        nextReadSourceToken &+= 1
+        let token = nextReadSourceToken
         readSourceFD = fd
+        readSourceToken = token
+        readSourceSocketOwnershipGeneration = socketOwnershipGeneration
 
         let cont = messageContinuation
         let log = logger
@@ -583,8 +644,8 @@ public actor UnixSocketMCPTransport: Transport {
             },
             onBytesRead: { Task { self.noteActivity() } },
             onCancel: { [weak self] in
-                mcpConnectionLog("UnixSocketMCPTransport read source cancelled for fd=\(fd)")
-                Task { await self?.readSourceDidCancel(fd: fd) }
+                mcpConnectionLog("UnixSocketMCPTransport read source cancelled for fd=\(fd) token=\(token)")
+                Task { await self?.readSourceDidCancel(fd: fd, token: token) }
             }
         )
 
@@ -594,6 +655,8 @@ public actor UnixSocketMCPTransport: Transport {
         } catch {
             reader = nil
             readSourceFD = nil
+            readSourceToken = nil
+            readSourceSocketOwnershipGeneration = nil
             throw error
         }
         mcpConnectionLog("UnixSocketMCPTransport read source started for fd=\(fd)")
@@ -601,48 +664,76 @@ public actor UnixSocketMCPTransport: Transport {
 
     /// Stops the read source. Does NOT close the FD - that happens in cancelHandler.
     private func stopReadSource() {
-        reader?.stop()
-        // Note: reader cleanup happens in readSourceDidCancel
+        guard let reader else { return }
+        guard let fd = readSourceFD,
+              let token = readSourceToken,
+              let socketOwnershipGeneration = readSourceSocketOwnershipGeneration
+        else {
+            self.reader = nil
+            readSourceFD = nil
+            readSourceToken = nil
+            readSourceSocketOwnershipGeneration = nil
+            reader.stop()
+            return
+        }
+
+        pendingReaderCancellations[token] = PendingReaderCancellation(
+            fd: fd,
+            socketOwnershipGeneration: socketOwnershipGeneration,
+            reader: reader,
+            transportRetainer: self
+        )
+        self.reader = nil
+        readSourceFD = nil
+        readSourceToken = nil
+        readSourceSocketOwnershipGeneration = nil
+        reader.stop()
+        // Note: retained reader cleanup happens in readSourceDidCancel
+    }
+
+    private func pendingReaderCancellationOwnsCurrentSocket() -> Bool {
+        pendingReaderCancellations.values.contains { ownership in
+            ownership.fd == socketFD &&
+                ownership.socketOwnershipGeneration == socketOwnershipGeneration
+        }
     }
 
     /// Called by the read source's cancel handler. Closes the FD safely.
-    private func readSourceDidCancel(fd: Int32) {
-        // Only close if this source still matches the current socketFD
-        if socketFD == fd {
-            closeSocket()
+    private func readSourceDidCancel(fd: Int32, token: UInt64) {
+        guard let ownership = pendingReaderCancellations.removeValue(forKey: token) else { return }
+        guard ownership.fd == fd else {
+            logger.error("UnixSocketMCPTransport reader cancellation fd mismatch for token=\(token)")
+            return
         }
 
-        // Only clear readSource if this cancel corresponds to the current source.
-        // This prevents accidentally nuking a newer source if we ever reconnect.
-        if readSourceFD == fd {
-            readSourceFD = nil
-            reader = nil
+        if socketFD == fd, socketOwnershipGeneration != ownership.socketOwnershipGeneration {
+            logger.warning("UnixSocketMCPTransport skipping stale reader cancellation close for reused fd=\(fd)")
+            return
         }
-        // else: this cancel corresponds to an old source; do not touch the current one
+
+        Darwin.close(fd)
+        if socketFD == fd {
+            socketFD = -1
+            socketOwnershipGeneration &+= 1
+        }
     }
 
     /// Called when read encounters an error.
     private func handleReadError(error: Swift.Error) {
         readError = error
-        isConnected = false
-        isStopping = true
-        stopReadSource() // Cancel read source so FD gets closed via cancelHandler
-        transitionToClosed(error: error)
+        tearDownSocket(error: error)
     }
 
     /// Called when read encounters EOF.
     /// - Parameter hasResidualData: If true, buffer had incomplete frame data
     private func handleReadEOF(hasResidualData: Bool) {
-        isConnected = false
-        isStopping = true
-        stopReadSource() // Cancel read source so FD gets closed via cancelHandler
         if hasResidualData {
             // Treat residual incomplete frame as a protocol error
             let truncationError = MCPError.internalError("Connection closed with incomplete frame data")
             readError = truncationError
-            transitionToClosed(error: truncationError)
+            tearDownSocket(error: truncationError)
         } else {
-            transitionToClosed(error: nil)
+            tearDownSocket(error: nil)
         }
     }
 

@@ -1,3 +1,4 @@
+import CoreServices
 import Foundation
 #if DEBUG || EDIT_FLOW_PERF
     import os
@@ -41,6 +42,33 @@ public enum FileSystemDelta: Sendable, Equatable {
     case folderRemoved(String)
     case fileModified(String, Date?) // observed disk mtime when available
     case folderModified(String, Date? = nil) // observed disk mtime when available
+}
+
+enum FileSystemDeltaPublicationSource: String {
+    case watcher
+    case syntheticMutation
+    case watcherBarrierNoop
+    case overflowRootRescan
+}
+
+struct FileSystemDeltaPublication {
+    let servicePublicationSequence: UInt64
+    let source: FileSystemDeltaPublicationSource
+    let watcherAcceptedWatermark: FileSystemWatcherIngressMailbox.Watermark?
+    let deltas: [FileSystemDelta]
+}
+
+typealias PendingFSEvent = (path: String, flags: FSEventStreamEventFlags, id: FSEventStreamEventId)
+
+struct PendingFSEventBatch {
+    var events: [PendingFSEvent] = []
+    var watcherAcceptedHighWatermark: FileSystemWatcherIngressMailbox.Watermark?
+    var publicationSource: FileSystemDeltaPublicationSource = .watcher
+    var watcherIngressGeneration: UInt64?
+
+    var isEmpty: Bool {
+        events.isEmpty
+    }
 }
 
 public enum CatalogRegularFileIneligibilityReason: Sendable, Equatable, CustomStringConvertible {
@@ -107,6 +135,14 @@ enum LoadContentsEvent {
     case totalFileCount(Int) // emitted at least once, first emission precedes item payloads
     case items([(any FileSystemItem, [String])]) // legacy compatibility
     case preparedItems(FSPreparedChunk) // preferred streaming payload
+}
+
+enum ContentReadWorkloadClass: String {
+    case interactiveRead
+    case contentSearch
+    case codemap
+    case encodingDetection
+    case unspecified
 }
 
 // MARK: - Encoding support -----------------------------------------------------

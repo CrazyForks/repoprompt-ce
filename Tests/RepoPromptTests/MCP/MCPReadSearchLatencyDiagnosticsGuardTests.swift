@@ -1,10 +1,14 @@
 #if DEBUG
+    import Combine
     @testable import RepoPrompt
     import XCTest
 
     final class MCPReadSearchLatencyDiagnosticsGuardTests: XCTestCase {
+        private var temporaryRoots = FileSystemTemporaryRoots()
+
         override func tearDown() {
             EditFlowPerf.resetDebugCaptureForTesting()
+            temporaryRoots.removeAll()
             super.tearDown()
         }
 
@@ -84,9 +88,21 @@
                 "EditFlow.ReadFile.WorkspaceContentLoad",
                 "EditFlow.ReadFile.SplitPreservingLineEndings",
                 "EditFlow.ReadFile.BuildSlice",
+                "EditFlow.ReadFile.AutoSelect.ResponseEnqueue",
+                "EditFlow.ReadFile.AutoSelect.CanonicalQueueWait",
+                "EditFlow.ReadFile.AutoSelect.CanonicalMutation",
+                "EditFlow.ReadFile.AutoSelect.CanonicalStoredCommit",
+                "EditFlow.ReadFile.AutoSelect.MirrorEnqueue",
+                "EditFlow.ReadFile.AutoSelect.MirrorQueueWait",
+                "EditFlow.ReadFile.AutoSelect.MirrorApply",
+                "EditFlow.ReadFile.AutoSelect.DrainWait",
+                "EditFlow.WorkspaceDurability.FlushWait",
+                "EditFlow.WorkspaceDurability.AtomicWrite",
                 "EditFlow.Search.CatalogSnapshot",
                 "EditFlow.Search.DTOBuild",
-                "EditFlow.FileSystem.ContentLoadActorBody"
+                "EditFlow.Search.BroadAdmissionWait",
+                "EditFlow.FileSystem.ContentLoadActorBody",
+                "EditFlow.FileSystem.ContentReadWorkerPermitWait"
             ] {
                 XCTAssertTrue(perf.contains(stage), "Missing attribution stage: \(stage)")
             }
@@ -195,7 +211,9 @@
             ] {
                 XCTAssertTrue(viewModel.contains(hook), "Missing runTool decomposition hook: \(hook)")
             }
-            XCTAssertTrue(viewModel.contains("EditFlowPerf.Stage.MCPToolCall.providerExecution,\n                    EditFlowPerf.Dimensions(toolName: name)"))
+            let providerExecution = try XCTUnwrap(viewModel.range(of: "EditFlowPerf.Stage.MCPToolCall.providerExecution,"))
+            let providerInvocation = viewModel[providerExecution.lowerBound...].prefix(180)
+            XCTAssertTrue(providerInvocation.contains("EditFlowPerf.Dimensions(toolName: name)"))
             XCTAssertTrue(viewModel.contains("result = try await withThrowingTaskGroup(of: T.self)"))
             XCTAssertEqual(viewModel.components(separatedBy: "EditFlowPerf.Stage.MCPToolCall.runToolCompletionCleanup,").count - 1, 4)
         }
@@ -520,7 +538,7 @@
 
             let autoSelect = try XCTUnwrap(method.range(of: "EditFlowPerf.Stage.ReadFile.providerAutoSelect"))
             let conditional = try XCTUnwrap(method.range(of: "if readResult.shouldAutoSelect", range: autoSelect.upperBound ..< method.endIndex))
-            let autoSelectCall = try XCTUnwrap(method.range(of: "await dependencies.maybeAutoSelectReadFileSelection", range: conditional.upperBound ..< method.endIndex))
+            let autoSelectCall = try XCTUnwrap(method.range(of: "await dependencies.enqueueReadFileAutoSelection", range: conditional.upperBound ..< method.endIndex))
             XCTAssertLessThan(autoSelect.lowerBound, conditional.lowerBound)
             XCTAssertLessThan(conditional.lowerBound, autoSelectCall.lowerBound)
 
@@ -583,6 +601,14 @@
                 "EditFlow.ReadFile.AutoSelect.FullSliceClearing",
                 "EditFlow.ReadFile.AutoSelect.FinalSelectionEquality",
                 "EditFlow.ReadFile.AutoSelect.Persistence",
+                "EditFlow.ReadFile.AutoSelect.ResponseEnqueue",
+                "EditFlow.ReadFile.AutoSelect.CanonicalQueueWait",
+                "EditFlow.ReadFile.AutoSelect.CanonicalMutation",
+                "EditFlow.ReadFile.AutoSelect.CanonicalStoredCommit",
+                "EditFlow.ReadFile.AutoSelect.MirrorEnqueue",
+                "EditFlow.ReadFile.AutoSelect.MirrorQueueWait",
+                "EditFlow.ReadFile.AutoSelect.MirrorApply",
+                "EditFlow.ReadFile.AutoSelect.DrainWait",
                 "EditFlow.ReadFile.AutoSelect.SliceFlowTotal"
             ] {
                 XCTAssertTrue(perf.contains(stage), "Missing nested auto-select attribution stage: \(stage)")
@@ -641,7 +667,7 @@
         func testProviderAutoSelectDecompositionKeepsAwaitOrderingAndCoarseOutcomes() throws {
             let provider = try source("Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPFileToolProvider.swift")
             let replyProjection = try XCTUnwrap(provider.range(of: "EditFlowPerf.Stage.ReadFile.providerReplyProjection"))
-            let dependencyAwait = try XCTUnwrap(provider.range(of: "await dependencies.maybeAutoSelectReadFileSelection", range: replyProjection.upperBound ..< provider.endIndex))
+            let dependencyAwait = try XCTUnwrap(provider.range(of: "await dependencies.enqueueReadFileAutoSelection", range: replyProjection.upperBound ..< provider.endIndex))
             let valueEncoding = try XCTUnwrap(provider.range(of: "EditFlowPerf.Stage.ReadFile.providerValueEncoding", range: dependencyAwait.upperBound ..< provider.endIndex))
             XCTAssertLessThan(replyProjection.lowerBound, dependencyAwait.lowerBound)
             XCTAssertLessThan(dependencyAwait.lowerBound, valueEncoding.lowerBound)
@@ -697,6 +723,66 @@
                     !$0.sanitizedDimensions.contains("payload") &&
                     !$0.sanitizedDimensions.contains("namespace")
             })
+        }
+
+        func testReadFileAutoSelectionQueueAndDurabilityHooksRemainOwnedByCoordinatorAndDiskWriter() throws {
+            let coordinator = try source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPReadFileAutoSelectionCoordinator.swift")
+            for hook in [
+                "responseEnqueue",
+                "canonicalQueueWait",
+                "canonicalMutation",
+                "mirrorEnqueue",
+                "mirrorQueueWait",
+                "mirrorApply",
+                "drainWait"
+            ] {
+                XCTAssertTrue(coordinator.contains("Stage.ReadFile.AutoSelect.\(hook)"), "Missing coordinator attribution hook: \(hook)")
+            }
+            let viewModel = try source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel+TabContext.swift")
+            XCTAssertTrue(viewModel.contains("Stage.ReadFile.AutoSelect.canonicalStoredCommit"))
+
+            let workspaceManager = try source("Sources/RepoPrompt/Features/Workspaces/ViewModels/WorkspaceManagerViewModel.swift")
+            XCTAssertTrue(workspaceManager.contains("Stage.WorkspaceDurability.flushWait"))
+            XCTAssertTrue(workspaceManager.contains("Stage.WorkspaceDurability.atomicWrite"))
+            XCTAssertFalse(coordinator.contains("EditFlowPerf.Dimensions(path:"))
+            XCTAssertFalse(workspaceManager.contains("EditFlowPerf.Dimensions(path:"))
+        }
+
+        func testReadFileAutoSelectionQueueRecorderCapturesSanitizedStagesAndLifecycle() throws {
+            _ = startedCapture(label: "read-file-auto-selection-queue", maxSamples: 100)
+            let correlation = try XCTUnwrap(EditFlowPerf.makeLifecycleCorrelationIfActive())
+            let samples: [StaticString] = [
+                EditFlowPerf.Stage.ReadFile.AutoSelect.responseEnqueue,
+                EditFlowPerf.Stage.ReadFile.AutoSelect.canonicalQueueWait,
+                EditFlowPerf.Stage.ReadFile.AutoSelect.canonicalMutation,
+                EditFlowPerf.Stage.ReadFile.AutoSelect.canonicalStoredCommit,
+                EditFlowPerf.Stage.ReadFile.AutoSelect.mirrorEnqueue,
+                EditFlowPerf.Stage.ReadFile.AutoSelect.mirrorQueueWait,
+                EditFlowPerf.Stage.ReadFile.AutoSelect.mirrorApply,
+                EditFlowPerf.Stage.ReadFile.AutoSelect.drainWait,
+                EditFlowPerf.Stage.WorkspaceDurability.flushWait,
+                EditFlowPerf.Stage.WorkspaceDurability.atomicWrite
+            ]
+            for stage in samples {
+                EditFlowPerf.measure(stage, EditFlowPerf.Dimensions(outcome: "success", queueDepth: 1)) {}
+            }
+            for event in [
+                EditFlowPerf.Lifecycle.ReadFileAutoSelect.enqueueAccepted,
+                EditFlowPerf.Lifecycle.ReadFileAutoSelect.canonicalApplyBegan,
+                EditFlowPerf.Lifecycle.ReadFileAutoSelect.mirrorScheduled,
+                EditFlowPerf.Lifecycle.ReadFileAutoSelect.mirrorApplyEnded,
+                EditFlowPerf.Lifecycle.ReadFileAutoSelect.drainEnded,
+                EditFlowPerf.Lifecycle.WorkspaceDurability.flushEnded,
+                EditFlowPerf.Lifecycle.WorkspaceDurability.writeEnded
+            ] {
+                EditFlowPerf.lifecycleEvent(event, correlation: correlation, EditFlowPerf.Dimensions(outcome: "success"))
+            }
+
+            let snapshot = EditFlowPerf.debugCaptureSnapshot(finish: true)
+            XCTAssertEqual(snapshot.retainedSampleCount, samples.count)
+            XCTAssertEqual(snapshot.retainedLifecycleEventCount, 7)
+            XCTAssertTrue(snapshot.stages.allSatisfy { !$0.sanitizedDimensions.contains("/") })
+            XCTAssertTrue(snapshot.lifecycleEvents.allSatisfy { !$0.sanitizedDimensions.contains("/") })
         }
 
         func testAcceptedFileAPIFilterInnerAttributionRemainsBehaviorNeutralScopedAndOrdered() throws {
@@ -887,7 +973,7 @@
             let unloadEnd = try XCTUnwrap(store.range(of: "    func file(rootID: UUID, relativePath: String)", range: unloadStart.upperBound ..< store.endIndex))
             let unload = String(store[unloadStart.lowerBound ..< unloadEnd.lowerBound])
             let rootDetach = try XCTUnwrap(unload.range(of: "rootStatesByID.removeValue(forKey: rootID)"))
-            let stopWatching = try XCTUnwrap(unload.range(of: "await entry.state.service.stopWatchingForChanges()"))
+            let stopWatching = try XCTUnwrap(unload.range(of: "await reconcileWatcherServiceState(entry.state.service, rootID: entry.rootID)"))
             let managedOnlyCleanup = try XCTUnwrap(unload.range(of: "managedOnlyFileIDs.remove(fileID)"))
             let rootSnapshotCleanup = try XCTUnwrap(unload.range(of: "removeCodemapSnapshots(forRootID: rootID)"))
             XCTAssertLessThan(rootDetach.lowerBound, stopWatching.lowerBound)
@@ -1054,6 +1140,7 @@
 
             let upperBound = startedCapture(label: "upper", maxSamples: 100_001)
             XCTAssertEqual(upperBound.maxSamples, 100_000)
+            XCTAssertEqual(upperBound.maxLifecycleEvents, 20000)
         }
 
         func testUnsafeSyntheticLabelAndDimensionsAreSanitizedAndBounded() throws {
@@ -1100,6 +1187,424 @@
             XCTAssertTrue(aggregate.sanitizedDimensions.contains("tool=read_file"))
             XCTAssertFalse(aggregate.sanitizedDimensions.contains("/"))
             XCTAssertFalse(aggregate.sanitizedDimensions.contains("namespace"))
+        }
+
+        func testLifecycleEventInventoryAndHiddenTimelineToggleRemainPresent() throws {
+            let perf = try source("Sources/RepoPrompt/Infrastructure/Diffing/EditFlowPerf.swift")
+            for eventName in [
+                "MCP.ToolCall.Received",
+                "MCP.ToolCall.RoutingSnapshotCompleted",
+                "MCP.ToolCall.LimiterWaitBegan",
+                "MCP.ToolCall.LimiterAcquired",
+                "MCP.ToolCall.CompletionObserverReturned",
+                "MCP.RunTool.PreflushBegan",
+                "MCP.RunTool.PreflushEnded",
+                "MCP.RunTool.RegistrationScheduled",
+                "MCP.RunTool.RegistrationMainActorEntered",
+                "MCP.RunTool.RegistrationEnded",
+                "MCP.RunTool.ProviderBegan",
+                "MCP.RunTool.ProviderEnded",
+                "MCP.RunTool.CleanupScheduled",
+                "MCP.RunTool.CleanupMainActorEntered",
+                "MCP.RunTool.Unregister",
+                "MCP.RunTool.IdleWaitersResumed",
+                "MCP.RunTool.CleanupEnded",
+                "MCP.RunTool.Return",
+                "FileSystem.CallbackAccepted",
+                "FileSystem.ServiceEnqueueEntered",
+                "FileSystem.ServicePublish",
+                "FileSystem.ContentReadWorkerPermitWaitBegan",
+                "FileSystem.ContentReadWorkerPermitAcquired",
+                "FileSystem.ContentReadWorkerPermitCancelled",
+                "Search.BroadAdmissionWaitBegan",
+                "Search.BroadAdmissionPermitAcquired",
+                "Search.BroadAdmissionPermitCancelled",
+                "Search.BroadAdmissionPermitReleased",
+                "WorkspaceIngress.StoreSinkScheduled",
+                "WorkspaceIngress.StoreSinkBegan",
+                "WorkspaceIngress.StoreCanonicalApplyCompleted",
+                "WorkspaceIngress.RootFlushBegan",
+                "WorkspaceIngress.RootFlushEnded",
+                "ReadFile.AutoSelect.EnqueueAccepted",
+                "ReadFile.AutoSelect.EnqueueCoalesced",
+                "ReadFile.AutoSelect.CanonicalApplyBegan",
+                "ReadFile.AutoSelect.CanonicalApplyEnded",
+                "ReadFile.AutoSelect.MirrorScheduled",
+                "ReadFile.AutoSelect.MirrorCoalesced",
+                "ReadFile.AutoSelect.MirrorApplyBegan",
+                "ReadFile.AutoSelect.MirrorApplyEnded",
+                "ReadFile.AutoSelect.DrainBegan",
+                "ReadFile.AutoSelect.DrainEnded",
+                "WorkspaceDurability.FlushBegan",
+                "WorkspaceDurability.FlushEnded",
+                "WorkspaceDurability.WriteBegan",
+                "WorkspaceDurability.WriteEnded"
+            ] {
+                XCTAssertTrue(perf.contains(eventName), "Missing lifecycle event inventory entry: \(eventName)")
+            }
+
+            let sibling = try source("Sources/RepoPrompt/Features/Diagnostics/MCP/MCPConnectionManager+DebugDiagnosticsReadSearchLatency.swift")
+            XCTAssertTrue(sibling.contains("include_timeline"))
+            XCTAssertTrue(sibling.contains("snapshot.payload(includeTimeline: includeTimeline)"))
+        }
+
+        func testLifecycleTimelinePreservesCorrelationOrderingAndSanitizesDimensions() throws {
+            _ = startedCapture(label: "timeline", maxSamples: 100)
+            let correlation = try XCTUnwrap(EditFlowPerf.makeLifecycleCorrelationIfActive())
+            let unsafe = "unsafe /:|\\n" + String(repeating: "x", count: 100)
+
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.MCPToolCall.received,
+                correlation: correlation,
+                EditFlowPerf.Dimensions(
+                    toolName: unsafe,
+                    workloadClass: unsafe,
+                    rootToken: unsafe,
+                    queueDepth: -1,
+                    waiterCount: -2
+                )
+            )
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.MCPToolCall.routingSnapshotCompleted,
+                correlation: correlation,
+                EditFlowPerf.Dimensions(toolName: "read_file")
+            )
+
+            let snapshot = EditFlowPerf.debugCaptureSnapshot(finish: true)
+            XCTAssertEqual(snapshot.maxLifecycleEvents, 100)
+            XCTAssertEqual(snapshot.retainedLifecycleEventCount, 2)
+            XCTAssertEqual(snapshot.droppedLifecycleEventCount, 0)
+            XCTAssertEqual(snapshot.lifecycleEvents.map(\.ordinal), [1, 2])
+            XCTAssertEqual(snapshot.lifecycleEvents.map(\.eventName), [
+                "MCP.ToolCall.Received",
+                "MCP.ToolCall.RoutingSnapshotCompleted"
+            ])
+            XCTAssertEqual(Set(snapshot.lifecycleEvents.map(\.correlationID)).count, 1)
+            XCTAssertTrue(snapshot.lifecycleEvents[0].sanitizedDimensions.contains("queueDepth=0"))
+            XCTAssertTrue(snapshot.lifecycleEvents[0].sanitizedDimensions.contains("waiterCount=0"))
+            XCTAssertTrue(snapshot.lifecycleEvents[0].sanitizedDimensions.contains("workloadClass=unsafe"))
+            XCTAssertFalse(snapshot.lifecycleEvents[0].sanitizedDimensions.contains("/"))
+            XCTAssertFalse(snapshot.lifecycleEvents[0].sanitizedDimensions.contains("|"))
+        }
+
+        func testLifecycleTimelineBoundReportsDroppedEventsWithoutConsumingIntervalBudget() throws {
+            _ = startedCapture(label: "timeline-bound", maxSamples: 100)
+            let correlation = try XCTUnwrap(EditFlowPerf.makeLifecycleCorrelationIfActive())
+            for _ in 0 ..< 101 {
+                EditFlowPerf.lifecycleEvent(
+                    EditFlowPerf.Lifecycle.MCPToolCall.received,
+                    correlation: correlation,
+                    EditFlowPerf.Dimensions(toolName: "read_file")
+                )
+            }
+
+            let snapshot = EditFlowPerf.debugCaptureSnapshot(finish: true)
+            XCTAssertEqual(snapshot.retainedSampleCount, 0)
+            XCTAssertEqual(snapshot.droppedSampleCount, 0)
+            XCTAssertEqual(snapshot.maxLifecycleEvents, 100)
+            XCTAssertEqual(snapshot.retainedLifecycleEventCount, 100)
+            XCTAssertEqual(snapshot.droppedLifecycleEventCount, 1)
+            XCTAssertEqual(snapshot.lifecycleEvents.count, 100)
+        }
+
+        func testStaleLifecycleCorrelationCannotContaminateNextCapture() throws {
+            _ = startedCapture(label: "timeline-a", maxSamples: 100)
+            let staleCorrelation = try XCTUnwrap(EditFlowPerf.makeLifecycleCorrelationIfActive())
+            _ = EditFlowPerf.debugCaptureSnapshot(finish: true)
+
+            _ = startedCapture(label: "timeline-b", maxSamples: 100)
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.MCPToolCall.received,
+                correlation: staleCorrelation,
+                EditFlowPerf.Dimensions(toolName: "read_file")
+            )
+
+            let snapshot = EditFlowPerf.debugCaptureSnapshot(finish: true)
+            XCTAssertEqual(snapshot.label, "timeline-b")
+            XCTAssertEqual(snapshot.retainedLifecycleEventCount, 0)
+            XCTAssertEqual(snapshot.droppedLifecycleEventCount, 0)
+            XCTAssertTrue(snapshot.lifecycleEvents.isEmpty)
+        }
+
+        func testInactiveLifecycleEventDoesNotEvaluateDimensionsAndAggregateOnlyPayloadOmitsTimeline() throws {
+            var dimensionsEvaluated = false
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.MCPToolCall.received,
+                correlation: nil,
+                EditFlowPerf.Dimensions(toolName: {
+                    dimensionsEvaluated = true
+                    return "should_not_evaluate"
+                }())
+            )
+            XCTAssertFalse(dimensionsEvaluated)
+
+            _ = startedCapture(label: "aggregate-only", maxSamples: 100)
+            let correlation = try XCTUnwrap(EditFlowPerf.makeLifecycleCorrelationIfActive())
+            EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.MCPToolCall.received, correlation: correlation)
+            let payload = EditFlowPerf.debugCaptureSnapshot(finish: true).payload(includeTimeline: false)
+            XCTAssertEqual(payload["timeline_included"] as? Bool, false)
+            XCTAssertNil(payload["lifecycle_events"])
+            XCTAssertEqual(payload["retained_lifecycle_event_count"] as? Int, 1)
+        }
+
+        func testWithConnectionIDScopesLifecycleCorrelationAcrossChildTaskAndRestoresIt() async throws {
+            _ = startedCapture(label: "connection-task-local", maxSamples: 100)
+            let correlation = try XCTUnwrap(EditFlowPerf.makeLifecycleCorrelationIfActive())
+            XCTAssertNil(EditFlowPerf.currentLifecycleCorrelation)
+
+            let observed = await ServerNetworkManager.withConnectionID(UUID(), lifecycleCorrelation: correlation) {
+                let immediate = EditFlowPerf.currentLifecycleCorrelation?.id
+                let child = await Task { EditFlowPerf.currentLifecycleCorrelation?.id }.value
+                return (immediate, child)
+            }
+
+            XCTAssertEqual(observed.0, correlation.id)
+            XCTAssertEqual(observed.1, correlation.id)
+            XCTAssertNil(EditFlowPerf.currentLifecycleCorrelation)
+            _ = EditFlowPerf.debugCaptureSnapshot(finish: true)
+        }
+
+        func testFileSystemPublicationScopesCorrelationDuringSynchronousSinkAndChildTask() async throws {
+            let root = try temporaryRoots.makeRoot(suiteName: "FileSystemPublicationCorrelation")
+            let service = try await FileSystemService(
+                path: root.path,
+                respectGitignore: false,
+                respectRepoIgnore: false,
+                respectCursorignore: false,
+                skipSymlinks: true
+            )
+            let publisher = await service.publisherForChanges()
+            let childTaskCompleted = expectation(description: "sink child task captured publication correlation")
+            let observations = LockedCorrelationIDs()
+            let cancellable = publisher.sink { _ in
+                observations.recordSink(EditFlowPerf.currentFileSystemPublicationCorrelation?.id)
+                Task {
+                    observations.recordChildTask(EditFlowPerf.currentFileSystemPublicationCorrelation?.id)
+                    childTaskCompleted.fulfill()
+                }
+            }
+
+            _ = startedCapture(label: "filesystem-publication", maxSamples: 100)
+            XCTAssertNil(EditFlowPerf.currentFileSystemPublicationCorrelation)
+            await service.publishFileSystemDeltas([.fileAdded("Synthetic.swift")], source: .syntheticMutation)
+            XCTAssertNil(EditFlowPerf.currentFileSystemPublicationCorrelation)
+            await fulfillment(of: [childTaskCompleted], timeout: 1)
+
+            let ids = observations.snapshot()
+            let sinkID = try XCTUnwrap(ids.sink)
+            XCTAssertEqual(ids.childTask, sinkID)
+            let snapshot = EditFlowPerf.debugCaptureSnapshot(finish: true)
+            XCTAssertTrue(snapshot.lifecycleEvents.contains {
+                $0.eventName == "FileSystem.ServicePublish" && $0.correlationID == sinkID.uuidString
+            })
+            withExtendedLifetime(cancellable) {}
+            await service.stopWatchingForChanges()
+        }
+
+        func testContentReadWorkerPermitAndBroadSearchAdmissionHooksRemainOwnedSanitizedAndOrdered() throws {
+            let contentLoading = try source("Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService+ContentLoading.swift")
+            XCTAssertTrue(contentLoading.contains("EditFlowPerf.Stage.FileSystem.contentReadWorkerPermitWait"))
+            XCTAssertTrue(contentLoading.contains("EditFlowPerf.Lifecycle.FileSystem.contentReadWorkerPermitWaitBegan"))
+            XCTAssertTrue(contentLoading.contains("EditFlowPerf.Lifecycle.FileSystem.contentReadWorkerPermitAcquired"))
+            XCTAssertTrue(contentLoading.contains("EditFlowPerf.Lifecycle.FileSystem.contentReadWorkerPermitCancelled"))
+            XCTAssertTrue(contentLoading.contains("workloadClass: request.workloadClass"))
+            XCTAssertFalse(contentLoading.contains("EditFlowPerf.Dimensions(path:"))
+            assertSourceOrder(
+                in: contentLoading,
+                hooks: [
+                    "let permitWaitState = EditFlowPerf.begin(",
+                    "let acquisition = try await acquire(",
+                    "EditFlowPerf.end(\n                EditFlowPerf.Stage.FileSystem.contentReadWorkerPermitWait",
+                    "defer { release() }",
+                    "return try await body()"
+                ]
+            )
+
+            let coordinator = try source("Sources/RepoPrompt/Features/Search/StoreBackedWorkspaceSearchAdmissionCoordinator.swift")
+            XCTAssertTrue(coordinator.contains("EditFlowPerf.Stage.Search.broadAdmissionWait"))
+            XCTAssertTrue(coordinator.contains("EditFlowPerf.Lifecycle.Search.broadAdmissionWaitBegan"))
+            XCTAssertTrue(coordinator.contains("EditFlowPerf.Lifecycle.Search.broadAdmissionPermitAcquired"))
+            XCTAssertTrue(coordinator.contains("EditFlowPerf.Lifecycle.Search.broadAdmissionPermitCancelled"))
+            XCTAssertTrue(coordinator.contains("EditFlowPerf.Lifecycle.Search.broadAdmissionPermitReleased"))
+            XCTAssertFalse(coordinator.contains("EditFlowPerf.Dimensions(path:"))
+            assertSourceOrder(
+                in: coordinator,
+                hooks: [
+                    "let waitState = EditFlowPerf.begin(",
+                    "acquisition = try await acquire(",
+                    "defer { release(acquisition) }",
+                    "return try await operation()"
+                ]
+            )
+        }
+
+        func testLifecycleSourceOrderCoversDispatchRunToolAndIngressBoundaries() throws {
+            let manager = try source("Sources/RepoPrompt/Infrastructure/MCP/MCPConnectionManager.swift")
+            assertSourceOrder(
+                in: manager,
+                hooks: [
+                    "EditFlowPerf.Lifecycle.MCPToolCall.received",
+                    "EditFlowPerf.Lifecycle.MCPToolCall.routingSnapshotCompleted",
+                    "EditFlowPerf.Lifecycle.MCPToolCall.limiterWaitBegan",
+                    "return await limiter.withPermit {",
+                    "EditFlowPerf.Lifecycle.MCPToolCall.limiterAcquired",
+                    "Self.withConnectionID(connectionID, lifecycleCorrelation: lifecycleCorrelation)"
+                ]
+            )
+            XCTAssertEqual(manager.components(separatedBy: "EditFlowPerf.Lifecycle.MCPToolCall.completionObserverReturned").count - 1, 5)
+
+            let viewModel = try source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel.swift")
+            assertSourceOrder(
+                in: viewModel,
+                hooks: [
+                    "EditFlowPerf.Lifecycle.MCPRunTool.preflushBegan",
+                    "awaitAppliedIngressForAllRoots()",
+                    "EditFlowPerf.Lifecycle.MCPRunTool.preflushEnded",
+                    "EditFlowPerf.Lifecycle.MCPRunTool.registrationScheduled",
+                    "EditFlowPerf.Lifecycle.MCPRunTool.registrationMainActorEntered",
+                    "EditFlowPerf.Lifecycle.MCPRunTool.providerBegan",
+                    "EditFlowPerf.Lifecycle.MCPRunTool.providerEnded",
+                    "EditFlowPerf.Lifecycle.MCPRunTool.cleanupScheduled",
+                    "EditFlowPerf.Lifecycle.MCPRunTool.cleanupMainActorEntered",
+                    "EditFlowPerf.Lifecycle.MCPRunTool.cleanupEnded",
+                    "EditFlowPerf.Lifecycle.MCPRunTool.returned"
+                ]
+            )
+            XCTAssertTrue(viewModel.contains("EditFlowPerf.Lifecycle.MCPRunTool.unregister"))
+            XCTAssertTrue(viewModel.contains("EditFlowPerf.Lifecycle.MCPRunTool.idleWaitersResumed"))
+
+            let fileSystemService = try source("Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService.swift")
+            let fileSystem = try source("Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService+FSEvents.swift")
+            assertSourceOrder(
+                in: fileSystem,
+                hooks: [
+                    "watcherIngressMailbox.accept(",
+                    "EditFlowPerf.Lifecycle.FileSystem.callbackAccepted",
+                    "func drainAcceptedWatcherIngressMailbox()",
+                    "EditFlowPerf.Lifecycle.FileSystem.serviceEnqueueEntered",
+                    "watcherAcceptedWatermark: batch.watcherAcceptedHighWatermark"
+                ]
+            )
+
+            let store = try source("Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceFileContextStore.swift")
+            assertSourceOrder(
+                in: store,
+                hooks: [
+                    "EditFlowPerf.Lifecycle.WorkspaceIngress.storeSinkScheduled",
+                    "publisherIngressCoordinator.accept("
+                ]
+            )
+            XCTAssertTrue(store.contains("EditFlowPerf.Lifecycle.WorkspaceIngress.storeSinkBegan"))
+            XCTAssertTrue(store.contains("handleObservedFileSystemDeltas("))
+            XCTAssertTrue(store.contains("EditFlowPerf.Lifecycle.WorkspaceIngress.storeCanonicalApplyCompleted"))
+            XCTAssertTrue(store.contains("EditFlowPerf.Lifecycle.WorkspaceIngress.rootFlushBegan"))
+            XCTAssertTrue(store.contains("EditFlowPerf.Lifecycle.WorkspaceIngress.rootFlushEnded"))
+            XCTAssertTrue(store.contains("ingressSequence: publication.watcherAcceptedWatermark?.rawValue"))
+            XCTAssertTrue(store.contains("barrierSequence: publication.servicePublicationSequence"))
+            XCTAssertTrue(fileSystemService.contains("ingressSequence: watcherAcceptedWatermark?.rawValue"))
+            XCTAssertTrue(fileSystemService.contains("barrierSequence: servicePublicationSequence"))
+        }
+
+        func testRuntimeRegistrationsSelectExplicitFreshnessPoliciesAndKeepAggressiveRefreshOptIn() throws {
+            let runtime = try source("Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPWindowToolRuntime.swift")
+            XCTAssertTrue(runtime.contains("enum MCPToolFreshnessPolicy"))
+            XCTAssertTrue(runtime.contains("freshnessPolicy: MCPToolFreshnessPolicy"))
+            XCTAssertFalse(runtime.contains("freshnessPolicy: MCPToolFreshnessPolicy ="))
+            XCTAssertFalse(runtime.contains("flushFS"))
+
+            let providerPaths = [
+                "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPAgentControlToolProvider.swift",
+                "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPAgentSessionControlToolProvider.swift",
+                "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPApplyEditsToolProvider.swift",
+                "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPAskUserToolProvider.swift",
+                "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPContextBuilderToolProvider.swift",
+                "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPFileToolProvider.swift",
+                "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPGitToolProvider.swift",
+                "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPOracleToolProvider.swift",
+                "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPPromptContextToolProvider.swift",
+                "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPSelectionToolProvider.swift",
+                "Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPWorktreeToolProvider.swift"
+            ]
+            let providers = try providerPaths.map(source).joined(separator: "\n")
+            let registrationCount = providers.components(separatedBy: "runtime.tool(").count - 1
+            let freshnessPolicyCount = providers.components(separatedBy: "freshnessPolicy:").count - 1
+            XCTAssertEqual(registrationCount, 23)
+            XCTAssertEqual(freshnessPolicyCount, registrationCount)
+            XCTAssertFalse(providers.contains("freshnessPolicy: .allLoadedAggressive"))
+
+            let server = try source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel.swift")
+            assertSourceOrder(
+                in: server,
+                hooks: [
+                    "let readableService = WorkspaceReadableFileService(store: store)",
+                    "await readableService.awaitFreshnessForExplicitRequest(path, fallbackScope: lookupRootScope)",
+                    "let exactPathIssueDetection = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.exactPathIssueDetection)"
+                ]
+            )
+            let search = try source("Sources/RepoPrompt/Features/Search/StoreBackedWorkspaceSearch.swift")
+            assertSourceOrder(
+                in: search,
+                hooks: [
+                    "_ = await store.awaitAppliedIngress(rootScope: rootScope)",
+                    "let snapshot = await store.searchCatalogSnapshot(rootScope: rootScope)"
+                ]
+            )
+            let workspaceFiles = try source("Sources/RepoPrompt/Features/WorkspaceFiles/ViewModels/WorkspaceFilesViewModel.swift")
+            XCTAssertEqual(workspaceFiles.components(separatedBy: "awaitAppliedIngressForAllRoots()").count - 1, 2)
+        }
+
+        func testFileSystemChangePublisherSendsRemainCentralized() throws {
+            let service = try source("Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService.swift")
+            let fsevents = try source("Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService+FSEvents.swift")
+            let operations = try source("Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService+FileOperations.swift")
+
+            XCTAssertTrue(service.contains("source: FileSystemDeltaPublicationSource"))
+            XCTAssertEqual(service.components(separatedBy: "changePublisher.send(publication)").count - 1, 3)
+            XCTAssertFalse(fsevents.contains("changePublisher.send"))
+            XCTAssertFalse(operations.contains("changePublisher.send"))
+            XCTAssertTrue(fsevents.contains("source: .watcherBarrierNoop"))
+            XCTAssertTrue(fsevents.contains("watcherAcceptedWatermark: batch.watcherAcceptedHighWatermark"))
+            XCTAssertEqual(operations.components(separatedBy: "source: .syntheticMutation").count - 1, 5)
+        }
+
+        private final class LockedCorrelationIDs: @unchecked Sendable {
+            private let lock = NSLock()
+            private var sinkID: UUID?
+            private var childTaskID: UUID?
+
+            func recordSink(_ id: UUID?) {
+                lock.lock()
+                sinkID = id
+                lock.unlock()
+            }
+
+            func recordChildTask(_ id: UUID?) {
+                lock.lock()
+                childTaskID = id
+                lock.unlock()
+            }
+
+            func snapshot() -> (sink: UUID?, childTask: UUID?) {
+                lock.lock()
+                defer { lock.unlock() }
+                return (sinkID, childTaskID)
+            }
+        }
+
+        private func assertSourceOrder(
+            in source: String,
+            hooks: [String],
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) {
+            var searchStart = source.startIndex
+            for hook in hooks {
+                guard let match = source.range(of: hook, range: searchStart ..< source.endIndex) else {
+                    XCTFail("Missing or out-of-order hook: \(hook)", file: file, line: line)
+                    return
+                }
+                searchStart = match.upperBound
+            }
         }
 
         private func startedCapture(label: String, maxSamples: Int) -> EditFlowPerf.DebugCaptureSnapshot {

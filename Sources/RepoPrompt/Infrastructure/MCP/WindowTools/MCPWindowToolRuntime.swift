@@ -3,12 +3,19 @@ import JSONSchema
 import MCP
 import Ontology
 
+enum MCPToolFreshnessPolicy {
+    case none
+    case rootScope(WorkspaceLookupRootScope)
+    case providerManaged
+    case allLoadedAggressive
+}
+
 @MainActor
 final class MCPWindowToolRuntime {
     typealias ProviderImplementation = @Sendable (MCPWindowToolContext, [String: Value]) async throws -> Value
     typealias ExecuteTool = @Sendable (
         _ name: String,
-        _ flushFS: Bool,
+        _ freshnessPolicy: MCPToolFreshnessPolicy,
         _ timeoutSeconds: Int,
         _ arguments: [String: Value],
         _ implementation: @escaping ProviderImplementation
@@ -24,10 +31,10 @@ final class MCPWindowToolRuntime {
 
     func tool(
         name: String,
+        freshnessPolicy: MCPToolFreshnessPolicy,
         description: String,
         annotations: MCP.Tool.Annotations = .init(),
         inputSchema: JSONSchema,
-        flushFS: Bool = true,
         timeoutSeconds: Int = 10000,
         isEnabledByDefault: Bool = true,
         implementation: @escaping ProviderImplementation
@@ -42,7 +49,7 @@ final class MCPWindowToolRuntime {
                 guard let self else {
                     throw MCPError.internalError("Window tool runtime deallocated while executing \(name)")
                 }
-                return try await executeTool(name, flushFS, timeoutSeconds, args, implementation)
+                return try await executeTool(name, freshnessPolicy, timeoutSeconds, args, implementation)
             }
         )
     }

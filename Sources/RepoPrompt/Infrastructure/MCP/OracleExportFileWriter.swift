@@ -46,7 +46,10 @@ struct GeneratedOracleExportFileWriter {
                 )
             }
 
-            _ = await store.flushPendingServiceEventsForAllRoots()
+            _ = await store.awaitAppliedIngressForExplicitRequest(
+                userPath: resolvedPath,
+                fallbackScope: .visibleWorkspace
+            )
             try await assertReadFileCanReadExport(path: resolvedPath, expectedContent: content)
             return resolvedPath
         } catch let error as MCPError {
@@ -89,7 +92,10 @@ struct GeneratedOracleExportFileWriter {
         guard resolvedPath.hasPrefix(rootPrefix) else { return }
         let relativePath = StandardizedPath.relative(String(resolvedPath.dropFirst(rootPrefix.count)))
         await store.replayObservedFileSystemDeltas(rootID: root.id, deltas: [.fileRemoved(relativePath)])
-        _ = await store.flushPendingServiceEventsForAllRoots()
+        _ = await store.awaitAppliedIngressForExplicitRequest(
+            userPath: resolvedPath,
+            fallbackScope: .visibleWorkspace
+        )
     }
 
     private func assertReadFileCanReadExport(path resolvedPath: String, expectedContent: String) async throws {

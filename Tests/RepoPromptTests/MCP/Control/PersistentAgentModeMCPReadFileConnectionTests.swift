@@ -7,9 +7,69 @@ import XCTest
 final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
     func testCodexAgentModeLeaseRetainsOneMCPServerSessionAcrossSerialExactAbsoluteReadFileCalls() async throws {
         #if DEBUG
+            try await withFixture { fixture in
+                try await runCheckpoint(fixture: fixture, scenario: .serialReads)
+            }
+        #else
+            throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
+        #endif
+    }
+
+    func testRetainedReadRepliesReturnBeforeWorkspaceContextDrainSettlesAutoSelection() async throws {
+        #if DEBUG
+            try await withFixture { fixture in
+                try await runCheckpoint(fixture: fixture, scenario: .workspaceContextDrain)
+            }
+        #else
+            throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
+        #endif
+    }
+
+    func testRetainedPromptExportWaitsForPendingReadSelectionDrain() async throws {
+        #if DEBUG
+            try await withFixture { fixture in
+                try await runCheckpoint(fixture: fixture, scenario: .promptExportDrain)
+            }
+        #else
+            throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
+        #endif
+    }
+
+    func testRetainedManageSelectionClearDrainsPendingReadAdditionBeforeApplyingClear() async throws {
+        #if DEBUG
+            try await withFixture { fixture in
+                try await runCheckpoint(fixture: fixture, scenario: .manageSelectionClear)
+            }
+        #else
+            throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
+        #endif
+    }
+
+    func testRetainedEndOfRunCleanupWaitsForAcceptedReadSelectionAndCommitsFinalState() async throws {
+        #if DEBUG
+            try await withFixture { fixture in
+                try await runCheckpoint(fixture: fixture, scenario: .endOfRun)
+            }
+        #else
+            throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
+        #endif
+    }
+}
+
+#if DEBUG
+    private extension PersistentAgentModeMCPReadFileConnectionTests {
+        enum CheckpointScenario {
+            case serialReads
+            case workspaceContextDrain
+            case promptExportDrain
+            case manageSelectionClear
+            case endOfRun
+        }
+
+        func withFixture(_ operation: (Fixture) async throws -> Void) async throws {
             let fixture = try await Fixture.make()
             do {
-                try await runCheckpoint(fixture: fixture)
+                try await operation(fixture)
                 await fixture.cleanup()
                 let pendingAfterCleanup = await fixture.networkManager.debugPendingPolicySnapshot(
                     for: AgentProviderKind.codexMCPClientID
@@ -21,20 +81,14 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 await fixture.cleanup()
                 throw error
             }
-        #else
-            throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
-        #endif
-    }
-}
+        }
 
-#if DEBUG
-    private extension PersistentAgentModeMCPReadFileConnectionTests {
         /// Dynamically proves one real retained BootstrapSocketConnectionManager/MCP.Server
         /// initialization and ordinary wire-level CallTool dispatch over one connected FD.
         /// The direct socketpair manager is intentionally not inserted into the parent's private
         /// dashboard registry, so registry history and registry-derived fingerprint claims remain
         /// outside this checkpoint's proof boundary.
-        func runCheckpoint(fixture: Fixture) async throws {
+        func runCheckpoint(fixture: Fixture, scenario: CheckpointScenario) async throws {
             let spec = fixture.spec
             XCTAssertEqual(spec.clientName, AgentProviderKind.codexMCPClientID)
             XCTAssertEqual(spec.purpose, .agentModeRun)
@@ -146,6 +200,236 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 XCTAssertEqual(current, baseline)
                 Self.assertStableAgentModeSnapshot(current, fixture: fixture)
             }
+
+            switch scenario {
+            case .serialReads:
+                break
+            case .workspaceContextDrain:
+                try await assertWorkspaceContextDrain(fixture: fixture)
+            case .promptExportDrain:
+                try await assertPromptExportDrain(fixture: fixture)
+            case .manageSelectionClear:
+                try await assertManageSelectionClearOrdering(fixture: fixture)
+            case .endOfRun:
+                try await assertEndOfRunFinish(fixture: fixture)
+            }
+        }
+
+        func assertWorkspaceContextDrain(fixture: Fixture) async throws {
+            let gate = PersistentAsyncGate()
+            fixture.window.mcpServer.setReadFileAutoSelectionCanonicalApplyGateForTesting {
+                await gate.markStartedAndWaitForRelease()
+            }
+            defer {
+                fixture.window.mcpServer.setReadFileAutoSelectionCanonicalApplyGateForTesting(nil)
+                Task { await gate.release() }
+            }
+
+            let firstRead = gatedReadTask(fixture: fixture, id: 6)
+            await gate.waitUntilStarted()
+            try await assertReadReplyReturned(firstRead, gate: gate, id: 6)
+            let secondRead = gatedReadTask(fixture: fixture, id: 7)
+            try await assertReadReplyReturned(secondRead, gate: gate, id: 7)
+
+            let contextFinished = PersistentAsyncSignal()
+            let contextTask = Task {
+                let response = try await fixture.socketClient.request(
+                    id: 8,
+                    method: "tools/call",
+                    params: [
+                        "name": MCPWindowToolName.workspaceContext,
+                        "arguments": [:]
+                    ]
+                )
+                await contextFinished.mark()
+                return response
+            }
+            try await Task.sleep(for: .milliseconds(50))
+            let contextReturnedBeforeDrain = await contextFinished.isMarked()
+            XCTAssertFalse(contextReturnedBeforeDrain)
+
+            await gate.release()
+            let contextResponse = try await contextTask.value
+            try Self.assertSuccessfulResponse(contextResponse, id: 8)
+            XCTAssertTrue(contextResponse.contains("PersistentAgentModeFixture.swift"), contextResponse)
+            let current = await fixture.retainedConnectionSnapshot()
+            Self.assertStableAgentModeSnapshot(current, fixture: fixture)
+        }
+
+        func assertPromptExportDrain(fixture: Fixture) async throws {
+            let gate = PersistentAsyncGate()
+            fixture.window.mcpServer.setReadFileAutoSelectionCanonicalApplyGateForTesting {
+                await gate.markStartedAndWaitForRelease()
+            }
+            defer {
+                fixture.window.mcpServer.setReadFileAutoSelectionCanonicalApplyGateForTesting(nil)
+                Task { await gate.release() }
+            }
+
+            let read = gatedReadTask(fixture: fixture, id: 6)
+            await gate.waitUntilStarted()
+            try await assertReadReplyReturned(read, gate: gate, id: 6)
+
+            let exportURL = fixture.rootURL.appendingPathComponent("prompt-export.txt")
+            let exportFinished = PersistentAsyncSignal()
+            let exportTask = Task {
+                let response = try await fixture.socketClient.request(
+                    id: 7,
+                    method: "tools/call",
+                    params: [
+                        "name": MCPWindowToolName.prompt,
+                        "arguments": [
+                            "op": "export",
+                            "path": exportURL.path
+                        ]
+                    ]
+                )
+                await exportFinished.mark()
+                return response
+            }
+            try await Task.sleep(for: .milliseconds(50))
+            let exportReturnedBeforeDrain = await exportFinished.isMarked()
+            XCTAssertFalse(exportReturnedBeforeDrain)
+
+            await gate.release()
+            try await Self.assertSuccessfulResponse(exportTask.value, id: 7)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: exportURL.path))
+            let exported = try String(contentsOf: exportURL, encoding: .utf8)
+            XCTAssertTrue(exported.contains("PersistentAgentModeFixture.swift"), exported)
+            let current = await fixture.retainedConnectionSnapshot()
+            Self.assertStableAgentModeSnapshot(current, fixture: fixture)
+        }
+
+        func assertManageSelectionClearOrdering(fixture: Fixture) async throws {
+            let initialClear = try await fixture.socketClient.request(
+                id: 6,
+                method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.manageSelection,
+                    "arguments": ["op": "clear"]
+                ]
+            )
+            try Self.assertSuccessfulResponse(initialClear, id: 6)
+
+            let gate = PersistentAsyncGate()
+            fixture.window.mcpServer.setReadFileAutoSelectionCanonicalApplyGateForTesting {
+                await gate.markStartedAndWaitForRelease()
+            }
+            defer {
+                fixture.window.mcpServer.setReadFileAutoSelectionCanonicalApplyGateForTesting(nil)
+                Task { await gate.release() }
+            }
+
+            let read = gatedReadTask(fixture: fixture, id: 7)
+            await gate.waitUntilStarted()
+            try await assertReadReplyReturned(read, gate: gate, id: 7)
+
+            let clearFinished = PersistentAsyncSignal()
+            let clearTask = Task {
+                let response = try await fixture.socketClient.request(
+                    id: 8,
+                    method: "tools/call",
+                    params: [
+                        "name": MCPWindowToolName.manageSelection,
+                        "arguments": ["op": "clear"]
+                    ]
+                )
+                await clearFinished.mark()
+                return response
+            }
+            try await Task.sleep(for: .milliseconds(50))
+            let clearReturnedBeforeDrain = await clearFinished.isMarked()
+            XCTAssertFalse(clearReturnedBeforeDrain)
+
+            await gate.release()
+            try await Self.assertSuccessfulResponse(clearTask.value, id: 8)
+            let finalSelection = fixture.window.mcpServer.tabContextByConnectionID[Fixture.connectionID]?.selection
+            XCTAssertEqual(finalSelection?.selectedPaths, [])
+            XCTAssertEqual(finalSelection?.slices, [:])
+            let current = await fixture.retainedConnectionSnapshot()
+            Self.assertStableAgentModeSnapshot(current, fixture: fixture)
+        }
+
+        func assertEndOfRunFinish(fixture: Fixture) async throws {
+            let initialClear = try await fixture.socketClient.request(
+                id: 6,
+                method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.manageSelection,
+                    "arguments": ["op": "clear"]
+                ]
+            )
+            try Self.assertSuccessfulResponse(initialClear, id: 6)
+
+            let gate = PersistentAsyncGate()
+            fixture.window.mcpServer.setReadFileAutoSelectionCanonicalApplyGateForTesting {
+                await gate.markStartedAndWaitForRelease()
+            }
+            defer {
+                fixture.window.mcpServer.setReadFileAutoSelectionCanonicalApplyGateForTesting(nil)
+                Task { await gate.release() }
+            }
+
+            let read = gatedReadTask(fixture: fixture, id: 7)
+            await gate.waitUntilStarted()
+            try await assertReadReplyReturned(read, gate: gate, id: 7)
+
+            let finishCompleted = PersistentAsyncSignal()
+            let finishTask = Task { @MainActor in
+                await fixture.window.mcpServer.commitAndClearTabContext(
+                    connectionID: Fixture.connectionID,
+                    expectedRunID: Fixture.runID
+                )
+                await finishCompleted.mark()
+            }
+            try await Task.sleep(for: .milliseconds(50))
+            let finishedBeforeRelease = await finishCompleted.isMarked()
+            XCTAssertFalse(finishedBeforeRelease)
+
+            await gate.release()
+            await finishTask.value
+            let storedSelection = fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection
+            XCTAssertEqual(storedSelection?.selectedPaths, [fixture.fileURL.path])
+            XCTAssertNil(fixture.window.mcpServer.tabContextByConnectionID[Fixture.connectionID])
+        }
+
+        func gatedReadTask(fixture: Fixture, id: Int) -> Task<String, Error> {
+            Task {
+                try await fixture.socketClient.request(
+                    id: id,
+                    method: "tools/call",
+                    params: [
+                        "name": MCPWindowToolName.readFile,
+                        "arguments": ["path": fixture.fileURL.path]
+                    ]
+                )
+            }
+        }
+
+        func assertReadReplyReturned(_ task: Task<String, Error>, gate: PersistentAsyncGate, id: Int) async throws {
+            let finished = PersistentAsyncSignal()
+            let observer = Task {
+                let result = await task.result
+                await finished.mark()
+                return result
+            }
+            let replyReturnedBeforeCanonicalApply = await waitUntilMarked(finished, timeout: .seconds(2))
+            XCTAssertTrue(replyReturnedBeforeCanonicalApply)
+            if !replyReturnedBeforeCanonicalApply {
+                await gate.release()
+            }
+            let response = try await observer.value.get()
+            let formattedRead = try Self.readFileText(from: response, id: id)
+            XCTAssertTrue(formattedRead.contains(Fixture.sentinelContent), formattedRead)
+        }
+
+        func waitUntilMarked(_ signal: PersistentAsyncSignal, timeout: Duration) async -> Bool {
+            let deadline = ContinuousClock.now + timeout
+            while ContinuousClock.now < deadline {
+                if await signal.isMarked() { return true }
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            return await signal.isMarked()
         }
 
         static func assertStableAgentModeSnapshot(_ snapshot: RetainedConnectionSnapshot, fixture: Fixture) {
@@ -357,7 +641,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 }
                 let resolvedSocketClient = SocketPairJSONRPCClient(fd: socketFDs[0])
                 socketClient = resolvedSocketClient
-                let resolvedConnectionManager = BootstrapSocketConnectionManager(
+                let resolvedConnectionManager = try BootstrapSocketConnectionManager(
                     connectionID: connectionID,
                     sessionToken: sessionToken,
                     clientPid: Int(getpid()),
@@ -593,6 +877,48 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 policyApplicationCount: policyApplicationCount,
                 appliedPolicy: appliedPolicy
             )
+        }
+    }
+
+    private actor PersistentAsyncGate {
+        private var started = false
+        private var released = false
+        private var startWaiters: [CheckedContinuation<Void, Never>] = []
+        private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+        func markStartedAndWaitForRelease() async {
+            started = true
+            startWaiters.forEach { $0.resume() }
+            startWaiters.removeAll()
+            guard !released else { return }
+            await withCheckedContinuation { continuation in
+                releaseWaiters.append(continuation)
+            }
+        }
+
+        func waitUntilStarted() async {
+            guard !started else { return }
+            await withCheckedContinuation { continuation in
+                startWaiters.append(continuation)
+            }
+        }
+
+        func release() {
+            released = true
+            releaseWaiters.forEach { $0.resume() }
+            releaseWaiters.removeAll()
+        }
+    }
+
+    private actor PersistentAsyncSignal {
+        private var marked = false
+
+        func mark() {
+            marked = true
+        }
+
+        func isMarked() -> Bool {
+            marked
         }
     }
 

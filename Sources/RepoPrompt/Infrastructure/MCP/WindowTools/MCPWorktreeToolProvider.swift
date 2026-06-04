@@ -30,6 +30,7 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
     private func manageWorktreeTool() -> Tool {
         runtime.tool(
             name: MCPWindowToolName.manageWorktree,
+            freshnessPolicy: .providerManaged,
             description: """
             Manage Git worktrees, per-agent-session worktree bindings, and session-bound worktree merges.
 

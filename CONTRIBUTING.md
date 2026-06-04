@@ -29,7 +29,9 @@ you should understand the code you submit and be able to explain its behavior.
 
 Do not check raw generated RP outputs into the repo; prompts, reviews,
 investigations, analysis, designs, and reference dumps are working artifacts
-unless deliberately distilled into durable docs.
+unless deliberately distilled into durable docs. Local `docs/investigations/*.md`
+reports stay unignored so RepoPrompt tooling can read them; do not stage or merge
+them unless intentionally requested.
 
 Run the smallest relevant coordinated validation commands from [`AGENTS.md`](AGENTS.md).
 At minimum:

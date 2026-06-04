@@ -24,6 +24,7 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
     private func applyEditsTool() -> Tool {
         runtime.tool(
             name: MCPWindowToolName.applyEdits,
+            freshnessPolicy: .providerManaged,
             description: """
             Apply direct file edits. Provide exactly ONE of these three modes:
 
@@ -84,6 +85,10 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
             let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
             let effectivePath = lookupContext.translateInputPath(request.path)
             let displayPath = lookupContext.bindingProjection?.projectedLogicalDisplayPath(forPhysicalPath: effectivePath, display: .relative) ?? request.path
+            _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
+                userPath: effectivePath,
+                fallbackScope: lookupContext.rootScope
+            )
             if let issue = await dependencies.promptVM.workspaceFileContextStore.exactPathResolutionIssue(for: effectivePath, kind: .file, rootScope: lookupContext.rootScope) {
                 throw MCPError.invalidParams(PathResolutionIssueRenderer.message(for: issue))
             }
@@ -164,7 +169,10 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
                         )
                     }
                     await EditFlowPerf.measure(EditFlowPerf.Stage.ApplyEdits.flushDeltas) {
-                        _ = await dependencies.promptVM.workspaceFileContextStore.flushPendingServiceEventsForAllRoots()
+                        _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
+                            userPath: effectivePath,
+                            fallbackScope: lookupContext.rootScope
+                        )
                     }
                     let persistedResult = previewResult.withFileMetadata(created: !preview.exists, overwritten: false)
                     return editSummary(
@@ -209,7 +217,10 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
             let result = try await service.run(effectiveRequest)
             if result.editsApplied > 0 {
                 await EditFlowPerf.measure(EditFlowPerf.Stage.ApplyEdits.flushDeltas) {
-                    _ = await dependencies.promptVM.workspaceFileContextStore.flushPendingServiceEventsForAllRoots()
+                    _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
+                        userPath: effectivePath,
+                        fallbackScope: lookupContext.rootScope
+                    )
                 }
             } else {
                 EditFlowPerf.event(

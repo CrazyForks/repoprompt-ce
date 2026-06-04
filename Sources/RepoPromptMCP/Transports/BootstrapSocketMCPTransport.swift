@@ -10,6 +10,7 @@ import Dispatch
 import Foundation
 import Logging
 import MCP
+import RepoPromptShared
 import SystemPackage
 
 #if canImport(Darwin)
@@ -27,6 +28,7 @@ public actor BootstrapSocketMCPTransport: Transport {
     private var isConnected = false
     private var streamFinished = false
     private var socketClosed = false
+    private var connectionAttempted = false
 
     private nonisolated let messageStream: AsyncThrowingStream<Data, Swift.Error>
     private var messageContinuation: AsyncThrowingStream<Data, Swift.Error>.Continuation
@@ -34,6 +36,19 @@ public actor BootstrapSocketMCPTransport: Transport {
     private var reader: NewlineDelimitedSocketReader?
     private let readQueue = DispatchQueue(label: "com.repoprompt.ce.mcp.cli.socket.read", qos: .userInitiated)
     private var readSourceFD: Int32?
+    private var readSourceToken: UInt64?
+    private var nextReadSourceToken: UInt64 = 0
+
+    /// Retains cancelled readers until their delayed cancel handlers perform final close.
+    /// The transport retainer intentionally forms a temporary cycle so cleanup does not
+    /// depend on an external owner keeping this actor alive after disconnect returns.
+    private struct PendingReaderCancellation {
+        let fd: Int32
+        let reader: NewlineDelimitedSocketReader
+        let transportRetainer: BootstrapSocketMCPTransport
+    }
+
+    private var pendingReaderCancellations: [UInt64: PendingReaderCancellation] = [:]
 
     /// Maximum time a write may make no forward progress before the connection is failed closed.
     private let writeStallTimeout: TimeInterval
@@ -50,7 +65,15 @@ public actor BootstrapSocketMCPTransport: Transport {
         logger: Logger? = nil,
         writeStallTimeout: TimeInterval = 30.0,
         writePollIntervalMilliseconds: Int32 = 250
-    ) {
+    ) throws {
+        do {
+            try POSIXDescriptorSupport.setCloseOnExec(connectedFD)
+        } catch {
+            POSIXDescriptorSupport.shutdownSocketReadWrite(connectedFD)
+            Darwin.close(connectedFD)
+            throw error
+        }
+
         socketFD = connectedFD
         self.logger = logger ?? Logger(label: "mcp.transport.socket") { _ in
             SwiftLogNoOpLogHandler()
@@ -71,12 +94,13 @@ public actor BootstrapSocketMCPTransport: Transport {
     /// Since the FD is already connected from bootstrap, this just starts the read source.
     public func connect() async throws {
         guard !isConnected else { return }
+        guard !connectionAttempted, !socketClosed, !streamFinished else {
+            logger.warning("BootstrapSocketMCPTransport.connect called after adopted socket teardown")
+            throw MCPError.connectionClosed
+        }
+        connectionAttempted = true
 
         logger.debug("BootstrapSocketMCPTransport connecting on FD \(socketFD)")
-
-        streamFinished = false
-        socketClosed = false
-
         logger.debug("BootstrapSocketMCPTransport connected, starting read source")
 
         do {
@@ -90,9 +114,7 @@ public actor BootstrapSocketMCPTransport: Transport {
             try startReadSource(fd: socketFD)
             isConnected = true
         } catch {
-            isConnected = false
-            finishStreamIfNeeded(throwing: error)
-            closeSocketIfNeeded()
+            tearDownSocket(error: error)
             throw error
         }
     }
@@ -100,11 +122,7 @@ public actor BootstrapSocketMCPTransport: Transport {
     /// Disconnects the transport and closes the socket.
     public func disconnect() async {
         guard !socketClosed else { return }
-        isConnected = false
-
-        stopReadSource()
-        finishStreamIfNeeded(throwing: MCPError.connectionClosed)
-        closeSocketIfNeeded()
+        tearDownSocket(error: MCPError.connectionClosed)
 
         logger.debug("BootstrapSocketMCPTransport disconnected")
     }
@@ -267,16 +285,7 @@ public actor BootstrapSocketMCPTransport: Transport {
 
     private func closeAfterSendFailure(_ error: Swift.Error) {
         logger.error("BootstrapSocketMCPTransport send failed; closing transport: \(String(describing: error))")
-        isConnected = false
-        if socketFD >= 0 {
-            _ = shutdown(socketFD, SHUT_RDWR)
-        }
-        let hasActiveReadSource = reader != nil
-        stopReadSource()
-        finishStreamIfNeeded(throwing: error)
-        if !hasActiveReadSource {
-            closeSocketIfNeeded()
-        }
+        tearDownSocket(error: error)
     }
 
     private struct BootstrapSocketWriteStalledError: Swift.Error, CustomStringConvertible {
@@ -296,7 +305,10 @@ public actor BootstrapSocketMCPTransport: Transport {
         try ReadSourceFDPreflight.validateOpenFD(fd, label: "BootstrapSocketMCPTransport read socket")
         stopReadSource()
 
+        nextReadSourceToken &+= 1
+        let token = nextReadSourceToken
         readSourceFD = fd
+        readSourceToken = token
 
         let cont = messageContinuation
         let log = logger
@@ -315,7 +327,7 @@ public actor BootstrapSocketMCPTransport: Transport {
                 Task { await self?.handleReadError(error: error) }
             },
             onCancel: { [weak self] in
-                Task { await self?.readSourceDidCancel(fd: fd) }
+                Task { await self?.readSourceDidCancel(fd: fd, token: token) }
             }
         )
 
@@ -325,38 +337,70 @@ public actor BootstrapSocketMCPTransport: Transport {
         } catch {
             reader = nil
             readSourceFD = nil
+            readSourceToken = nil
             throw error
         }
     }
 
     /// Stops the read source. FD is closed in cancel handler to avoid races.
     private func stopReadSource() {
-        reader?.stop()
+        guard let reader else { return }
+        guard let fd = readSourceFD, let token = readSourceToken else {
+            self.reader = nil
+            readSourceFD = nil
+            readSourceToken = nil
+            reader.stop()
+            return
+        }
+
+        pendingReaderCancellations[token] = PendingReaderCancellation(
+            fd: fd,
+            reader: reader,
+            transportRetainer: self
+        )
+        self.reader = nil
+        readSourceFD = nil
+        readSourceToken = nil
+        reader.stop()
+        // Note: retained reader cleanup happens in readSourceDidCancel.
     }
 
-    private func readSourceDidCancel(fd: Int32) {
-        if readSourceFD == fd {
-            readSourceFD = nil
-            reader = nil
+    private func pendingReaderCancellationOwnsCurrentSocket() -> Bool {
+        pendingReaderCancellations.values.contains { $0.fd == socketFD }
+    }
+
+    private func readSourceDidCancel(fd: Int32, token: UInt64) {
+        guard let ownership = pendingReaderCancellations.removeValue(forKey: token) else { return }
+        guard ownership.fd == fd else {
+            logger.error("BootstrapSocketMCPTransport reader cancellation fd mismatch for token=\(token)")
+            return
         }
         closeSocketIfNeeded()
     }
 
     private func handleReadError(error: Swift.Error) {
-        isConnected = false
-        stopReadSource()
-        finishStreamIfNeeded(throwing: error)
+        tearDownSocket(error: error)
     }
 
     private func handleReadEOF(hasResidualData: Bool) {
-        isConnected = false
-        stopReadSource()
-
         if hasResidualData {
             let truncationError = MCPError.internalError("Connection closed with incomplete frame data")
-            finishStreamIfNeeded(throwing: truncationError)
+            tearDownSocket(error: truncationError)
         } else {
-            finishStreamIfNeeded()
+            tearDownSocket()
+        }
+    }
+
+    private func tearDownSocket(error: Swift.Error? = nil) {
+        isConnected = false
+        if !socketClosed {
+            POSIXDescriptorSupport.shutdownSocketReadWrite(socketFD)
+        }
+
+        stopReadSource()
+        finishStreamIfNeeded(throwing: error)
+        if !pendingReaderCancellationOwnsCurrentSocket() {
+            closeSocketIfNeeded()
         }
     }
 
@@ -374,6 +418,7 @@ public actor BootstrapSocketMCPTransport: Transport {
     private func closeSocketIfNeeded() {
         guard !socketClosed else { return }
         socketClosed = true
+        POSIXDescriptorSupport.shutdownSocketReadWrite(socketFD)
         Darwin.close(socketFD)
     }
 }

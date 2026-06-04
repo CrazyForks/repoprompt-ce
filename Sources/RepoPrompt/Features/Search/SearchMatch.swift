@@ -482,7 +482,8 @@ private struct SearchFileDescriptor {
         do {
             let loaded = try await store.readContentWithDate(
                 rootID: record.rootID,
-                relativePath: record.standardizedRelativePath
+                relativePath: record.standardizedRelativePath,
+                workloadClass: .contentSearch
             )
             return FileSearchContentSnapshot(
                 content: loaded.content,

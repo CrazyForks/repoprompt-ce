@@ -809,7 +809,10 @@ extension AgentModeViewModel {
     ) async {
         await VCSService.shared.invalidateCache(for: target.url)
         if let store = promptManager?.workspaceFileContextStore {
-            _ = await store.flushPendingServiceEventsForAllRoots()
+            _ = await store.awaitAppliedIngressForExplicitRequest(
+                userPath: target.path,
+                fallbackScope: .allLoaded
+            )
             let roots = await store.rootRefs(scope: .allLoaded)
             for root in roots where samePath(root.standardizedFullPath, target.path) {
                 try? await store.requestCodemapScans(inRoot: root.id)

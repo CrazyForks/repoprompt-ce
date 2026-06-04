@@ -107,7 +107,7 @@ import Foundation
 
             // Process the events and get deltas directly
             let formattedEvents = events.map { ($0.absolutePath, $0.flags, $0.eventId) }
-            let deltas = await handleBatchedEvents(formattedEvents, testMode: true)
+            let deltas = await handleBatchedEvents(PendingFSEventBatch(events: formattedEvents), testMode: true)
 
             return deltas ?? []
         }
@@ -138,7 +138,58 @@ import Foundation
                     FSEventCallbackEntry(path: event.absolutePath, flags: event.flags, id: event.eventId)
                 }
             )
-            enqueueFSEventHandlingTask(payload)
+            enqueueFSEventEntries(payload.entries)
+            scheduleCoalescingIfNeeded()
+        }
+
+        @discardableResult
+        func acceptWatcherPayloadForTesting(
+            _ events: [(absolutePath: String, flags: FSEventStreamEventFlags, eventId: FSEventStreamEventId)],
+            scheduleDrain: Bool = true
+        ) -> FileSystemWatcherIngressMailbox.Watermark? {
+            watcherIngressMailbox.startAccepting()
+            let payload = FSEventCallbackPayload(
+                entries: events.map { event in
+                    FSEventCallbackEntry(path: event.absolutePath, flags: event.flags, id: event.eventId)
+                }
+            )
+            let drain: (@Sendable () async -> Void)? = if scheduleDrain {
+                { [weak self] in await self?.drainAcceptedWatcherIngressMailbox() }
+            } else {
+                nil
+            }
+            return watcherIngressMailbox.accept(payload, lifecycleCorrelation: nil, scheduleDrain: drain)
+        }
+
+        func watcherIngressMailboxSnapshotForTesting() -> FileSystemWatcherIngressMailbox.Snapshot {
+            watcherIngressMailbox.snapshotForTesting()
+        }
+
+        func publicationStateForTesting() -> (
+            lastServicePublicationSequence: UInt64,
+            lastPublishedWatcherAcceptedWatermark: FileSystemWatcherIngressMailbox.Watermark
+        ) {
+            (lastServicePublicationSequence, lastPublishedWatcherAcceptedWatermark)
+        }
+
+        func setWatcherBatchWillProcessHandlerForTesting(
+            _ handler: (@Sendable () async -> Void)?
+        ) {
+            watcherBatchWillProcessHandler = handler
+        }
+
+        func setContentReadChunkHandlerForTesting(
+            _ handler: (@Sendable (String) async -> Void)?
+        ) {
+            contentReadChunkHandler = handler
+        }
+
+        func cachedEncodingForTesting(relativePath: String) -> String.Encoding? {
+            encodingMap[relativePath]
+        }
+
+        func isWatchingForChangesForTesting() -> Bool {
+            fseventStreamRef != nil
         }
 
         func watcherStateForTesting() -> (

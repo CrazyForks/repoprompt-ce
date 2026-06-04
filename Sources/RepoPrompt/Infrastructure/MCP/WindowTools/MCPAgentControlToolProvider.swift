@@ -26,6 +26,7 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
     private func agentExploreTool() -> Tool {
         runtime.tool(
             name: MCPWindowToolName.agentExplore,
+            freshnessPolicy: .none,
             description: """
             Short-lived, read-only explore child agents for narrow codebase probes. Each child runs in a fresh session with its own context window. Always uses the `explore` role; no custom `model_id`, workflows, session reuse, `steer`, or `respond`.
 
@@ -67,6 +68,7 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
         let messageDescription = "[start, steer] Instruction text. Required for start and steer. If sharing an exported plan, include the path/instruction directly in this text."
         return runtime.tool(
             name: MCPWindowToolName.agentRun,
+            freshnessPolicy: .none,
             description: """
             Spawn and control Agent Mode sessions. `start` always creates a new session/tab; use `steer` to continue an existing session.
 
@@ -147,6 +149,7 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
     private func agentManageTool() -> Tool {
         runtime.tool(
             name: MCPWindowToolName.agentManage,
+            freshnessPolicy: .providerManaged,
             description: """
             List agents, manage sessions, and browse workflows.
 

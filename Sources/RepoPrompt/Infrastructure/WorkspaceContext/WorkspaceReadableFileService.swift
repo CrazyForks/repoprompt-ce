@@ -12,6 +12,16 @@ struct WorkspaceReadableFileService {
         self.homeDirectoryURL = homeDirectoryURL
     }
 
+    func awaitFreshnessForExplicitRequest(
+        _ userPath: String,
+        fallbackScope: WorkspaceLookupRootScope
+    ) async {
+        _ = await store.awaitAppliedIngressForExplicitRequest(
+            userPath: userPath,
+            fallbackScope: fallbackScope
+        )
+    }
+
     static func exactAbsoluteCatalogHitInput(_ rawPath: String) -> String? {
         let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }

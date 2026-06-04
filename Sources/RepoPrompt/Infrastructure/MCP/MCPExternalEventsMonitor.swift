@@ -1,5 +1,7 @@
 import Combine
+import Darwin
 import Foundation
+import RepoPromptShared
 
 /// Monitors the MCP events directory for error events written by external CLI clients.
 /// Surfaces these events to the UI even when network communication is impossible.
@@ -32,12 +34,15 @@ final class MCPExternalEventsMonitor: ObservableObject {
     }
 
     deinit {
-        dispatchSource?.cancel()
+        let source = dispatchSource
         dispatchSource = nil
-        if directoryFileDescriptor >= 0 {
-            close(directoryFileDescriptor)
-        }
+        let fd = directoryFileDescriptor
         directoryFileDescriptor = -1
+        if let source {
+            source.cancel()
+        } else if fd >= 0 {
+            Darwin.close(fd)
+        }
     }
 
     // MARK: - Setup
@@ -53,20 +58,38 @@ final class MCPExternalEventsMonitor: ObservableObject {
 
     // MARK: - Public API
 
+    static func openDirectoryWatcherFD(at url: URL) throws -> Int32 {
+        let fd = Darwin.open(url.path, O_EVTONLY)
+        guard fd >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+
+        do {
+            try POSIXDescriptorSupport.setCloseOnExec(fd)
+            return fd
+        } catch {
+            Darwin.close(fd)
+            throw error
+        }
+    }
+
     /// Starts monitoring for new event files
     func start() {
         guard dispatchSource == nil else { return }
 
         // Open directory file descriptor
-        directoryFileDescriptor = open(eventsDirectory.path, O_EVTONLY)
-        guard directoryFileDescriptor >= 0 else {
-            print("MCPExternalEventsMonitor: Failed to open events directory for monitoring")
+        let openedFD: Int32
+        do {
+            openedFD = try Self.openDirectoryWatcherFD(at: eventsDirectory)
+        } catch {
+            print("MCPExternalEventsMonitor: Failed to open events directory for monitoring: \(error)")
             return
         }
+        directoryFileDescriptor = openedFD
 
         // Create dispatch source for directory changes
         let source = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: directoryFileDescriptor,
+            fileDescriptor: openedFD,
             eventMask: [.write, .rename],
             queue: .main
         )
@@ -77,11 +100,8 @@ final class MCPExternalEventsMonitor: ObservableObject {
             }
         }
 
-        source.setCancelHandler { [weak self] in
-            if let fd = self?.directoryFileDescriptor, fd >= 0 {
-                close(fd)
-            }
-            self?.directoryFileDescriptor = -1
+        source.setCancelHandler {
+            Darwin.close(openedFD)
         }
 
         dispatchSource = source
@@ -93,8 +113,15 @@ final class MCPExternalEventsMonitor: ObservableObject {
 
     /// Stops monitoring
     func stop() {
-        dispatchSource?.cancel()
+        let source = dispatchSource
         dispatchSource = nil
+        let fd = directoryFileDescriptor
+        directoryFileDescriptor = -1
+        if let source {
+            source.cancel()
+        } else if fd >= 0 {
+            Darwin.close(fd)
+        }
     }
 
     /// Loads the most recent displayable event if it's fresh enough (within maxAge)

@@ -34,6 +34,9 @@ extension MCPServerViewModel {
         /// True if this snapshot was created via explicit `bind_context` / `_tabID` binding.
         /// Explicit bindings should persist even when the bound tab is not the active tab.
         let explicitlyBound: Bool
+        /// Ephemeral identity for deferred read-file auto-selection work. A replacement binding
+        /// receives a fresh generation so stale queued work cannot apply to the new snapshot.
+        var readFileAutoSelectionGeneration: UInt64
 
         init(
             tabID: UUID,
@@ -46,7 +49,8 @@ extension MCPServerViewModel {
             runID: UUID?,
             activeAgentSessionID: UUID? = nil,
             worktreeBindings: [AgentSessionWorktreeBinding] = [],
-            explicitlyBound: Bool
+            explicitlyBound: Bool,
+            readFileAutoSelectionGeneration: UInt64 = 0
         ) {
             self.tabID = tabID
             self.windowID = windowID
@@ -59,6 +63,7 @@ extension MCPServerViewModel {
             self.activeAgentSessionID = activeAgentSessionID
             self.worktreeBindings = worktreeBindings
             self.explicitlyBound = explicitlyBound
+            self.readFileAutoSelectionGeneration = readFileAutoSelectionGeneration
         }
     }
 
@@ -389,8 +394,36 @@ extension MCPServerViewModel {
     }
 
     @MainActor
+    private func readFileAutoSelectionContextKey(
+        connectionID: UUID,
+        context: TabScopedContext
+    ) -> MCPReadFileAutoSelectionCoordinator.ContextKey {
+        MCPReadFileAutoSelectionCoordinator.ContextKey(
+            windowID: context.windowID,
+            workspaceID: context.workspaceID,
+            tabID: context.tabID,
+            route: .bound(connectionID: connectionID, runID: context.runID),
+            bindingGeneration: context.readFileAutoSelectionGeneration
+        )
+    }
+
+    @MainActor
+    private func activateReadFileAutoSelection(_ context: inout TabScopedContext) {
+        nextReadFileAutoSelectionBindingGeneration &+= 1
+        context.readFileAutoSelectionGeneration = nextReadFileAutoSelectionBindingGeneration
+    }
+
+    @MainActor
+    private func invalidateReadFileAutoSelection(connectionID: UUID, context: TabScopedContext) {
+        readFileAutoSelectionCoordinator.invalidate(
+            context: readFileAutoSelectionContextKey(connectionID: connectionID, context: context)
+        )
+    }
+
+    @MainActor
     private func releaseBinding(connectionID: UUID, preserveConnectionRunIDMapping: Bool = false) {
         guard let context = tabContextByConnectionID.removeValue(forKey: connectionID) else { return }
+        invalidateReadFileAutoSelection(connectionID: connectionID, context: context)
         endMirroringForConnection(connectionID)
         windowIDByConnection.removeValue(forKey: connectionID)
         let updatedMappings = Self.runMappingsAfterBindingRelease(
@@ -510,14 +543,9 @@ extension MCPServerViewModel {
 
     @MainActor
     private func pushVirtualContextToUI(_ context: TabScopedContext) async {
+        // `commitTabContext` already recounts when it applies the active tab. Avoid a
+        // duplicate immediate recount after the heavy file-selector projection.
         await commitTabContext(context)
-        // Only refresh metrics when we actually applied to the active tab
-        if let manager = workspaceManager,
-           let activeWS = manager.activeWorkspace,
-           activeWS.activeComposeTabID == context.tabID
-        {
-            await refreshSelectionMetrics()
-        }
     }
 
     @MainActor
@@ -640,6 +668,7 @@ extension MCPServerViewModel {
 
         for connectionID in boundConnections {
             guard let context = tabContextByConnectionID.removeValue(forKey: connectionID) else { continue }
+            invalidateReadFileAutoSelection(connectionID: connectionID, context: context)
             endMirroringForConnection(connectionID)
             if let runID = context.runID {
                 cleanupRunIDMapping(runID: runID, connectionID: connectionID)
@@ -803,7 +832,7 @@ extension MCPServerViewModel {
 
         // Explicit tab-context bindings preserve the tab's stored state unless a caller opts into
         // active selection flushing through the snapshot helper.
-        let context = try makeTabContextSnapshot(
+        var context = try makeTabContextSnapshot(
             tabID: tab.id,
             workspaceID: ws.id,
             windowID: windowID,
@@ -813,6 +842,7 @@ extension MCPServerViewModel {
             flushActiveSelection: false
         )
 
+        activateReadFileAutoSelection(&context)
         tabContextByConnectionID[connectionID] = context
         windowIDByConnection[connectionID] = windowID
         if let runID {
@@ -883,7 +913,7 @@ extension MCPServerViewModel {
             return workspaceManager?.activeWorkspace?.id
         }()
 
-        let context = makeTabContextSnapshot(
+        var context = makeTabContextSnapshot(
             from: snapshot,
             workspaceID: resolvedWorkspaceID,
             windowID: windowID,
@@ -913,6 +943,11 @@ extension MCPServerViewModel {
             }
 
             tabContextLog("installTabContext immediate bind connectionID=\(uuid)")
+            if let previous = tabContextByConnectionID[uuid] {
+                invalidateReadFileAutoSelection(connectionID: uuid, context: previous)
+                endMirroringForConnection(uuid)
+            }
+            activateReadFileAutoSelection(&context)
             tabContextByConnectionID[uuid] = context
             windowIDByConnection[uuid] = context.windowID
             if let runID = context.runID {
@@ -972,16 +1007,19 @@ extension MCPServerViewModel {
         {
             if existing.windowID == windowID {
                 tabContextByConnectionID.removeValue(forKey: previousConnection)
+                invalidateReadFileAutoSelection(connectionID: previousConnection, context: existing)
                 endMirroringForConnection(previousConnection)
                 connectionIDToRunID.removeValue(forKey: previousConnection)
                 windowIDByConnection.removeValue(forKey: previousConnection)
-                tabContextByConnectionID[connectionID] = existing
-                windowIDByConnection[connectionID] = existing.windowID
-                _ = registerRunIDMapping(connectionID: connectionID, runID: runID, windowID: existing.windowID)
-                recordLastContext(clientName: clientName, context: existing)
-                beginMirroringForConnection(connectionID, context: existing)
-                tabContextLog("bindPendingContextToConnection handover: runID=\(runID) tab=\(existing.tabID) \(previousConnection) -> \(connectionID) queueBefore=\(queueBefore)")
-                return existing
+                var rebound = existing
+                activateReadFileAutoSelection(&rebound)
+                tabContextByConnectionID[connectionID] = rebound
+                windowIDByConnection[connectionID] = rebound.windowID
+                _ = registerRunIDMapping(connectionID: connectionID, runID: runID, windowID: rebound.windowID)
+                recordLastContext(clientName: clientName, context: rebound)
+                beginMirroringForConnection(connectionID, context: rebound)
+                tabContextLog("bindPendingContextToConnection handover: runID=\(runID) tab=\(rebound.tabID) \(previousConnection) -> \(connectionID) queueBefore=\(queueBefore)")
+                return rebound
             } else {
                 tabContextLog("bindPendingContextToConnection handover skipped window mismatch runID=\(runID) prevWindow=\(existing.windowID) currentWindow=\(windowID)")
             }
@@ -998,11 +1036,12 @@ extension MCPServerViewModel {
             tabContextLog("bindPendingContextToConnection no exact match for runHint connectionID=\(connectionID) clientName=\(clientName) window=\(windowID) runHint=\(runHint!.uuidString) queueBefore=\(queueBefore) remaining=\(result.remaining)")
         }
 
-        guard let context = result.context else {
+        guard var context = result.context else {
             tabContextLog("bindPendingContextToConnection no pending context clientName=\(clientName) window=\(windowID) connectionID=\(connectionID) queueBefore=\(queueBefore) remaining=\(result.remaining) runHint=\(runHint?.uuidString ?? "nil")")
             return nil
         }
 
+        activateReadFileAutoSelection(&context)
         tabContextByConnectionID[connectionID] = context
         windowIDByConnection[connectionID] = context.windowID
         if let runID = context.runID {
@@ -1136,7 +1175,7 @@ extension MCPServerViewModel {
     }
 
     @MainActor
-    private func activeTabCompatibilitySnapshot(
+    func activeTabCompatibilitySnapshot(
         metadata: RequestMetadata,
         toolName: String
     ) throws -> TabContextSnapshot {
@@ -1226,7 +1265,35 @@ extension MCPServerViewModel {
         } else {
             await commitTabContext(selectionOnlyCommitContext(from: context))
         }
-        await refreshSelectionMetrics()
+    }
+
+    @MainActor
+    func acceptReadFileAutoSelection(
+        selection: StoredSelection,
+        contextKey: MCPReadFileAutoSelectionCoordinator.ContextKey
+    ) async -> Bool {
+        guard isReadFileAutoSelectionContextCurrent(contextKey),
+              let manager = workspaceManager,
+              let workspaceID = contextKey.workspaceID,
+              let workspaceIndex = manager.workspaces.firstIndex(where: { $0.id == workspaceID }),
+              let tabIndex = manager.workspaces[workspaceIndex].composeTabs.firstIndex(where: { $0.id == contextKey.tabID })
+        else { return false }
+
+        if case let .bound(connectionID, _) = contextKey.route,
+           var latest = tabContextByConnectionID[connectionID]
+        {
+            latest.selection = selection
+            tabContextByConnectionID[connectionID] = latest
+        }
+
+        var updatedTab = manager.workspaces[workspaceIndex].composeTabs[tabIndex]
+        guard updatedTab.selection != selection else { return false }
+        updatedTab.selection = selection
+        updatedTab.lastModified = Date()
+        await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.AutoSelect.canonicalStoredCommit) {
+            manager.updateComposeTabStoredOnly(updatedTab)
+        }
+        return true
     }
 
     @MainActor
@@ -1471,17 +1538,20 @@ extension MCPServerViewModel {
         }
 
         tabContextByConnectionID.removeValue(forKey: previousConnection)
+        invalidateReadFileAutoSelection(connectionID: previousConnection, context: existing)
         endMirroringForConnection(previousConnection)
         connectionIDToRunID.removeValue(forKey: previousConnection)
         windowIDByConnection.removeValue(forKey: previousConnection)
 
-        tabContextByConnectionID[connectionID] = existing
-        windowIDByConnection[connectionID] = existing.windowID
-        let mappingOK = registerRunIDMapping(connectionID: connectionID, runID: runID, windowID: existing.windowID)
-        if let clientName { recordLastContext(clientName: clientName, context: existing) }
-        beginMirroringForConnection(connectionID, context: existing)
+        var rebound = existing
+        activateReadFileAutoSelection(&rebound)
+        tabContextByConnectionID[connectionID] = rebound
+        windowIDByConnection[connectionID] = rebound.windowID
+        let mappingOK = registerRunIDMapping(connectionID: connectionID, runID: runID, windowID: rebound.windowID)
+        if let clientName { recordLastContext(clientName: clientName, context: rebound) }
+        beginMirroringForConnection(connectionID, context: rebound)
         tabContextLog("resolveTabContext handover: runID=\(runID) \(previousConnection) -> \(connectionID) mappingOK=\(mappingOK) window=\(providedWindowID?.description ?? "nil")")
-        return existing
+        return rebound
     }
 
     @MainActor
@@ -1936,7 +2006,7 @@ extension MCPServerViewModel {
 
     @MainActor
     func commitAndClearTabContext(connectionID: UUID, expectedRunID: UUID? = nil) async {
-        guard let context = tabContextByConnectionID[connectionID] else { return }
+        guard var context = tabContextByConnectionID[connectionID] else { return }
 
         // Decide whether we will commit stored UI state for this context
         // Mismatch => clear binding only (do not commit old/stale state)
@@ -1944,6 +2014,16 @@ extension MCPServerViewModel {
         if let expected = expectedRunID, context.runID != expected {
             tabContextLog("commitAndClearTabContext run mismatch connectionID=\(connectionID) expectedRunID=\(expected.uuidString) actualRunID=\(context.runID?.uuidString ?? "nil") tab=\(context.tabID) — clearing binding without commit")
             shouldCommit = false
+        }
+
+        if shouldCommit {
+            let key = readFileAutoSelectionContextKey(connectionID: connectionID, context: context)
+            await readFileAutoSelectionCoordinator.finish(context: key)
+            if let latest = tabContextByConnectionID[connectionID], latest.runID == context.runID {
+                context = latest
+            }
+        } else {
+            invalidateReadFileAutoSelection(connectionID: connectionID, context: context)
         }
 
         // Clear binding regardless of mismatch so future runs can rebind
@@ -1996,6 +2076,7 @@ extension MCPServerViewModel {
            let context = tabContextByConnectionID[connectionID]
         {
             if runID == nil || context.runID == runID {
+                invalidateReadFileAutoSelection(connectionID: connectionID, context: context)
                 endMirroringForConnection(connectionID)
                 tabContextByConnectionID.removeValue(forKey: connectionID)
                 windowIDByConnection.removeValue(forKey: connectionID)

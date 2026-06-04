@@ -3135,6 +3135,27 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
     }
 
+    /// Applies the newest stored selection to the active file-selector UI without replaying
+    /// prompt text or other compose-tab state. Used by deferred `read_file` auto-selection.
+    @MainActor
+    func applyStoredSelectionMirrorForReadFileAutoSelection(tabID: UUID) async {
+        guard let active = activeWorkspace,
+              active.activeComposeTabID == tabID,
+              let tab = composeTab(with: tabID)
+        else { return }
+
+        beginApplyingTabContext(forTabID: tabID)
+        defer { endApplyingTabContext(forTabID: tabID) }
+        if let selectionCoordinator {
+            await selectionCoordinator.withApplyingSelectionMirror {
+                await fileManager.applyStoredSelection(tab.selection)
+            }
+        } else {
+            await fileManager.applyStoredSelection(tab.selection)
+        }
+        await promptViewModel.tokenCountingViewModel.forceImmediateRecount()
+    }
+
     /// Silent "stored-only" update: updates the compose tab in the backing store
     /// without reloading PromptViewModel's compose tabs or publishing snapshots.
     /// Used by MCP virtual context commits to avoid triggering empty live-UI snapshots.
@@ -5248,6 +5269,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         private struct Pending {
             var newestData: Data
             var newestMetadata: WorkspaceSavePayloadMetadata?
+            var newestLifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?
             var task: Task<Void, Never>?
         }
 
@@ -5269,6 +5291,9 @@ class WorkspaceManagerViewModel: ObservableObject {
         private var waitersByURL: [URL: [CheckedContinuation<Void, Never>]] = [:]
         private var latestSelectionByWorkspaceTab: [WorkspaceTabSelectionKey: LatestSelectionRecord] = [:]
         private var lastWrittenSelectionRevisionByWorkspaceTab: [WorkspaceTabSelectionKey: UInt64] = [:]
+        #if DEBUG
+            private var atomicWriteGateForTesting: (@Sendable () async -> Void)?
+        #endif
 
         // MARK: public API
 
@@ -5283,6 +5308,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
 
         private func enqueue(data: Data, url: URL, metadata: WorkspaceSavePayloadMetadata?) {
+            let lifecycleCorrelation = EditFlowPerf.currentLifecycleCorrelation
             WorkspaceSaveTracer.event("workspaceSave.enqueue", metadata: metadata, url: url)
             recordLatestSelectionIfNeeded(metadata)
 
@@ -5294,6 +5320,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 {
                     pending.newestData = data
                     pending.newestMetadata = metadata
+                    pending.newestLifecycleCorrelation = lifecycleCorrelation ?? pending.newestLifecycleCorrelation
                     decision = "replacedExistingNewerSelectionRevision"
                 } else if Self.shouldKeepExistingWorkspacePayload(existing: pending.newestData, incoming: data, url: url) {
                     decision = "keptExistingNewerDate"
@@ -5302,6 +5329,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 } else {
                     pending.newestData = data
                     pending.newestMetadata = metadata
+                    pending.newestLifecycleCorrelation = lifecycleCorrelation ?? pending.newestLifecycleCorrelation
                     decision = "storedAsNewest"
                 }
                 pendingByURL[url] = pending
@@ -5309,7 +5337,12 @@ class WorkspaceManagerViewModel: ObservableObject {
                 return
             }
 
-            pendingByURL[url] = Pending(newestData: data, newestMetadata: metadata, task: nil)
+            pendingByURL[url] = Pending(
+                newestData: data,
+                newestMetadata: metadata,
+                newestLifecycleCorrelation: lifecycleCorrelation,
+                task: nil
+            )
             runNext(for: url)
         }
 
@@ -5334,6 +5367,12 @@ class WorkspaceManagerViewModel: ObservableObject {
                     return false
                 }
                 WorkspaceSaveTracer.event("workspaceSave.syncWrite.begin", metadata: metadata, url: url, extra: ["path": "normalization"])
+                let writeState = EditFlowPerf.begin(EditFlowPerf.Stage.WorkspaceDurability.atomicWrite)
+                EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.WorkspaceDurability.writeBegan)
+                defer {
+                    EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.WorkspaceDurability.writeEnded)
+                    EditFlowPerf.end(EditFlowPerf.Stage.WorkspaceDurability.atomicWrite, writeState)
+                }
                 try data.write(to: url, options: .atomic)
                 recordLatestSelectionIfNeeded(metadata)
                 WorkspaceSaveTracer.event("workspaceSave.syncWrite.success", metadata: metadata, url: url, extra: ["path": "normalization"])
@@ -5347,12 +5386,27 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         func flush(url: URL) async {
             if pendingByURL[url] == nil { return }
+            let lifecycleCorrelation = EditFlowPerf.currentLifecycleCorrelation
+            let flushState = EditFlowPerf.begin(EditFlowPerf.Stage.WorkspaceDurability.flushWait)
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.WorkspaceDurability.flushBegan,
+                correlation: lifecycleCorrelation
+            )
             await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
                 waitersByURL[url, default: []].append(cont)
             }
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.WorkspaceDurability.flushEnded,
+                correlation: lifecycleCorrelation
+            )
+            EditFlowPerf.end(EditFlowPerf.Stage.WorkspaceDurability.flushWait, flushState)
         }
 
         #if DEBUG
+            func setAtomicWriteGateForTesting(_ gate: (@Sendable () async -> Void)?) {
+                atomicWriteGateForTesting = gate
+            }
+
             func removeAllForTesting() {
                 for (_, pending) in pendingByURL {
                     pending.task?.cancel()
@@ -5360,6 +5414,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 pendingByURL.removeAll()
                 latestSelectionByWorkspaceTab.removeAll()
                 lastWrittenSelectionRevisionByWorkspaceTab.removeAll()
+                atomicWriteGateForTesting = nil
                 let allWaiters = waitersByURL.values.flatMap(\.self)
                 waitersByURL.removeAll()
                 for waiter in allWaiters {
@@ -5513,11 +5568,16 @@ class WorkspaceManagerViewModel: ObservableObject {
             guard var slot = pendingByURL[url] else { return }
             let payload = slot.newestData
             let metadata = slot.newestMetadata
+            let lifecycleCorrelation = slot.newestLifecycleCorrelation
             slot.newestData = Data()
             slot.newestMetadata = nil
+            slot.newestLifecycleCorrelation = nil
             pendingByURL[url] = slot
             let latestRecord = metadata?.selectionKey.flatMap { latestSelectionByWorkspaceTab[$0] }
             let lastWrittenRevision = metadata?.selectionKey.map { lastWrittenSelectionRevisionByWorkspaceTab[$0, default: 0] } ?? 0
+            #if DEBUG
+                let atomicWriteGateForTesting = atomicWriteGateForTesting
+            #endif
 
             let task = Task.detached(priority: .utility) { [weak self] in
                 let effective = Self.effectivePayloadForWrite(
@@ -5531,6 +5591,26 @@ class WorkspaceManagerViewModel: ObservableObject {
                 var writeSucceeded = false
                 do {
                     if effective.shouldWrite {
+                        #if DEBUG
+                            await atomicWriteGateForTesting?()
+                        #endif
+                        let writeState = EditFlowPerf.begin(EditFlowPerf.Stage.WorkspaceDurability.atomicWrite)
+                        EditFlowPerf.lifecycleEvent(
+                            EditFlowPerf.Lifecycle.WorkspaceDurability.writeBegan,
+                            correlation: lifecycleCorrelation
+                        )
+                        defer {
+                            EditFlowPerf.lifecycleEvent(
+                                EditFlowPerf.Lifecycle.WorkspaceDurability.writeEnded,
+                                correlation: lifecycleCorrelation,
+                                EditFlowPerf.Dimensions(outcome: writeSucceeded ? "success" : "failed")
+                            )
+                            EditFlowPerf.end(
+                                EditFlowPerf.Stage.WorkspaceDurability.atomicWrite,
+                                writeState,
+                                EditFlowPerf.Dimensions(outcome: writeSucceeded ? "success" : "failed")
+                            )
+                        }
                         try effective.data.write(to: url, options: .atomic)
                         writeSucceeded = true
                         WorkspaceSaveTracer.event("workspaceSave.write.success", metadata: effective.metadata, url: url)

@@ -1,4 +1,5 @@
 import Combine
+import CoreServices
 import Foundation
 
 enum WorkspaceFileTreeSnapshotMode: String {
@@ -120,11 +121,43 @@ actor WorkspaceFileContextStore {
         let enableHierarchicalIgnores: Bool
     }
 
+    private struct ScopedIngressBarrierTarget {
+        let watcherAcceptedWatermark: FileSystemWatcherIngressMailbox.Watermark
+        let acceptedServicePublicationSequence: UInt64
+
+        func covers(_ other: ScopedIngressBarrierTarget) -> Bool {
+            watcherAcceptedWatermark >= other.watcherAcceptedWatermark
+                && acceptedServicePublicationSequence >= other.acceptedServicePublicationSequence
+        }
+    }
+
+    private struct ScopedIngressBarrierFlight {
+        let token: UInt64
+        let target: ScopedIngressBarrierTarget
+        let task: Task<WorkspaceIngressBarrierSample, Never>
+    }
+
+    #if DEBUG
+        struct ScopedIngressBarrierStats: Equatable {
+            let launchCount: Int
+            let joinCount: Int
+            let successorCount: Int
+        }
+    #endif
+
     #if DEBUG
         private var rootLoadWillStartHandler: (@Sendable (String) async -> Void)?
         private var rootLoadDidJoinInFlightHandler: (@Sendable (String) async -> Void)?
         private var rootUnloadDidDetachHandler: (@Sendable ([String]) async -> Void)?
         private var ensureIndexedFilesEligibilityDidResolveHandler: (@Sendable (UUID, String) async -> Void)?
+        private var watcherSinkWillApplyHandler: (@Sendable (UUID) async -> Void)?
+        private var publisherIngressWillWaitHandler: (@Sendable (Set<UUID>) async -> Void)?
+        private var watcherServiceStateWillReconcileHandler: (@Sendable (UUID, Bool) async -> Void)?
+        private var appliedIngressDidCaptureWatermarksHandler: (@Sendable ([UUID: UInt64]) async -> Void)?
+        private var scopedIngressBarrierWillFlushHandler: (@Sendable (UUID) async -> Void)?
+        private var scopedIngressBarrierLaunchCountsByRootID: [UUID: Int] = [:]
+        private var scopedIngressBarrierJoinCountsByRootID: [UUID: Int] = [:]
+        private var scopedIngressBarrierSuccessorCountsByRootID: [UUID: Int] = [:]
 
         func setRootLoadWillStartHandler(_ handler: (@Sendable (String) async -> Void)?) {
             rootLoadWillStartHandler = handler
@@ -140,6 +173,34 @@ actor WorkspaceFileContextStore {
 
         func setEnsureIndexedFilesEligibilityDidResolveHandler(_ handler: (@Sendable (UUID, String) async -> Void)?) {
             ensureIndexedFilesEligibilityDidResolveHandler = handler
+        }
+
+        func setWatcherSinkWillApplyHandler(_ handler: (@Sendable (UUID) async -> Void)?) {
+            watcherSinkWillApplyHandler = handler
+        }
+
+        func setPublisherIngressWillWaitHandler(_ handler: (@Sendable (Set<UUID>) async -> Void)?) {
+            publisherIngressWillWaitHandler = handler
+        }
+
+        func setWatcherServiceStateWillReconcileHandler(_ handler: (@Sendable (UUID, Bool) async -> Void)?) {
+            watcherServiceStateWillReconcileHandler = handler
+        }
+
+        func setAppliedIngressDidCaptureWatermarksHandler(_ handler: (@Sendable ([UUID: UInt64]) async -> Void)?) {
+            appliedIngressDidCaptureWatermarksHandler = handler
+        }
+
+        func setScopedIngressBarrierWillFlushHandler(_ handler: (@Sendable (UUID) async -> Void)?) {
+            scopedIngressBarrierWillFlushHandler = handler
+        }
+
+        func scopedIngressBarrierStatsForTesting(rootID: UUID) -> ScopedIngressBarrierStats {
+            ScopedIngressBarrierStats(
+                launchCount: scopedIngressBarrierLaunchCountsByRootID[rootID] ?? 0,
+                joinCount: scopedIngressBarrierJoinCountsByRootID[rootID] ?? 0,
+                successorCount: scopedIngressBarrierSuccessorCountsByRootID[rootID] ?? 0
+            )
         }
     #endif
 
@@ -194,6 +255,10 @@ actor WorkspaceFileContextStore {
     private var appliedIndexContinuations: [UUID: AsyncStream<WorkspaceAppliedIndexBatchEvent>.Continuation] = [:]
     private var appliedIndexGenerationsByRootID: [UUID: UInt64] = [:]
     private var watcherCancellablesByRootID: [UUID: AnyCancellable] = [:]
+    private let publisherIngressCoordinator = WorkspaceFileSystemIngressCoordinator()
+    private var scopedIngressBarrierFlightsByRootID: [UUID: ScopedIngressBarrierFlight] = [:]
+    private var nextScopedIngressBarrierToken: UInt64 = 0
+    private static let maxConcurrentScopedIngressBarriers = 8
     private var codeScanResultTask: Task<Void, Never>?
 
     deinit {
@@ -260,20 +325,108 @@ actor WorkspaceFileContextStore {
 
     func startWatchingRoot(id rootID: UUID) async throws {
         let state = try state(for: rootID)
-        watcherCancellablesByRootID.removeValue(forKey: rootID)?.cancel()
-        await state.service.startWatchingForChanges()
-        let publisher = await state.service.publisherForChanges()
+        if watcherCancellablesByRootID[rootID] != nil {
+            await reconcileWatcherServiceState(state.service, rootID: rootID)
+            return
+        }
         let root = state.root
-        let cancellable = publisher.sink { [weak self] deltas in
-            Task { await self?.handleObservedFileSystemDeltas(deltas, root: root) }
+        let diagnosticRootToken = state.service.diagnosticRootToken
+        let publisherIngressCoordinator = publisherIngressCoordinator
+        let subscription = publisherIngressCoordinator.openPublisherIngress(rootID: rootID) { [weak self] publication, publicationCorrelation in
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.WorkspaceIngress.storeSinkBegan,
+                correlation: publicationCorrelation,
+                EditFlowPerf.Dimensions(
+                    changeCount: publication.deltas.count,
+                    rootToken: diagnosticRootToken.uuidString,
+                    ingressSequence: publication.watcherAcceptedWatermark?.rawValue,
+                    barrierSequence: publication.servicePublicationSequence
+                )
+            )
+            await self?.handleObservedPublisherFileSystemPublication(
+                publication,
+                root: root,
+                publicationCorrelation: publicationCorrelation,
+                diagnosticRootToken: diagnosticRootToken
+            )
+        }
+        let publisher = await state.service.publisherForChanges()
+        guard rootStatesByID[rootID] != nil,
+              publisherIngressCoordinator.isPublisherIngressOpen(subscription)
+        else {
+            await reconcileWatcherServiceState(state.service, rootID: rootID)
+            return
+        }
+        let cancellable = publisher.sink { publication in
+            #if DEBUG || EDIT_FLOW_PERF
+                let publicationCorrelation = EditFlowPerf.currentFileSystemPublicationCorrelation
+            #else
+                let publicationCorrelation: EditFlowPerf.LifecycleCorrelation? = nil
+            #endif
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.WorkspaceIngress.storeSinkScheduled,
+                correlation: publicationCorrelation,
+                EditFlowPerf.Dimensions(
+                    changeCount: publication.deltas.count,
+                    rootToken: diagnosticRootToken.uuidString,
+                    ingressSequence: publication.watcherAcceptedWatermark?.rawValue,
+                    barrierSequence: publication.servicePublicationSequence
+                )
+            )
+            publisherIngressCoordinator.accept(
+                subscription,
+                publication: publication,
+                lifecycleCorrelation: publicationCorrelation
+            )
+        }
+        guard rootStatesByID[rootID] != nil,
+              publisherIngressCoordinator.isPublisherIngressOpen(subscription)
+        else {
+            cancellable.cancel()
+            await reconcileWatcherServiceState(state.service, rootID: rootID)
+            return
         }
         watcherCancellablesByRootID[rootID] = cancellable
+        await reconcileWatcherServiceState(state.service, rootID: rootID)
     }
 
     func stopWatchingRoot(id rootID: UUID) async {
         watcherCancellablesByRootID.removeValue(forKey: rootID)?.cancel()
-        guard let state = rootStatesByID[rootID] else { return }
-        await state.service.stopWatchingForChanges()
+        publisherIngressCoordinator.closePublisherIngress(rootID: rootID)
+        guard let state = rootStatesByID[rootID] else {
+            await waitForCurrentPublisherIngress(rootIDs: [rootID])
+            return
+        }
+        await reconcileWatcherServiceState(state.service, rootID: rootID)
+        await waitForCurrentPublisherIngress(rootIDs: [rootID])
+    }
+
+    private func reconcileWatcherServiceState(_ service: FileSystemService, rootID: UUID) async {
+        while true {
+            let shouldWatch = publisherIngressCoordinator.hasOpenPublisherIngress(rootID: rootID)
+            #if DEBUG
+                if let watcherServiceStateWillReconcileHandler {
+                    await watcherServiceStateWillReconcileHandler(rootID, shouldWatch)
+                }
+            #endif
+            if shouldWatch {
+                await service.startWatchingForChanges()
+            } else {
+                await service.stopWatchingForChanges()
+            }
+            guard shouldWatch != publisherIngressCoordinator.hasOpenPublisherIngress(rootID: rootID) else { return }
+        }
+    }
+
+    private func waitForCurrentPublisherIngress(rootIDs: Set<UUID>) async {
+        #if DEBUG
+            if publisherIngressCoordinator.pendingPublisherIngressCount(rootIDs: rootIDs) > 0,
+               let publisherIngressWillWaitHandler
+            {
+                await publisherIngressWillWaitHandler(rootIDs)
+            }
+        #endif
+        await publisherIngressCoordinator.waitForCurrentPublisherIngress(rootIDs: rootIDs)
     }
 
     private func yieldFileSystemDeltaEvent(_ event: WorkspaceFileSystemDeltaEvent) {
@@ -299,7 +452,64 @@ actor WorkspaceFileContextStore {
         await handleObservedFileSystemDeltas(deltas, root: root)
     }
 
-    private func handleObservedFileSystemDeltas(_ deltas: [FileSystemDelta], root: WorkspaceRootRecord) async {
+    #if DEBUG
+        func publishSyntheticFileSystemDeltasForTesting(rootID: UUID, deltas: [FileSystemDelta]) async throws {
+            let state = try state(for: rootID)
+            await state.service.publishFileSystemDeltas(deltas, source: .syntheticMutation)
+        }
+
+        func publisherIngressCountForTesting(rootID: UUID) -> Int {
+            publisherIngressCoordinator.pendingPublisherIngressCount(rootIDs: [rootID])
+        }
+
+        func rootWatcherIsActiveForTesting(rootID: UUID) async throws -> Bool {
+            let state = try state(for: rootID)
+            return await state.service.isWatchingForChangesForTesting()
+        }
+
+        func acceptWatcherPayloadForTesting(
+            rootID: UUID,
+            events: [(absolutePath: String, flags: FSEventStreamEventFlags, eventId: FSEventStreamEventId)],
+            scheduleDrain: Bool = true
+        ) async throws -> FileSystemWatcherIngressMailbox.Watermark? {
+            let state = try state(for: rootID)
+            return await state.service.acceptWatcherPayloadForTesting(events, scheduleDrain: scheduleDrain)
+        }
+
+        func appliedIngressSnapshotForTesting(rootID: UUID) -> WorkspaceFileSystemIngressCoordinator.AppliedSnapshot {
+            publisherIngressCoordinator.appliedSnapshot(rootID: rootID)
+        }
+    #endif
+
+    private func handleObservedPublisherFileSystemPublication(
+        _ publication: FileSystemDeltaPublication,
+        root: WorkspaceRootRecord,
+        publicationCorrelation: EditFlowPerf.LifecycleCorrelation?,
+        diagnosticRootToken: UUID
+    ) async {
+        #if DEBUG
+            if let watcherSinkWillApplyHandler {
+                await watcherSinkWillApplyHandler(root.id)
+            }
+        #endif
+        await handleObservedFileSystemDeltas(
+            publication.deltas,
+            root: root,
+            publicationCorrelation: publicationCorrelation,
+            diagnosticRootToken: diagnosticRootToken,
+            watcherAcceptedWatermark: publication.watcherAcceptedWatermark,
+            servicePublicationSequence: publication.servicePublicationSequence
+        )
+    }
+
+    private func handleObservedFileSystemDeltas(
+        _ deltas: [FileSystemDelta],
+        root: WorkspaceRootRecord,
+        publicationCorrelation: EditFlowPerf.LifecycleCorrelation? = nil,
+        diagnosticRootToken: UUID? = nil,
+        watcherAcceptedWatermark: FileSystemWatcherIngressMailbox.Watermark? = nil,
+        servicePublicationSequence: UInt64? = nil
+    ) async {
         guard rootStatesByID[root.id] != nil else { return }
         for delta in deltas {
             guard await isDiscoveryFacingFileSystemDelta(delta, rootID: root.id) else { continue }
@@ -312,6 +522,16 @@ actor WorkspaceFileContextStore {
         let preparedDeltas = FileSystemDeltaPreparation.coalesce(deltas, inRoot: root.standardizedFullPath)
             .compactMap { FileSystemDeltaPreparation.prepare($0, inRoot: root.standardizedFullPath) }
         await applyPreparedIndexDeltas(rootID: root.id, deltas: preparedDeltas)
+        EditFlowPerf.lifecycleEvent(
+            EditFlowPerf.Lifecycle.WorkspaceIngress.storeCanonicalApplyCompleted,
+            correlation: publicationCorrelation,
+            EditFlowPerf.Dimensions(
+                appliedCount: preparedDeltas.count,
+                rootToken: diagnosticRootToken?.uuidString,
+                ingressSequence: watcherAcceptedWatermark?.rawValue,
+                barrierSequence: servicePublicationSequence
+            )
+        )
     }
 
     private func isDiscoveryFacingFileSystemDelta(_ delta: FileSystemDelta, rootID: UUID) async -> Bool {
@@ -495,19 +715,202 @@ actor WorkspaceFileContextStore {
         }
     }
 
-    func flushPendingServiceEventsForAllRoots() async -> [(rootPath: String, pendingRawEventCountBeforeFlush: Int)] {
-        var samples: [(rootPath: String, pendingRawEventCountBeforeFlush: Int)] = []
-        for rootID in rootLoadOrder {
-            guard let state = rootStatesByID[rootID] else { continue }
+    /// Awaits callback payloads accepted before the captured cut through canonical store application.
+    ///
+    /// FSEvents not yet delivered by macOS remain outside this contract. Later accepted callbacks
+    /// may join the same actor-visible batch or overflow sentinel, so the captured watcher cut is a
+    /// lower bound rather than a strict exclusion boundary. Synthetic publications are ordered with
+    /// watcher publications and included in the downstream service-publication cut, but they do not
+    /// advance watcher-accepted watermarks.
+    func awaitAppliedIngressForAllRoots() async -> [WorkspaceIngressBarrierSample] {
+        await awaitAppliedIngress(rootIDs: rootLoadOrder)
+    }
+
+    /// Awaits freshness only for roots represented by `rootScope`.
+    /// Concurrent requests for the same root share a watermark-keyed flight when the
+    /// existing flight covers both the callback-accepted and publisher-accepted cuts.
+    func awaitAppliedIngress(rootScope: WorkspaceLookupRootScope) async -> [WorkspaceIngressBarrierSample] {
+        await awaitAppliedIngress(rootIDs: rootsForPathLookup(scope: rootScope).map(\.id))
+    }
+
+    /// Resolves the narrowest safe workspace freshness scope for an explicit request.
+    /// Absolute paths await only their containing loaded root. Absolute paths outside all
+    /// loaded roots (including always-readable support files) do not pay a workspace barrier.
+    /// Relative and alias-shaped paths await the caller's fallback scope because resolution
+    /// may depend on more than one candidate root.
+    func awaitAppliedIngressForExplicitRequest(
+        userPath: String,
+        fallbackScope: WorkspaceLookupRootScope
+    ) async -> [WorkspaceIngressBarrierSample] {
+        let trimmed = userPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        let expanded = (trimmed as NSString).expandingTildeInPath
+        let standardized = (expanded as NSString).standardizingPath
+        guard standardized.hasPrefix("/") else {
+            return await awaitAppliedIngress(rootScope: fallbackScope)
+        }
+        let containingRootID = rootLoadOrder.compactMap { rootID -> WorkspaceRootRecord? in
+            rootStatesByID[rootID]?.root
+        }
+        .filter { StandardizedPath.isDescendant(standardized, of: $0.standardizedFullPath) }
+        .max { $0.standardizedFullPath.count < $1.standardizedFullPath.count }?
+        .id
+        guard let containingRootID else { return [] }
+        return await awaitAppliedIngress(rootIDs: [containingRootID])
+    }
+
+    private func awaitAppliedIngress(rootIDs: [UUID]) async -> [WorkspaceIngressBarrierSample] {
+        let orderedRootIDs = rootIDs.reduce(into: [UUID]()) { result, rootID in
+            guard rootStatesByID[rootID] != nil, !result.contains(rootID) else { return }
+            result.append(rootID)
+        }
+        guard !orderedRootIDs.isEmpty else { return [] }
+
+        let targetsByRootID = Dictionary(uniqueKeysWithValues: orderedRootIDs.compactMap { rootID in
+            rootStatesByID[rootID].map { state in
+                (
+                    rootID,
+                    ScopedIngressBarrierTarget(
+                        watcherAcceptedWatermark: state.service.captureAcceptedWatcherWatermark(),
+                        acceptedServicePublicationSequence: publisherIngressCoordinator.appliedSnapshot(rootID: rootID)
+                            .acceptedServicePublicationSequence
+                    )
+                )
+            }
+        })
+
+        #if DEBUG
+            if let appliedIngressDidCaptureWatermarksHandler {
+                await appliedIngressDidCaptureWatermarksHandler(targetsByRootID.mapValues { $0.watcherAcceptedWatermark.rawValue })
+            }
+        #endif
+
+        var samplesByIndex: [Int: WorkspaceIngressBarrierSample] = [:]
+        for chunkStart in stride(from: 0, to: orderedRootIDs.count, by: Self.maxConcurrentScopedIngressBarriers) {
+            let chunkEnd = min(chunkStart + Self.maxConcurrentScopedIngressBarriers, orderedRootIDs.count)
+            await withTaskGroup(of: (Int, WorkspaceIngressBarrierSample?).self) { group in
+                for index in chunkStart ..< chunkEnd {
+                    let rootID = orderedRootIDs[index]
+                    guard let target = targetsByRootID[rootID] else { continue }
+                    group.addTask { [weak self] in
+                        await (index, self?.awaitAppliedIngress(rootID: rootID, target: target))
+                    }
+                }
+                for await (index, sample) in group {
+                    if let sample { samplesByIndex[index] = sample }
+                }
+            }
+        }
+        return samplesByIndex.keys.sorted().compactMap { samplesByIndex[$0] }
+    }
+
+    private func awaitAppliedIngress(
+        rootID: UUID,
+        target: ScopedIngressBarrierTarget
+    ) async -> WorkspaceIngressBarrierSample? {
+        guard let state = rootStatesByID[rootID] else { return nil }
+        if let flight = scopedIngressBarrierFlightsByRootID[rootID], flight.target.covers(target) {
             #if DEBUG
-                let pendingCount = await state.service.pendingRawEventCountForDiagnostics()
+                scopedIngressBarrierJoinCountsByRootID[rootID, default: 0] += 1
+            #endif
+            return await flight.task.value
+        }
+
+        let isSuccessor = scopedIngressBarrierFlightsByRootID[rootID] != nil
+        nextScopedIngressBarrierToken &+= 1
+        let token = nextScopedIngressBarrierToken
+        let publisherIngressCoordinator = publisherIngressCoordinator
+        let root = state.root
+        let service = state.service
+        #if DEBUG
+            scopedIngressBarrierLaunchCountsByRootID[rootID, default: 0] += 1
+            if isSuccessor {
+                scopedIngressBarrierSuccessorCountsByRootID[rootID, default: 0] += 1
+            }
+            let scopedIngressBarrierWillFlushHandler = scopedIngressBarrierWillFlushHandler
+            let publisherIngressWillWaitHandler = publisherIngressWillWaitHandler
+        #endif
+        #if DEBUG || EDIT_FLOW_PERF
+            let lifecycleCorrelation = EditFlowPerf.currentLifecycleCorrelation
+        #else
+            let lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation? = nil
+        #endif
+        let task = Task {
+            #if DEBUG
+                if let scopedIngressBarrierWillFlushHandler {
+                    await scopedIngressBarrierWillFlushHandler(rootID)
+                }
+                let pendingCount = await service.pendingRawEventCountForDiagnostics()
             #else
                 let pendingCount = 0
             #endif
-            samples.append((rootPath: state.root.standardizedFullPath, pendingRawEventCountBeforeFlush: pendingCount))
-            await state.service.flushPendingEventsNow()
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.WorkspaceIngress.rootFlushBegan,
+                correlation: lifecycleCorrelation,
+                EditFlowPerf.Dimensions(
+                    pendingRawEventCount: pendingCount,
+                    rootToken: service.diagnosticRootToken.uuidString,
+                    ingressSequence: target.watcherAcceptedWatermark.rawValue
+                )
+            )
+            #if DEBUG
+                if target.acceptedServicePublicationSequence > publisherIngressCoordinator.appliedSnapshot(rootID: rootID).appliedServicePublicationSequence,
+                   let publisherIngressWillWaitHandler
+                {
+                    await publisherIngressWillWaitHandler([rootID])
+                }
+            #endif
+            await publisherIngressCoordinator.waitUntilApplied(
+                rootID: rootID,
+                servicePublicationSequence: target.acceptedServicePublicationSequence
+            )
+            let publishedSequence = await service.flushPendingEventsNow(
+                throughAcceptedWatcherWatermark: target.watcherAcceptedWatermark
+            )
+            let acceptedDownstreamCut = publisherIngressCoordinator.appliedSnapshot(rootID: rootID)
+                .acceptedServicePublicationSequence
+            await publisherIngressCoordinator.waitUntilApplied(
+                rootID: rootID,
+                servicePublicationSequence: max(target.acceptedServicePublicationSequence, acceptedDownstreamCut)
+            )
+            let applied = publisherIngressCoordinator.appliedSnapshot(rootID: rootID)
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.WorkspaceIngress.rootFlushEnded,
+                correlation: lifecycleCorrelation,
+                EditFlowPerf.Dimensions(
+                    pendingRawEventCount: pendingCount,
+                    rootToken: service.diagnosticRootToken.uuidString,
+                    ingressSequence: applied.appliedWatcherWatermark.rawValue,
+                    barrierSequence: applied.appliedServicePublicationSequence
+                )
+            )
+            return WorkspaceIngressBarrierSample(
+                rootID: rootID,
+                rootPath: root.standardizedFullPath,
+                pendingRawEventCountBeforeFlush: pendingCount,
+                acceptedWatcherWatermark: target.watcherAcceptedWatermark.rawValue,
+                publishedServicePublicationSequence: publishedSequence,
+                appliedServicePublicationSequence: applied.appliedServicePublicationSequence,
+                appliedWatcherWatermark: applied.appliedWatcherWatermark.rawValue
+            )
         }
-        return samples
+        scopedIngressBarrierFlightsByRootID[rootID] = ScopedIngressBarrierFlight(
+            token: token,
+            target: target,
+            task: task
+        )
+        let sample = await task.value
+        if scopedIngressBarrierFlightsByRootID[rootID]?.token == token {
+            scopedIngressBarrierFlightsByRootID.removeValue(forKey: rootID)
+        }
+        return sample
+    }
+
+    /// Compatibility wrapper for callers that still consume the original diagnostic shape.
+    func flushPendingServiceEventsForAllRoots() async -> [(rootPath: String, pendingRawEventCountBeforeFlush: Int)] {
+        await awaitAppliedIngressForAllRoots().map { sample in
+            (sample.rootPath, sample.pendingRawEventCountBeforeFlush)
+        }
     }
 
     // MARK: - Deferred replay buffer ownership
@@ -1358,6 +1761,7 @@ actor WorkspaceFileContextStore {
         var statesToUnload: [(rootID: UUID, state: RootState)] = []
         for rootID in orderedRootIDs {
             watcherCancellablesByRootID.removeValue(forKey: rootID)?.cancel()
+            publisherIngressCoordinator.closePublisherIngress(rootID: rootID)
             guard let state = rootStatesByID.removeValue(forKey: rootID) else { continue }
             statesToUnload.append((rootID, state))
         }
@@ -1412,7 +1816,7 @@ actor WorkspaceFileContextStore {
             #if DEBUG
                 let stopWatcherRootStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
             #endif
-            await entry.state.service.stopWatchingForChanges()
+            await reconcileWatcherServiceState(entry.state.service, rootID: entry.rootID)
             #if DEBUG
                 WorkspaceRestorePerfLog.event(
                     "store.rootUnload.stopWatcherRoot",
@@ -1424,6 +1828,8 @@ actor WorkspaceFileContextStore {
                 )
             #endif
         }
+        await waitForCurrentPublisherIngress(rootIDs: removedRootIDSet)
+        publisherIngressCoordinator.finishPublisherIngress(rootIDs: removedRootIDSet)
         #if DEBUG
             WorkspaceRestorePerfLog.event(
                 "store.rootUnload.stopWatchers",
@@ -1526,14 +1932,28 @@ actor WorkspaceFileContextStore {
         return foldersByID[folderID]
     }
 
-    func readContent(rootID: UUID, relativePath: String) async throws -> String? {
+    func readContent(
+        rootID: UUID,
+        relativePath: String,
+        workloadClass: ContentReadWorkloadClass = .unspecified
+    ) async throws -> String? {
         let state = try state(for: rootID)
-        return try await state.service.loadContent(ofRelativePath: StandardizedPath.relative(relativePath))
+        return try await state.service.loadContent(
+            ofRelativePath: StandardizedPath.relative(relativePath),
+            workloadClass: workloadClass
+        )
     }
 
-    func readContentWithDate(rootID: UUID, relativePath: String) async throws -> (content: String?, modificationDate: Date) {
+    func readContentWithDate(
+        rootID: UUID,
+        relativePath: String,
+        workloadClass: ContentReadWorkloadClass = .unspecified
+    ) async throws -> (content: String?, modificationDate: Date) {
         let state = try state(for: rootID)
-        return try await state.service.loadContentWithDate(ofRelativePath: StandardizedPath.relative(relativePath))
+        return try await state.service.loadContentWithDate(
+            ofRelativePath: StandardizedPath.relative(relativePath),
+            workloadClass: workloadClass
+        )
     }
 
     func fileExistsOnDisk(rootID: UUID, relativePath: String) async throws -> Bool {
@@ -1737,7 +2157,10 @@ actor WorkspaceFileContextStore {
         for file in files {
             guard isDiscoverableFileID(file.id), let state = rootStatesByID[file.rootID] else { continue }
             do {
-                let loaded = try await state.service.loadContentWithDate(ofRelativePath: file.standardizedRelativePath)
+                let loaded = try await state.service.loadContentWithDate(
+                    ofRelativePath: file.standardizedRelativePath,
+                    workloadClass: .codemap
+                )
                 guard let content = loaded.content else { continue }
                 requests.append(CodeScanActor.ScanRequest(
                     fileID: file.id,

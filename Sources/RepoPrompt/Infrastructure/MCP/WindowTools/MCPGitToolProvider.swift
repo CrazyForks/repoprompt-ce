@@ -22,6 +22,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
     private func gitTool() -> Tool {
         runtime.tool(
             name: MCPWindowToolName.git,
+            freshnessPolicy: .providerManaged,
             description: """
             Safe, read-only git operations.
 
@@ -1071,7 +1072,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                     }
 
                     await dependencies.ensureGitDataRootLoaded(workspace, workspaceManager)
-                    _ = await dependencies.promptVM.workspaceFileContextStore.flushPendingServiceEventsForAllRoots()
+                    _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: .visibleWorkspacePlusGitData)
                     let primaryArtifactCandidates = perRepoResults.flatMap { repoResult -> [String] in
                         guard let snapshotDir = repoResult.snapshotDir,
                               let artifacts = repoResult.artifacts
@@ -1146,7 +1147,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                 )
 
                 await dependencies.ensureGitDataRootLoaded(workspace, workspaceManager)
-                _ = await dependencies.promptVM.workspaceFileContextStore.flushPendingServiceEventsForAllRoots()
+                _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: .visibleWorkspacePlusGitData)
                 let snapshotID = manifest.snapshotID
                 let snapshotDirURL = store.snapshotDir(workspaceDirectory: workspaceDirectory, repoKey: primaryRepo.repoKey, snapshotID: snapshotID)
                 let snapshotDirRel = store.snapshotRelativePath(repoKey: primaryRepo.repoKey, snapshotID: snapshotID)

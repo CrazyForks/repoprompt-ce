@@ -137,7 +137,7 @@ extension FileSystemService {
         }
 
         // 6) Emit synthetic deltas so the UI updates before FSEvents arrive
-        changePublisher.send([.fileRemoved(stdOld), .fileAdded(stdNew)])
+        publishFileSystemDeltas([.fileRemoved(stdOld), .fileAdded(stdNew)], source: .syntheticMutation)
     }
 
     func createFile(atRelativePath relativePath: String, content: String) async throws {
@@ -198,7 +198,7 @@ extension FileSystemService {
         }
 
         // emit a *synthetic* delta so the UI updates immediately
-        changePublisher.send([.fileAdded(target.relativePath)])
+        publishFileSystemDeltas([.fileAdded(target.relativePath)], source: .syntheticMutation)
     }
 
     func deleteFile(atRelativePath relativePath: String) async throws {
@@ -212,7 +212,7 @@ extension FileSystemService {
             throw FileSystemError.failedToDeleteFile(error)
         }
         forgetTrackedPath(target.relativePath)
-        changePublisher.send([.fileRemoved(target.relativePath)])
+        publishFileSystemDeltas([.fileRemoved(target.relativePath)], source: .syntheticMutation)
     }
 
     func moveItemToTrash(atRelativePath relativePath: String) async throws {
@@ -245,7 +245,7 @@ extension FileSystemService {
             deltas = [isDirectory.boolValue ? .folderRemoved(normalizedRelativePath) : .fileRemoved(normalizedRelativePath)]
         }
         if !deltas.isEmpty {
-            changePublisher.send(deltas)
+            publishFileSystemDeltas(deltas, source: .syntheticMutation)
         }
     }
 
@@ -321,7 +321,7 @@ extension FileSystemService {
 
         // emit a *synthetic* delta so the UI updates immediately, with mtime if available
         let mdate = try? await getFileModificationDate(atRelativePath: target.relativePath)
-        changePublisher.send([.fileModified(target.relativePath, mdate)])
+        publishFileSystemDeltas([.fileModified(target.relativePath, mdate)], source: .syntheticMutation)
     }
 
     func checkFilePermissions(atRelativePath relativePath: String) -> Bool {

@@ -123,7 +123,12 @@ actor InteractiveMCPClientSession {
         logger.debug("Bootstrap handshake complete, FD=\(connectedFD)")
 
         // Create transport with the connected FD
-        let transport = BootstrapSocketMCPTransport(connectedFD: connectedFD, logger: logger)
+        let transport: BootstrapSocketMCPTransport
+        do {
+            transport = try BootstrapSocketMCPTransport(connectedFD: connectedFD, logger: logger)
+        } catch let error as POSIXDescriptorConfigurationError {
+            throw InteractiveSessionError.descriptorConfigurationFailed(errno: error.errnoValue)
+        }
 
         // Create MCP client
         let client = MCP.Client(
@@ -598,8 +603,15 @@ actor InteractiveMCPClientSession {
         var shouldCloseFD = true
         defer {
             if shouldCloseFD {
+                POSIXDescriptorSupport.shutdownSocketReadWrite(fd)
                 Darwin.close(fd)
             }
+        }
+
+        do {
+            try POSIXDescriptorSupport.setCloseOnExec(fd)
+        } catch let error as POSIXDescriptorConfigurationError {
+            throw InteractiveSessionError.descriptorConfigurationFailed(errno: error.errnoValue)
         }
 
         // Disable SIGPIPE
@@ -751,6 +763,7 @@ actor InteractiveMCPClientSession {
 enum InteractiveSessionError: Swift.Error, CustomStringConvertible {
     case notConnected
     case socketCreationFailed(errno: Int32)
+    case descriptorConfigurationFailed(errno: Int32)
     case pathTooLong
     case connectFailed(errno: Int32)
     case appNotRunning
@@ -770,6 +783,8 @@ enum InteractiveSessionError: Swift.Error, CustomStringConvertible {
             return "Not connected to MCP server"
         case let .socketCreationFailed(errno):
             return "Failed to create socket: \(errno)"
+        case let .descriptorConfigurationFailed(errno):
+            return "Failed to configure socket descriptor: \(errno)"
         case .pathTooLong:
             return "Socket path too long"
         case let .connectFailed(errno):

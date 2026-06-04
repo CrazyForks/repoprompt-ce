@@ -9,7 +9,7 @@ import SystemPackage
 // MARK: - Version Constants
 
 /// Update this when releasing new versions
-let CLI_VERSION = "1.0.4"
+let CLI_VERSION = "1.0.5"
 
 /// CLI verbose mode - controls debug output (enabled by --verbose flag)
 var cliVerboseMode = false
@@ -176,6 +176,7 @@ enum CLIEventLogger {
                 switch socketError {
                 case let .connectFailed(errno),
                      let .socketCreationFailed(errno),
+                     let .descriptorConfigurationFailed(errno),
                      let .bindFailed(errno),
                      let .listenFailed(errno),
                      let .acceptFailed(errno),
@@ -326,6 +327,7 @@ actor ClientIdentityCache {
 /// Socket proxy errors
 enum SocketProxyError: Swift.Error, LocalizedError {
     case socketCreationFailed(errno: Int32)
+    case descriptorConfigurationFailed(errno: Int32)
     case pathTooLong
     case bindFailed(errno: Int32)
     case listenFailed(errno: Int32)
@@ -355,6 +357,8 @@ enum SocketProxyError: Swift.Error, LocalizedError {
         switch self {
         case let .socketCreationFailed(errno):
             return "Failed to create socket: \(errno)"
+        case let .descriptorConfigurationFailed(errno):
+            return "Failed to configure socket descriptor: \(errno)"
         case .pathTooLong:
             return "Socket path too long"
         case let .bindFailed(errno):
@@ -528,6 +532,13 @@ actor BootstrapSocketProxy {
             throw SocketProxyError.socketCreationFailed(errno: errno)
         }
 
+        do {
+            try POSIXDescriptorSupport.setCloseOnExec(fd)
+        } catch let error as POSIXDescriptorConfigurationError {
+            Darwin.close(fd)
+            throw SocketProxyError.descriptorConfigurationFailed(errno: error.errnoValue)
+        }
+
         // Disable SIGPIPE
         var noSigPipe: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
@@ -581,6 +592,7 @@ actor BootstrapSocketProxy {
 
     private func closeSocket() {
         if socketFD >= 0 {
+            POSIXDescriptorSupport.shutdownSocketReadWrite(socketFD)
             Darwin.close(socketFD)
             socketFD = -1
         }
@@ -1075,6 +1087,13 @@ actor MCPService: Service {
             log.warning("Failed to open kill signals directory for watching")
             return
         }
+        do {
+            try POSIXDescriptorSupport.setCloseOnExec(fd)
+        } catch {
+            close(fd)
+            log.warning("Failed to configure kill signals directory watcher descriptor: \(error)")
+            return
+        }
         killSignalFD = fd
 
         let source = DispatchSource.makeFileSystemObjectSource(
@@ -1092,10 +1111,8 @@ actor MCPService: Service {
             }
         }
 
-        source.setCancelHandler { [weak self] in
-            Task { [weak self] in
-                await self?.closeKillSignalFD()
-            }
+        source.setCancelHandler {
+            close(fd)
         }
 
         killSignalSource = source
@@ -1149,17 +1166,11 @@ actor MCPService: Service {
         }
     }
 
-    private func closeKillSignalFD() {
-        if killSignalFD >= 0 {
-            close(killSignalFD)
-            killSignalFD = -1
-        }
-    }
-
     private func teardownKillSignalWatcher() {
-        killSignalSource?.cancel()
+        let source = killSignalSource
         killSignalSource = nil
-        closeKillSignalFD()
+        killSignalFD = -1
+        source?.cancel()
         killSignalContinuation = nil
     }
 
@@ -1242,6 +1253,7 @@ actor MCPService: Service {
                  .handshakeFailed,
                  .protocolVersionMismatch,
                  .socketCreationFailed,
+                 .descriptorConfigurationFailed,
                  .pathTooLong,
                  .bindFailed,
                  .listenFailed,

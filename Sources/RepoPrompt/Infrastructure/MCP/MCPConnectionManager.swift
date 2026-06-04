@@ -203,6 +203,92 @@ struct IdentityContextSnapshot {
 // MCPServerConnection implementation is BootstrapSocketConnectionManager (in a separate file).
 // No replacement code is needed; we now go directly to ServerNetworkManager.
 
+/// Lock-protected ownership ledger for accepted bootstrap descriptors after handshake
+/// ownership transfer but before actor-processed deferred registration. Full shutdown
+/// invalidates one lifecycle and drains its descriptors synchronously.
+private final class BootstrapTransferredSocketLedger: @unchecked Sendable {
+    private struct Entry {
+        let lifecycleGeneration: UInt64
+        let fd: Int32
+    }
+
+    private let lock = NSLock()
+    private var activeLifecycleGeneration: UInt64?
+    private var entriesByConnectionID: [UUID: Entry] = [:]
+
+    func activate(lifecycleGeneration: UInt64) {
+        lock.lock()
+        activeLifecycleGeneration = lifecycleGeneration
+        lock.unlock()
+    }
+
+    func publish(connectionID: UUID, lifecycleGeneration: UInt64, fd: Int32) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard activeLifecycleGeneration == lifecycleGeneration,
+              entriesByConnectionID[connectionID] == nil
+        else { return false }
+        entriesByConnectionID[connectionID] = Entry(lifecycleGeneration: lifecycleGeneration, fd: fd)
+        return true
+    }
+
+    func contains(connectionID: UUID, lifecycleGeneration: UInt64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard activeLifecycleGeneration == lifecycleGeneration,
+              let entry = entriesByConnectionID[connectionID]
+        else { return false }
+        return entry.lifecycleGeneration == lifecycleGeneration
+    }
+
+    func claim(connectionID: UUID, lifecycleGeneration: UInt64) -> Int32? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard activeLifecycleGeneration == lifecycleGeneration,
+              let entry = entriesByConnectionID[connectionID],
+              entry.lifecycleGeneration == lifecycleGeneration
+        else { return nil }
+        entriesByConnectionID.removeValue(forKey: connectionID)
+        return entry.fd
+    }
+
+    func remove(connectionID: UUID, lifecycleGeneration: UInt64) -> Int32? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let entry = entriesByConnectionID[connectionID],
+              entry.lifecycleGeneration == lifecycleGeneration
+        else { return nil }
+        entriesByConnectionID.removeValue(forKey: connectionID)
+        return entry.fd
+    }
+
+    func invalidateAndDrain(lifecycleGeneration: UInt64) -> [Int32] {
+        lock.lock()
+        defer { lock.unlock() }
+        guard activeLifecycleGeneration == lifecycleGeneration else { return [] }
+        activeLifecycleGeneration = nil
+        let matchingEntries = entriesByConnectionID.filter { $0.value.lifecycleGeneration == lifecycleGeneration }
+        for connectionID in matchingEntries.keys {
+            entriesByConnectionID.removeValue(forKey: connectionID)
+        }
+        return matchingEntries.values.map(\.fd)
+    }
+
+    var isEmptyAndInactive: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return activeLifecycleGeneration == nil && entriesByConnectionID.isEmpty
+    }
+
+    #if DEBUG
+        var debugEntryCount: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return entriesByConnectionID.count
+        }
+    #endif
+}
+
 /// Manages all MCP connections using the bootstrap UNIX-domain socket.
 /// TCP/Bonjour transport has been removed.
 actor ServerNetworkManager {
@@ -470,15 +556,19 @@ actor ServerNetworkManager {
     }
 
     private var isRunningState: Bool = false
+    private var lifecycleGeneration: UInt64 = 0
     private var isEnabledState: Bool = true
 
     // Bootstrap socket server
     private var bootstrapSocketServer: BootstrapSocketServer?
+    private var bootstrapSocketServerLifecycleGeneration: UInt64?
     private var bootstrapSocketTask: Task<Void, Never>?
     private var maintenanceTask: Task<Void, Never>?
     private var bootstrapStartInProgress: Bool = false
+    private var bootstrapStartLifecycleGeneration: UInt64?
     private var bootstrapRestartInProgress: Bool = false
     private var bootstrapRestartToken: UUID?
+    private var bootstrapRestartLifecycleGeneration: UInt64?
     private var lastBootstrapRestartAt: Date = .distantPast
     private let bootstrapRestartMinInterval: TimeInterval = 2.0
     private var bootstrapStartFailures: Int = 0
@@ -503,7 +593,17 @@ actor ServerNetworkManager {
             case productionSocketURLRejected
         }
 
+        enum DebugLifecycleFenceCheckpoint: Hashable {
+            case listenerPublishedBeforeStartInvocation
+            case listenerStopReturnedBeforeConditionalClear
+            case restartTaskBeforePerform
+        }
+
         private var testBootstrapSocketURLOverride: URL?
+        private var debugLifecycleFenceCheckpointsToSuspend: Set<DebugLifecycleFenceCheckpoint> = []
+        private var debugSuspendedLifecycleFenceCheckpoints: Set<DebugLifecycleFenceCheckpoint> = []
+        private var debugLifecycleFenceCheckpointResumeWaiters: [DebugLifecycleFenceCheckpoint: [CheckedContinuation<Void, Never>]] = [:]
+        private var debugBootstrapRestartTaskCompletionCount = 0
 
         func debugInstallBootstrapSocketURLOverride(_ socketURL: URL) throws {
             try debugRequireFullyStoppedForBootstrapSocketURLOverride()
@@ -536,18 +636,98 @@ actor ServerNetworkManager {
             isEnabledState
         }
 
+        func debugSuspendNextLifecycleFenceCheckpoint(_ checkpoint: DebugLifecycleFenceCheckpoint) {
+            debugLifecycleFenceCheckpointsToSuspend.insert(checkpoint)
+        }
+
+        func debugIsLifecycleFenceCheckpointSuspended(_ checkpoint: DebugLifecycleFenceCheckpoint) -> Bool {
+            debugSuspendedLifecycleFenceCheckpoints.contains(checkpoint)
+        }
+
+        func debugResumeLifecycleFenceCheckpoint(_ checkpoint: DebugLifecycleFenceCheckpoint) {
+            debugLifecycleFenceCheckpointsToSuspend.remove(checkpoint)
+            debugSuspendedLifecycleFenceCheckpoints.remove(checkpoint)
+            let waiters = debugLifecycleFenceCheckpointResumeWaiters.removeValue(forKey: checkpoint) ?? []
+            waiters.forEach { $0.resume() }
+        }
+
+        func debugResumeAllLifecycleFenceCheckpoints() {
+            let checkpoints = debugLifecycleFenceCheckpointsToSuspend
+                .union(debugSuspendedLifecycleFenceCheckpoints)
+                .union(debugLifecycleFenceCheckpointResumeWaiters.keys)
+            checkpoints.forEach { debugResumeLifecycleFenceCheckpoint($0) }
+        }
+
+        func debugLifecycleGenerationForLifecycleFenceTest() -> UInt64 {
+            lifecycleGeneration
+        }
+
+        func debugBootstrapListenerLifecycleGenerationForLifecycleFenceTest() -> UInt64? {
+            bootstrapSocketServerLifecycleGeneration
+        }
+
+        func debugBootstrapListenerIdentityForLifecycleFenceTest() -> ObjectIdentifier? {
+            bootstrapSocketServer.map(ObjectIdentifier.init)
+        }
+
+        func debugBootstrapRestartTaskCompletionCountForLifecycleFenceTest() -> Int {
+            debugBootstrapRestartTaskCompletionCount
+        }
+
+        func debugConnectionWaiterCountForLifecycleFenceTest() -> Int {
+            connectionWaiters.count
+        }
+
+        func debugHasCurrentBootstrapListenerForLifecycleFenceTest() -> Bool {
+            guard let bootstrapSocketServer else { return false }
+            return isCurrentBootstrapListener(bootstrapSocketServer, lifecycleGeneration: lifecycleGeneration)
+        }
+
+        func debugScheduleDelayedBootstrapRestartForLifecycleFenceTest(delay: TimeInterval) -> Bool {
+            lastBootstrapRestartAt = .distantPast
+            let tokenBeforeRestart = bootstrapRestartToken
+            restartBootstrapSocketServer(
+                reason: "DEBUG lifecycle fence test",
+                delay: delay,
+                lifecycleGeneration: lifecycleGeneration
+            )
+            return bootstrapRestartToken != tokenBeforeRestart
+                && bootstrapRestartLifecycleGeneration == lifecycleGeneration
+        }
+
+        private func debugSuspendLifecycleFenceCheckpointIfNeeded(_ checkpoint: DebugLifecycleFenceCheckpoint) async {
+            guard debugLifecycleFenceCheckpointsToSuspend.remove(checkpoint) != nil else { return }
+            debugSuspendedLifecycleFenceCheckpoints.insert(checkpoint)
+            await withCheckedContinuation { continuation in
+                debugLifecycleFenceCheckpointResumeWaiters[checkpoint, default: []].append(continuation)
+            }
+            debugSuspendedLifecycleFenceCheckpoints.remove(checkpoint)
+        }
+
+        private func debugRecordBootstrapRestartTaskCompletion() {
+            debugBootstrapRestartTaskCompletionCount += 1
+        }
+
         private func debugRequireFullyStoppedForBootstrapSocketURLOverride() throws {
             guard !isRunningState,
                   bootstrapSocketServer == nil,
+                  bootstrapSocketServerLifecycleGeneration == nil,
                   bootstrapSocketTask == nil,
                   maintenanceTask == nil,
                   !bootstrapStartInProgress,
+                  bootstrapStartLifecycleGeneration == nil,
                   !bootstrapRestartInProgress,
                   bootstrapRestartToken == nil,
+                  bootstrapRestartLifecycleGeneration == nil,
+                  debugLifecycleFenceCheckpointsToSuspend.isEmpty,
+                  debugSuspendedLifecycleFenceCheckpoints.isEmpty,
+                  debugLifecycleFenceCheckpointResumeWaiters.isEmpty,
                   connections.isEmpty,
+                  connectionLifecycleGenerationByID.isEmpty,
                   connectionTasks.isEmpty,
                   pendingConnections.isEmpty,
                   bootstrapReservations.isEmpty,
+                  transferredBootstrapSockets.isEmptyAndInactive,
                   connectionWaiters.isEmpty
             else {
                 throw DebugBootstrapSocketURLOverrideError.managerNotFullyStopped
@@ -583,6 +763,7 @@ actor ServerNetworkManager {
     #endif
 
     private var connections: [UUID: any MCPServerConnection] = [:]
+    private var connectionLifecycleGenerationByID: [UUID: UInt64] = [:]
     private var connectionTasks: [UUID: Task<Void, Never>] = [:]
     private var pendingConnections: [UUID: String] = [:]
 
@@ -788,6 +969,7 @@ actor ServerNetworkManager {
 
     /// 🆕 Connection waiter continuations (replaces polling in waitForNewConnection)
     private struct ConnectionWaiter {
+        let lifecycleGeneration: UInt64
         let clientName: String?
         let excludeExisting: Set<UUID>
         let continuation: CheckedContinuation<UUID?, Never>
@@ -830,10 +1012,14 @@ actor ServerNetworkManager {
     /// This prevents burst scenarios where multiple concurrent accepts could exceed maxGlobalConnections.
     private struct BootstrapReservation {
         let connectionID: UUID
+        let lifecycleGeneration: UInt64
         let createdAt: Date
     }
 
     private var bootstrapReservations: [UUID: BootstrapReservation] = [:]
+    /// Synchronously visible ownership for transferred bootstrap sockets that are
+    /// awaiting deferred actor registration.
+    private let transferredBootstrapSockets = BootstrapTransferredSocketLedger()
     /// Safety-net TTL for reservations (should be released via commit/rollback, but this catches edge cases).
     /// Use a generous value to avoid expiring legitimate reservations under load.
     private let bootstrapReservationTTL: TimeInterval = 60.0
@@ -844,15 +1030,41 @@ actor ServerNetworkManager {
     }
 
     /// Reserve a slot for an incoming bootstrap connection (called before returning .accept)
-    private func reserveBootstrapSlot(connectionID: UUID) {
-        bootstrapReservations[connectionID] = BootstrapReservation(connectionID: connectionID, createdAt: Date())
+    private func reserveBootstrapSlot(connectionID: UUID, lifecycleGeneration: UInt64) {
+        bootstrapReservations[connectionID] = BootstrapReservation(
+            connectionID: connectionID,
+            lifecycleGeneration: lifecycleGeneration,
+            createdAt: Date()
+        )
     }
 
-    /// Release a bootstrap reservation (called on commit or rollback)
-    private func releaseBootstrapReservation(connectionID: UUID) {
-        if bootstrapReservations.removeValue(forKey: connectionID) == nil {
-            log.warning("releaseBootstrapReservation: no reservation found for \(connectionID) (double release or leak)")
+    /// Release a bootstrap reservation when an accepted handshake aborts before commit.
+    private func rollbackBootstrapReservation(connectionID: UUID, lifecycleGeneration: UInt64, reason: String) {
+        if bootstrapReservations[connectionID]?.lifecycleGeneration == lifecycleGeneration {
+            bootstrapReservations.removeValue(forKey: connectionID)
+            connectionLog("Bootstrap connection \(connectionID) rolled back (\(reason))")
+        } else if isRunningState {
+            log.warning("rollbackBootstrapReservation: no matching reservation found for \(connectionID) while running (reason=\(reason))")
+        } else {
+            connectionLog("Bootstrap connection \(connectionID) rollback found no matching reservation after shutdown (\(reason))")
         }
+        closeTransferredBootstrapSocket(
+            connectionID: connectionID,
+            lifecycleGeneration: lifecycleGeneration
+        )
+    }
+
+    private func closeTransferredBootstrapSocket(connectionID: UUID, lifecycleGeneration: UInt64) {
+        guard let fd = transferredBootstrapSockets.remove(
+            connectionID: connectionID,
+            lifecycleGeneration: lifecycleGeneration
+        ) else { return }
+        closeUnregisteredBootstrapFD(fd)
+    }
+
+    private func closeUnregisteredBootstrapFD(_ fd: Int32) {
+        POSIXDescriptorSupport.shutdownSocketReadWrite(fd)
+        Darwin.close(fd)
     }
 
     /// Clean up expired reservations (safety net for edge cases)
@@ -863,7 +1075,11 @@ actor ServerNetworkManager {
             let expiredIDs = expired.map(\.key.uuidString).joined(separator: ", ")
             log.warning("Cleaning up \(expired.count) expired bootstrap reservations (indicates a bug or crash): \(expiredIDs)")
             for id in expired.keys {
-                bootstrapReservations.removeValue(forKey: id)
+                guard let reservation = bootstrapReservations.removeValue(forKey: id) else { continue }
+                closeTransferredBootstrapSocket(
+                    connectionID: id,
+                    lifecycleGeneration: reservation.lifecycleGeneration
+                )
             }
         }
     }
@@ -1251,13 +1467,24 @@ actor ServerNetworkManager {
         Self.currentConnectionID
     }
 
-    /// Runs the given async operation with the TaskLocal connectionID set.
+    /// Runs the given async operation with the TaskLocal connectionID and lifecycle correlation set.
     /// Use this to propagate the connection context across Task boundaries.
     nonisolated static func withConnectionID<T>(
         _ connectionID: UUID?,
+        lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation? = nil,
         operation: () async throws -> T
     ) async rethrows -> T {
-        try await $currentConnectionID.withValue(connectionID, operation: operation)
+        #if DEBUG || EDIT_FLOW_PERF
+            let effectiveLifecycleCorrelation = lifecycleCorrelation ?? EditFlowPerf.currentLifecycleCorrelation
+            guard let effectiveLifecycleCorrelation else {
+                return try await $currentConnectionID.withValue(connectionID, operation: operation)
+            }
+            return try await EditFlowPerf.$currentLifecycleCorrelation.withValue(effectiveLifecycleCorrelation) {
+                try await $currentConnectionID.withValue(connectionID, operation: operation)
+            }
+        #else
+            return try await $currentConnectionID.withValue(connectionID, operation: operation)
+        #endif
     }
 
     func clientIdentifier(forConnection id: UUID) -> String? {
@@ -1990,8 +2217,14 @@ actor ServerNetworkManager {
 
     /// Find a matching connection among current connections, excluding those in the exclude set.
     /// Checks both admitted (clientIDByConnection) and pending (pendingConnections) names.
-    private func findMatchingConnection(excluding: Set<UUID>, clientName: String?) -> UUID? {
+    private func findMatchingConnection(
+        excluding: Set<UUID>,
+        clientName: String?,
+        lifecycleGeneration expectedLifecycleGeneration: UInt64
+    ) -> UUID? {
+        guard isCurrentLifecycle(expectedLifecycleGeneration) else { return nil }
         for (id, _) in connections {
+            guard connectionLifecycleGenerationByID[id] == expectedLifecycleGeneration else { continue }
             guard !excluding.contains(id) else { continue }
 
             if let nameFilter = clientName {
@@ -2015,8 +2248,12 @@ actor ServerNetworkManager {
 
     /// Resume a waiter with a result (connection ID or nil for timeout/cancel).
     /// Ensures single-shot resumption by removing waiter before resuming.
-    private func resumeWaiter(_ waiterID: UUID, with connectionID: UUID?) {
-        guard let waiter = connectionWaiters.removeValue(forKey: waiterID) else { return }
+    private func resumeWaiter(_ waiterID: UUID, lifecycleGeneration expectedLifecycleGeneration: UInt64? = nil, with connectionID: UUID?) {
+        guard let waiter = connectionWaiters[waiterID] else { return }
+        if let expectedLifecycleGeneration {
+            guard waiter.lifecycleGeneration == expectedLifecycleGeneration else { return }
+        }
+        connectionWaiters.removeValue(forKey: waiterID)
         waiter.timeoutTask?.cancel()
         waiter.continuation.resume(returning: connectionID)
     }
@@ -2024,19 +2261,19 @@ actor ServerNetworkManager {
     /// Cancel a waiter (called from task cancellation handler).
     /// Note: Intentionally no logging here to avoid actor hop complexity during cancellation
     /// which can cause resource starvation/deadlock.
-    private func cancelWaiter(_ waiterID: UUID) {
-        guard let waiter = connectionWaiters.removeValue(forKey: waiterID) else { return }
-        waiter.timeoutTask?.cancel()
-        waiter.continuation.resume(returning: nil)
+    private func cancelWaiter(_ waiterID: UUID, lifecycleGeneration expectedLifecycleGeneration: UInt64) {
+        resumeWaiter(waiterID, lifecycleGeneration: expectedLifecycleGeneration, with: nil)
     }
 
     /// Notify waiters when a new connection arrives. Resumes the first matching waiter (FIFO).
     /// Called from handleBootstrapConnection after adding to connections.
-    private func notifyConnectionWaiters(connectionID: UUID, clientName: String?) {
+    private func notifyConnectionWaiters(connectionID: UUID, clientName: String?, lifecycleGeneration expectedLifecycleGeneration: UInt64) {
+        guard isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return }
         let actualName = clientName ?? "unknown"
         var matchedWaiterID: UUID?
 
         for (waiterID, waiter) in connectionWaiters {
+            guard waiter.lifecycleGeneration == expectedLifecycleGeneration else { continue }
             guard !waiter.excludeExisting.contains(connectionID) else {
                 mcpACPLog("[MCP-ACP] waiter=\(waiterID) connection=\(connectionID) skipped existing expected=\(waiter.clientName ?? "<any>") actual=\(actualName)")
                 continue
@@ -2056,7 +2293,7 @@ actor ServerNetworkManager {
 
         let waiter = connectionWaiters[matchID]
         connectionLog("Found new connection \(connectionID) for waiting client: \(waiter?.clientName ?? "any") (actual: \(actualName))")
-        resumeWaiter(matchID, with: connectionID)
+        resumeWaiter(matchID, lifecycleGeneration: expectedLifecycleGeneration, with: connectionID)
     }
 
     /// Wait for a new connection from a specific client (for Context Builder).
@@ -2067,24 +2304,32 @@ actor ServerNetworkManager {
     /// client name. This allows bootstrap connections (which exist before MCP initialize)
     /// to satisfy waiters once their MCP client name is established.
     func waitForNewConnection(clientName: String?, timeout: TimeInterval = 10.0) async -> UUID? {
+        let waiterLifecycleGeneration = lifecycleGeneration
+        guard isCurrentLifecycle(waiterLifecycleGeneration) else { return nil }
+
         // Compute exclusion set based on whether we're filtering by name
         let existing: Set<UUID>
         if let targetName = clientName {
             // Only exclude connections that already match this client name.
             // This allows bootstrap connections to satisfy waiters once MCP initialize arrives.
             let alreadyMatching = connections.keys.filter { id in
+                guard connectionLifecycleGenerationByID[id] == waiterLifecycleGeneration else { return false }
                 let admitted = clientIDByConnection[id]
                 let pending = pendingConnections[id]
                 return admitted == targetName || pending == targetName
             }
             existing = Set(alreadyMatching)
         } else {
-            // Unfiltered waiter: exclude all existing connections
-            existing = Set(connections.keys)
+            // Unfiltered waiter: exclude all existing connections from this lifecycle.
+            existing = Set(connections.keys.filter { connectionLifecycleGenerationByID[$0] == waiterLifecycleGeneration })
         }
 
         // Fast path: check if a matching connection already exists
-        if let match = findMatchingConnection(excluding: existing, clientName: clientName) {
+        if let match = findMatchingConnection(
+            excluding: existing,
+            clientName: clientName,
+            lifecycleGeneration: waiterLifecycleGeneration
+        ) {
             let label = clientIDByConnection[match] ?? pendingConnections[match] ?? "unknown"
             connectionLog("Found existing connection \(match) for client: \(label)")
             return match
@@ -2095,14 +2340,24 @@ actor ServerNetworkManager {
 
         return await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<UUID?, Never>) in
+                guard isCurrentLifecycle(waiterLifecycleGeneration) else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+
                 // Schedule timeout task
                 let timeoutTask = Task { [weak self] in
                     try? await Task.sleep(for: .seconds(timeout))
-                    await self?.handleWaiterTimeout(waiterID, clientName: clientName)
+                    await self?.handleWaiterTimeout(
+                        waiterID,
+                        lifecycleGeneration: waiterLifecycleGeneration,
+                        clientName: clientName
+                    )
                 }
 
                 // Register the waiter
                 let waiter = ConnectionWaiter(
+                    lifecycleGeneration: waiterLifecycleGeneration,
                     clientName: clientName,
                     excludeExisting: existing,
                     continuation: continuation,
@@ -2112,28 +2367,39 @@ actor ServerNetworkManager {
 
                 // Recheck after registration to close race window:
                 // A connection may have arrived between fast-path check and registration
-                if let match = findMatchingConnection(excluding: existing, clientName: clientName) {
+                if let match = findMatchingConnection(
+                    excluding: existing,
+                    clientName: clientName,
+                    lifecycleGeneration: waiterLifecycleGeneration
+                ) {
                     let label = clientIDByConnection[match] ?? pendingConnections[match] ?? "unknown"
                     connectionLog("Found connection \(match) for client: \(label) (post-registration recheck)")
-                    resumeWaiter(waiterID, with: match)
+                    resumeWaiter(
+                        waiterID,
+                        lifecycleGeneration: waiterLifecycleGeneration,
+                        with: match
+                    )
                 }
             }
         } onCancel: {
             Task { [weak self] in
-                await self?.cancelWaiter(waiterID)
+                await self?.cancelWaiter(
+                    waiterID,
+                    lifecycleGeneration: waiterLifecycleGeneration
+                )
             }
         }
     }
 
     /// Handle waiter timeout - resume with nil if waiter still exists.
-    private func handleWaiterTimeout(_ waiterID: UUID, clientName: String?) {
-        guard connectionWaiters[waiterID] != nil else { return } // Already resolved
+    private func handleWaiterTimeout(_ waiterID: UUID, lifecycleGeneration expectedLifecycleGeneration: UInt64, clientName: String?) {
+        guard connectionWaiters[waiterID]?.lifecycleGeneration == expectedLifecycleGeneration else { return }
         if let clientName {
             connectionLog("Timed out waiting for connection from client: \(clientName)")
         } else {
             connectionLog("Timed out waiting for connection without client hint")
         }
-        resumeWaiter(waiterID, with: nil)
+        resumeWaiter(waiterID, lifecycleGeneration: expectedLifecycleGeneration, with: nil)
     }
 
     /// Backwards-compatible overload that preserves previous call sites.
@@ -2146,24 +2412,35 @@ actor ServerNetworkManager {
             print("[MCPStartup] ServerNetworkManager.start entered")
         #endif
         connectionLog("Starting network manager")
+        if !isRunningState {
+            lifecycleGeneration &+= 1
+        }
         isRunningState = true
+        let startLifecycleGeneration = lifecycleGeneration
+        transferredBootstrapSockets.activate(lifecycleGeneration: startLifecycleGeneration)
 
         // Start bootstrap socket server for UNIX socket connections before maintenance
         // health checks can observe and restart a not-yet-created socket.
         bootstrapSocketTask?.cancel()
-        await startBootstrapSocketServer()
+        await startBootstrapSocketServer(lifecycleGeneration: startLifecycleGeneration)
+
+        // A full shutdown may have run while listener startup awaited another actor.
+        guard isCurrentLifecycle(startLifecycleGeneration) else { return }
 
         // Start periodic maintenance loop for cleanup tasks
-        startMaintenanceLoop()
+        startMaintenanceLoop(lifecycleGeneration: startLifecycleGeneration)
     }
 
     /// Starts the periodic maintenance loop for cleanup tasks.
-    private func startMaintenanceLoop() {
+    private func startMaintenanceLoop(lifecycleGeneration: UInt64) {
+        guard isCurrentLifecycle(lifecycleGeneration) else { return }
         maintenanceTask?.cancel()
         maintenanceTask = Task { [weak self] in
             guard let self else { return }
             while !Task.isCancelled {
-                await maintenanceTick()
+                guard await isCurrentLifecycle(lifecycleGeneration) else { return }
+                await maintenanceTick(lifecycleGeneration: lifecycleGeneration)
+                guard await isCurrentLifecycle(lifecycleGeneration) else { return }
                 do { try await Task.sleep(for: .seconds(5)) }
                 catch { break }
             }
@@ -2175,15 +2452,19 @@ actor ServerNetworkManager {
     private let killSignalCleanupInterval: TimeInterval = 60.0
 
     /// Performs periodic maintenance: cleans up expired reservations, cooldowns, policies, and stale kill signals.
-    private func maintenanceTick() async {
+    private func maintenanceTick(lifecycleGeneration expectedLifecycleGeneration: UInt64) async {
+        guard isCurrentLifecycle(expectedLifecycleGeneration) else { return }
         // Safety-net cleanup for edge cases / crashy mid-flight states.
         cleanupExpiredBootstrapReservations()
         cleanupExpiredKilledSessions()
         cleanupExpiredUserKilledClients()
         cleanupExpiredClientConnectionPolicies()
-        await pruneNonViableConnections()
-        await pressureEvictIdleConnectionsIfNeeded()
-        await ensureBootstrapHealthy()
+        await pruneNonViableConnections(lifecycleGeneration: expectedLifecycleGeneration)
+        guard isCurrentLifecycle(expectedLifecycleGeneration) else { return }
+        await pressureEvictIdleConnectionsIfNeeded(lifecycleGeneration: expectedLifecycleGeneration)
+        guard isCurrentLifecycle(expectedLifecycleGeneration) else { return }
+        await ensureBootstrapHealthy(lifecycleGeneration: expectedLifecycleGeneration)
+        guard isCurrentLifecycle(expectedLifecycleGeneration) else { return }
 
         // Throttle kill signal cleanup (involves filesystem operations)
         let now = Date()
@@ -2214,14 +2495,23 @@ actor ServerNetworkManager {
     }
 
     /// Prune connections that are no longer viable or have been stuck connecting too long.
-    private func pruneNonViableConnections() async {
+    private func pruneNonViableConnections(lifecycleGeneration expectedLifecycleGeneration: UInt64? = nil) async {
+        if let expectedLifecycleGeneration {
+            guard isCurrentLifecycle(expectedLifecycleGeneration) else { return }
+        }
         guard !connections.isEmpty else { return }
         let now = Date()
         let connectingTimeout = TimeInterval(connectingTimeoutSeconds)
         var toRemove: [UUID] = []
 
         for (id, mgr) in connections {
+            if let expectedLifecycleGeneration {
+                guard isCurrentLifecycle(expectedLifecycleGeneration) else { return }
+            }
             let state = await mgr.connectionState()
+            if let expectedLifecycleGeneration {
+                guard isCurrentLifecycle(expectedLifecycleGeneration) else { return }
+            }
             if case .failed = state {
                 toRemove.append(id)
                 continue
@@ -2231,6 +2521,9 @@ actor ServerNetworkManager {
                 continue
             }
             let viable = await mgr.isViableForRetention()
+            if let expectedLifecycleGeneration {
+                guard isCurrentLifecycle(expectedLifecycleGeneration) else { return }
+            }
             if !viable {
                 toRemove.append(id)
                 continue
@@ -2246,15 +2539,24 @@ actor ServerNetworkManager {
         }
 
         for id in toRemove {
+            if let expectedLifecycleGeneration {
+                guard isCurrentLifecycle(expectedLifecycleGeneration) else { return }
+            }
             await removeConnection(id)
         }
     }
 
     /// Under pressure, evict idle connections that exceed pressureEvictIdleSeconds.
-    private func pressureEvictIdleConnectionsIfNeeded() async {
+    private func pressureEvictIdleConnectionsIfNeeded(lifecycleGeneration expectedLifecycleGeneration: UInt64? = nil) async {
+        if let expectedLifecycleGeneration {
+            guard isCurrentLifecycle(expectedLifecycleGeneration) else { return }
+        }
         guard pressureEvictIdleSeconds > 0 else { return }
         guard bootstrapLoad() >= maxGlobalConnections else { return }
         if let victim = await oldestEvictableConnectionID() {
+            if let expectedLifecycleGeneration {
+                guard isCurrentLifecycle(expectedLifecycleGeneration) else { return }
+            }
             log.warning("Pressure eviction: evicting idle connection \(victim)")
             await removeConnection(victim)
         }
@@ -2265,8 +2567,13 @@ actor ServerNetworkManager {
     /// Ensures the bootstrap socket listener is present and healthy.
     /// Intended as a periodic self-heal for stale sockets or failed startups.
     func ensureBootstrapHealthy(force: Bool = false) async {
-        guard isRunningState else { return }
-        guard isEnabledState else { return }
+        await ensureBootstrapHealthy(force: force, lifecycleGeneration: lifecycleGeneration)
+    }
+
+    private func ensureBootstrapHealthy(force: Bool = false, lifecycleGeneration healthCheckLifecycleGeneration: UInt64) async {
+        guard isCurrentLifecycle(healthCheckLifecycleGeneration) else { return }
+        // Listener retention and recovery are lifecycle concerns, not tool-exposure concerns.
+        // Ordinary setEnabled(false) keeps sockets alive and must still self-heal the listener.
         guard !bootstrapStartInProgress else { return }
         guard !bootstrapRestartInProgress else { return }
 
@@ -2281,41 +2588,46 @@ actor ServerNetworkManager {
 
         if !exists {
             log.warning("Bootstrap socket path missing: \(socketPath). Restarting listener.")
-            restartBootstrapSocketServer(reason: "socket_path_missing")
+            restartBootstrapSocketServer(reason: "socket_path_missing", lifecycleGeneration: healthCheckLifecycleGeneration)
             return
         }
 
         if !isUnixDomainSocket(atPath: socketPath) {
             log.warning("Bootstrap socket path is not a socket: \(socketPath). Restarting listener.")
-            restartBootstrapSocketServer(reason: "socket_path_not_socket")
+            restartBootstrapSocketServer(reason: "socket_path_not_socket", lifecycleGeneration: healthCheckLifecycleGeneration)
             return
         }
 
-        guard let server = bootstrapSocketServer else {
-            connectionLog("BootstrapSocketServer nil while running. Restarting.")
-            restartBootstrapSocketServer(reason: "server_nil")
+        guard let server = bootstrapSocketServer,
+              bootstrapSocketServerLifecycleGeneration == healthCheckLifecycleGeneration
+        else {
+            connectionLog("BootstrapSocketServer nil or stale while running. Restarting.")
+            restartBootstrapSocketServer(reason: "server_nil_or_stale", lifecycleGeneration: healthCheckLifecycleGeneration)
             return
         }
 
         await server.ensureAccepting()
+        guard isCurrentBootstrapListener(server, lifecycleGeneration: healthCheckLifecycleGeneration) else { return }
 
         let diagnostics = await server.diagnostics()
+        guard isCurrentBootstrapListener(server, lifecycleGeneration: healthCheckLifecycleGeneration) else { return }
         if !diagnostics.listenFDValid {
             log.warning("Bootstrap listen FD invalid; restarting.")
-            restartBootstrapSocketServer(reason: "listen_fd_invalid")
+            restartBootstrapSocketServer(reason: "listen_fd_invalid", lifecycleGeneration: healthCheckLifecycleGeneration)
             return
         }
 
         if !diagnostics.acceptSourceExists {
             log.warning("Bootstrap accept source missing; restarting.")
-            restartBootstrapSocketServer(reason: "accept_source_missing")
+            restartBootstrapSocketServer(reason: "accept_source_missing", lifecycleGeneration: healthCheckLifecycleGeneration)
             return
         }
 
         let listening = await server.isListening()
+        guard isCurrentBootstrapListener(server, lifecycleGeneration: healthCheckLifecycleGeneration) else { return }
         if !listening {
             log.warning("BootstrapSocketServer not listening (but should be). Restarting.")
-            restartBootstrapSocketServer(reason: "not_listening")
+            restartBootstrapSocketServer(reason: "not_listening", lifecycleGeneration: healthCheckLifecycleGeneration)
         }
     }
 
@@ -2332,8 +2644,12 @@ actor ServerNetworkManager {
         return (info.st_mode & S_IFMT) == S_IFSOCK
     }
 
-    private func restartBootstrapSocketServer(reason: String, delay: TimeInterval = 0) {
-        guard isRunningState else { return }
+    private func restartBootstrapSocketServer(
+        reason: String,
+        delay: TimeInterval = 0,
+        lifecycleGeneration expectedLifecycleGeneration: UInt64
+    ) {
+        guard isCurrentLifecycle(expectedLifecycleGeneration) else { return }
         guard !bootstrapRestartInProgress else { return }
 
         let now = Date()
@@ -2343,81 +2659,154 @@ actor ServerNetworkManager {
         lastBootstrapRestartAt = now
         let token = UUID()
         bootstrapRestartToken = token
+        bootstrapRestartLifecycleGeneration = expectedLifecycleGeneration
 
         Task { [weak self] in
             if delay > 0 {
                 try? await Task.sleep(for: .seconds(delay))
             }
-            await self?.performBootstrapRestart(reason: reason, token: token)
+            #if DEBUG
+                await self?.debugSuspendLifecycleFenceCheckpointIfNeeded(.restartTaskBeforePerform)
+            #endif
+            await self?.performBootstrapRestart(
+                reason: reason,
+                token: token,
+                lifecycleGeneration: expectedLifecycleGeneration
+            )
+            #if DEBUG
+                await self?.debugRecordBootstrapRestartTaskCompletion()
+            #endif
         }
     }
 
-    private func performBootstrapRestart(reason: String, token: UUID) async {
-        defer { bootstrapRestartInProgress = false }
+    private func performBootstrapRestart(reason: String, token: UUID, lifecycleGeneration expectedLifecycleGeneration: UInt64) async {
+        defer { clearBootstrapRestartIfMatching(token: token, lifecycleGeneration: expectedLifecycleGeneration) }
 
-        guard bootstrapRestartToken == token else {
+        guard bootstrapRestartToken == token,
+              bootstrapRestartLifecycleGeneration == expectedLifecycleGeneration
+        else {
             connectionLog("Skipping bootstrap restart (reason=\(reason)) - superseded")
             return
         }
-        bootstrapRestartToken = nil
-
-        guard isRunningState else {
-            connectionLog("Skipping bootstrap restart (reason=\(reason)) - manager not running")
+        guard isCurrentLifecycle(expectedLifecycleGeneration) else {
+            connectionLog("Skipping bootstrap restart (reason=\(reason)) - stale lifecycle")
             return
         }
 
         let socketPath = resolvedBootstrapSocketURL().path
         connectionLog("Restarting bootstrap socket server (reason=\(reason), socket=\(socketPath), failures=\(bootstrapStartFailures))")
-        await stopBootstrapSocketServer()
-        await startBootstrapSocketServer()
+        let server = bootstrapSocketServer
+        let serverLifecycleGeneration = bootstrapSocketServerLifecycleGeneration
+        if let serverLifecycleGeneration {
+            await stopBootstrapSocketServer(server: server, lifecycleGeneration: serverLifecycleGeneration)
+        }
+        guard bootstrapRestartToken == token,
+              bootstrapRestartLifecycleGeneration == expectedLifecycleGeneration,
+              isCurrentLifecycle(expectedLifecycleGeneration)
+        else {
+            connectionLog("Skipping bootstrap listener replacement (reason=\(reason)) - stale lifecycle")
+            return
+        }
+        await startBootstrapSocketServer(lifecycleGeneration: expectedLifecycleGeneration)
+    }
+
+    private func clearBootstrapRestartIfMatching(token: UUID, lifecycleGeneration expectedLifecycleGeneration: UInt64) {
+        guard bootstrapRestartToken == token,
+              bootstrapRestartLifecycleGeneration == expectedLifecycleGeneration
+        else { return }
+        bootstrapRestartToken = nil
+        bootstrapRestartLifecycleGeneration = nil
+        bootstrapRestartInProgress = false
+    }
+
+    private func invalidateBootstrapRestartState() {
+        bootstrapRestartToken = nil
+        bootstrapRestartLifecycleGeneration = nil
+        bootstrapRestartInProgress = false
+    }
+
+    private func clearBootstrapStartIfMatching(lifecycleGeneration expectedLifecycleGeneration: UInt64) {
+        guard bootstrapStartLifecycleGeneration == expectedLifecycleGeneration else { return }
+        bootstrapStartLifecycleGeneration = nil
+        bootstrapStartInProgress = false
+    }
+
+    private func isCurrentBootstrapListener(_ server: BootstrapSocketServer, lifecycleGeneration expectedLifecycleGeneration: UInt64) -> Bool {
+        isCurrentLifecycle(expectedLifecycleGeneration)
+            && bootstrapSocketServer === server
+            && bootstrapSocketServerLifecycleGeneration == expectedLifecycleGeneration
     }
 
     /// Starts the bootstrap socket server for UNIX socket connections.
-    private func startBootstrapSocketServer() async {
+    private func startBootstrapSocketServer(lifecycleGeneration expectedLifecycleGeneration: UInt64) async {
         #if DEBUG
-            print("[MCPStartup] startBootstrapSocketServer entered running=\(isRunningState) enabled=\(isEnabledState) inProgress=\(bootstrapStartInProgress)")
+            print("[MCPStartup] startBootstrapSocketServer entered running=\(isRunningState) enabled=\(isEnabledState) inProgress=\(bootstrapStartInProgress) generation=\(expectedLifecycleGeneration)")
         #endif
-        guard isRunningState else { return }
+        guard isCurrentLifecycle(expectedLifecycleGeneration) else { return }
         guard !bootstrapStartInProgress else { return }
+        // Never overwrite a listener that another lifecycle is still tearing down.
+        // A new lifecycle maintenance tick will retry once identity-fenced teardown clears it.
+        guard bootstrapSocketServer == nil else { return }
         bootstrapStartInProgress = true
-        defer { bootstrapStartInProgress = false }
+        bootstrapStartLifecycleGeneration = expectedLifecycleGeneration
+        defer { clearBootstrapStartIfMatching(lifecycleGeneration: expectedLifecycleGeneration) }
 
-        connectionLog("Starting bootstrap socket server...")
+        connectionLog("Starting bootstrap socket server for lifecycle \(expectedLifecycleGeneration)...")
 
         let socketURL = resolvedBootstrapSocketURL()
         let server = BootstrapSocketServer(socketURL: socketURL, logger: log)
         bootstrapSocketServer = server
+        bootstrapSocketServerLifecycleGeneration = expectedLifecycleGeneration
+        #if DEBUG
+            await debugSuspendLifecycleFenceCheckpointIfNeeded(.listenerPublishedBeforeStartInvocation)
+        #endif
 
         do {
             #if DEBUG
-                print("[MCPStartup] calling BootstrapSocketServer.start socket=\(socketURL.path)")
+                print("[MCPStartup] calling BootstrapSocketServer.start socket=\(socketURL.path) generation=\(expectedLifecycleGeneration)")
             #endif
-            try await server.start { [weak self] clientFD, sessionToken, clientPid, clientName async -> BootstrapSocketServer.Admission in
-                guard let self else {
+            try await server.start { [weak self, weak server] clientFD, sessionToken, clientPid, clientName async -> BootstrapSocketServer.Admission in
+                guard let self, let server else {
                     return .reject(.rejected(reason: "Server unavailable", errorCode: "server_unavailable"))
                 }
                 return await handleBootstrapConnection(
+                    sourceListener: server,
+                    lifecycleGeneration: expectedLifecycleGeneration,
                     clientFD: clientFD,
                     sessionToken: sessionToken,
                     clientPid: clientPid,
                     clientName: clientName
                 )
             }
+            guard isCurrentBootstrapListener(server, lifecycleGeneration: expectedLifecycleGeneration) else {
+                await server.stop()
+                return
+            }
             #if DEBUG
-                print("[MCPStartup] BootstrapSocketServer.start succeeded socket=\(socketURL.path)")
+                print("[MCPStartup] BootstrapSocketServer.start succeeded socket=\(socketURL.path) generation=\(expectedLifecycleGeneration)")
             #endif
             bootstrapStartFailures = 0
-            bootstrapRestartToken = nil
-            bootstrapRestartInProgress = false
+            invalidateBootstrapRestartState()
         } catch {
             #if DEBUG
                 print("[MCPStartup] BootstrapSocketServer.start failed: \(error)")
             #endif
+            if bootstrapSocketServer === server,
+               bootstrapSocketServerLifecycleGeneration == expectedLifecycleGeneration
+            {
+                bootstrapSocketServer = nil
+                bootstrapSocketServerLifecycleGeneration = nil
+                scheduleBootstrapSocketServerStartForCurrentLifecycleIfNeeded(excluding: expectedLifecycleGeneration)
+            }
+            guard isCurrentLifecycle(expectedLifecycleGeneration) else { return }
             bootstrapStartFailures += 1
-            bootstrapSocketServer = nil
             log.error("Failed to start bootstrap socket server: \(error) (failures=\(bootstrapStartFailures))")
             let delay = bootstrapBackoffDelay(for: bootstrapStartFailures)
-            restartBootstrapSocketServer(reason: "start_failed", delay: delay)
+            restartBootstrapSocketServer(
+                reason: "start_failed",
+                delay: delay,
+                lifecycleGeneration: expectedLifecycleGeneration
+            )
         }
     }
 
@@ -2426,8 +2815,10 @@ actor ServerNetworkManager {
     ///
     /// IMPORTANT: Connection registration is deferred to postAccept to avoid "ghost" connections
     /// if the "accepted" response fails to send. Capacity is reserved here and released on
-    /// commit (postAccept) or rollback (onAcceptWriteFailed).
+    /// commit (postAccept) or rollback (onAcceptAborted).
     private func handleBootstrapConnection(
+        sourceListener: BootstrapSocketServer,
+        lifecycleGeneration admissionLifecycleGeneration: UInt64,
         clientFD: Int32,
         sessionToken: String,
         clientPid: Int,
@@ -2436,6 +2827,10 @@ actor ServerNetworkManager {
         let connectionID = UUID()
         connectionLog("Bootstrap socket connection: \(connectionID) from '\(clientName ?? "unknown")' (pid=\(clientPid), session=\(sessionToken.prefix(8))...)")
         mcpACPLog("[MCP-ACP] bootstrap connection connection=\(connectionID) bootstrapClientName=\(clientName ?? "unknown") pid=\(clientPid)")
+
+        guard isCurrentBootstrapListener(sourceListener, lifecycleGeneration: admissionLifecycleGeneration) else {
+            return rejectBootstrapAdmissionBecauseStopped(connectionID: connectionID)
+        }
 
         // Clean up any expired reservations (safety net)
         cleanupExpiredBootstrapReservations()
@@ -2465,60 +2860,267 @@ actor ServerNetworkManager {
             clientPid: clientPid,
             isReplacementForSession: replacedIDForCapacity != nil
         )
+        guard isCurrentBootstrapListener(sourceListener, lifecycleGeneration: admissionLifecycleGeneration) else {
+            return rejectBootstrapAdmissionBecauseStopped(connectionID: connectionID)
+        }
 
         // Enforce capacity against bootstrapLoad() (connections + reservations)
         // Loop eviction until we have space or no candidates remain
         while bootstrapLoad() - (replacedIDForCapacity != nil ? 1 : 0) >= maxGlobalConnections {
-            let evicted = await evictLeastValuableGlobalForAdmission(preserveOnePerClient: preserveOnePerClient)
+            let evicted = await evictLeastValuableGlobalForAdmission(
+                preserveOnePerClient: preserveOnePerClient,
+                sourceListener: sourceListener,
+                lifecycleGeneration: admissionLifecycleGeneration
+            )
+            guard isCurrentBootstrapListener(sourceListener, lifecycleGeneration: admissionLifecycleGeneration) else {
+                return rejectBootstrapAdmissionBecauseStopped(connectionID: connectionID)
+            }
             if !evicted {
                 log.warning("At global capacity and no evictable candidate; rejecting bootstrap connection \(connectionID)")
                 return .reject(.rejected(reason: "Server at capacity", errorCode: MCPBootstrapErrorCode.capacityExceeded.rawValue))
             }
         }
 
-        // Reserve capacity BEFORE returning .accept
-        reserveBootstrapSlot(connectionID: connectionID)
+        guard isCurrentBootstrapListener(sourceListener, lifecycleGeneration: admissionLifecycleGeneration) else {
+            return rejectBootstrapAdmissionBecauseStopped(connectionID: connectionID)
+        }
+        return makeAcceptedBootstrapAdmission(
+            connectionID: connectionID,
+            lifecycleGeneration: admissionLifecycleGeneration,
+            sessionToken: sessionToken,
+            clientPid: clientPid,
+            clientName: clientName
+        )
+    }
 
+    private func isCurrentLifecycle(_ generation: UInt64) -> Bool {
+        isRunningState && lifecycleGeneration == generation
+    }
+
+    private func rejectBootstrapAdmissionBecauseStopped(connectionID: UUID) -> BootstrapSocketServer.Admission {
+        connectionLog("Rejecting bootstrap connection \(connectionID) - manager stopped")
+        return .reject(.rejected(reason: "Server unavailable", errorCode: "server_unavailable"))
+    }
+
+    private func makeAcceptedBootstrapAdmission(
+        connectionID: UUID,
+        lifecycleGeneration admissionLifecycleGeneration: UInt64,
+        sessionToken: String,
+        clientPid: Int,
+        clientName: String?
+    ) -> BootstrapSocketServer.Admission {
+        reserveBootstrapSlot(
+            connectionID: connectionID,
+            lifecycleGeneration: admissionLifecycleGeneration
+        )
         connectionLog("handleBootstrapConnection: returning Admission.accept for \(connectionID)")
 
-        // Return acceptance with:
-        // - postAccept: commit path (release reservation, then register connection)
-        // - onAcceptWriteFailed: rollback path (release reservation only)
-        // NOTE: Using strong capture [self] to ensure reservation is always released.
-        // These closures are short-lived and not stored long-term.
+        // NOTE: Using strong capture [self] to ensure reservation cleanup always reaches
+        // the owning manager. These closures are short-lived and not stored long-term.
         return .accept(
-            postAccept: { [self] in
-                // Commit: release reservation (connection will be added to connections[])
-                await releaseBootstrapReservation(connectionID: connectionID)
-                if let replacedNow = await existingConnectionID(forSessionToken: sessionToken) {
-                    await softDisconnectConnection(replacedNow, reason: .connectionReplaced, message: "Replaced by new connection for same session")
-                }
-                await registerAndStartBootstrapConnection(
+            publishTransferredFD: { [transferredBootstrapSockets] clientFD in
+                transferredBootstrapSockets.publish(
                     connectionID: connectionID,
-                    sessionToken: sessionToken,
-                    clientPid: clientPid,
-                    clientName: clientName,
-                    clientFD: clientFD
+                    lifecycleGeneration: admissionLifecycleGeneration,
+                    fd: clientFD
                 )
             },
-            onAcceptWriteFailed: { [self] in
-                // Rollback: release reservation without registering
-                await releaseBootstrapReservation(connectionID: connectionID)
-                connectionLog("Bootstrap connection \(connectionID) rolled back (accept write failed)")
+            postAccept: { [self] in
+                await commitAcceptedBootstrapConnection(
+                    connectionID: connectionID,
+                    lifecycleGeneration: admissionLifecycleGeneration,
+                    sessionToken: sessionToken,
+                    clientPid: clientPid,
+                    clientName: clientName
+                )
+            },
+            onAcceptAborted: { [self] in
+                await rollbackBootstrapReservation(
+                    connectionID: connectionID,
+                    lifecycleGeneration: admissionLifecycleGeneration,
+                    reason: "accept aborted"
+                )
             }
         )
     }
+
+    private func commitAcceptedBootstrapConnection(
+        connectionID: UUID,
+        lifecycleGeneration admissionLifecycleGeneration: UInt64,
+        sessionToken: String,
+        clientPid: Int,
+        clientName: String?
+    ) async {
+        guard let reservation = bootstrapReservations[connectionID],
+              reservation.lifecycleGeneration == admissionLifecycleGeneration,
+              isCurrentLifecycle(admissionLifecycleGeneration)
+        else {
+            closeTransferredBootstrapSocket(
+                connectionID: connectionID,
+                lifecycleGeneration: admissionLifecycleGeneration
+            )
+            if isRunningState {
+                log.warning("commitAcceptedBootstrapConnection: no current reservation found for \(connectionID) while running")
+            }
+            return
+        }
+
+        guard isCurrentBootstrapCommit(
+            connectionID: connectionID,
+            lifecycleGeneration: admissionLifecycleGeneration
+        ) else {
+            abandonPendingBootstrapCommit(
+                connectionID: connectionID,
+                lifecycleGeneration: admissionLifecycleGeneration,
+                reason: "lifecycle invalid before replacement"
+            )
+            return
+        }
+
+        if let replacedNow = existingConnectionID(forSessionToken: sessionToken) {
+            await softDisconnectConnection(replacedNow, reason: .connectionReplaced, message: "Replaced by new connection for same session")
+        }
+
+        guard isCurrentBootstrapCommit(
+            connectionID: connectionID,
+            lifecycleGeneration: admissionLifecycleGeneration
+        ) else {
+            abandonPendingBootstrapCommit(
+                connectionID: connectionID,
+                lifecycleGeneration: admissionLifecycleGeneration,
+                reason: "lifecycle invalid after replacement"
+            )
+            return
+        }
+
+        guard let committedFD = transferredBootstrapSockets.claim(
+            connectionID: connectionID,
+            lifecycleGeneration: admissionLifecycleGeneration
+        ) else {
+            abandonPendingBootstrapCommit(
+                connectionID: connectionID,
+                lifecycleGeneration: admissionLifecycleGeneration,
+                reason: "transferred fd missing before registration"
+            )
+            return
+        }
+        bootstrapReservations.removeValue(forKey: connectionID)
+
+        registerAndStartBootstrapConnection(
+            connectionID: connectionID,
+            lifecycleGeneration: admissionLifecycleGeneration,
+            sessionToken: sessionToken,
+            clientPid: clientPid,
+            clientName: clientName,
+            clientFD: committedFD
+        )
+    }
+
+    private func isCurrentBootstrapCommit(connectionID: UUID, lifecycleGeneration: UInt64) -> Bool {
+        isCurrentLifecycle(lifecycleGeneration)
+            && bootstrapReservations[connectionID]?.lifecycleGeneration == lifecycleGeneration
+            && transferredBootstrapSockets.contains(
+                connectionID: connectionID,
+                lifecycleGeneration: lifecycleGeneration
+            )
+    }
+
+    private func abandonPendingBootstrapCommit(connectionID: UUID, lifecycleGeneration: UInt64, reason: String) {
+        if bootstrapReservations[connectionID]?.lifecycleGeneration == lifecycleGeneration {
+            bootstrapReservations.removeValue(forKey: connectionID)
+        }
+        closeTransferredBootstrapSocket(
+            connectionID: connectionID,
+            lifecycleGeneration: lifecycleGeneration
+        )
+        connectionLog("Abandoned pending bootstrap commit \(connectionID) (\(reason))")
+    }
+
+    #if DEBUG
+        func debugMakeReservedBootstrapAdmissionForShutdownTest(
+            connectionID: UUID,
+            sessionToken: String,
+            clientPid: Int,
+            clientName: String?,
+            clientFD: Int32
+        ) -> BootstrapSocketServer.Admission? {
+            guard isRunningState else { return nil }
+            let admission = makeAcceptedBootstrapAdmission(
+                connectionID: connectionID,
+                lifecycleGeneration: lifecycleGeneration,
+                sessionToken: sessionToken,
+                clientPid: clientPid,
+                clientName: clientName
+            )
+            guard admission.publishTransferredFD?(clientFD) == true else {
+                rollbackBootstrapReservation(
+                    connectionID: connectionID,
+                    lifecycleGeneration: lifecycleGeneration,
+                    reason: "DEBUG test publication failed"
+                )
+                return nil
+            }
+            return admission
+        }
+
+        func debugContainsConnection(_ id: UUID) -> Bool {
+            connections[id] != nil
+        }
+
+        func debugBootstrapReservationCount() -> Int {
+            bootstrapReservations.count
+        }
+
+        func debugTransferredBootstrapSocketCountForShutdownTest() -> Int {
+            transferredBootstrapSockets.debugEntryCount
+        }
+    #endif
 
     /// Registers a bootstrap connection and starts its MCP server.
     /// Called from postAccept AFTER the "accepted" response has been successfully sent.
     private func registerAndStartBootstrapConnection(
         connectionID: UUID,
+        lifecycleGeneration: UInt64,
         sessionToken: String,
         clientPid: Int,
         clientName: String?,
         clientFD: Int32
-    ) async {
-        // Initialize identity context
+    ) {
+        guard isRunningState, self.lifecycleGeneration == lifecycleGeneration else {
+            closeUnregisteredBootstrapFD(clientFD)
+            return
+        }
+
+        let purpose = purposeForNewBootstrapConnection(
+            clientName: clientName,
+            sessionToken: sessionToken
+        )
+
+        // Do not block first-frame MCP startup on MainActor/global settings during bootstrap.
+        // The instructions resource path reads the live Code Maps setting later; defaulting
+        // the initial server instructions to enabled keeps CLI initialize responsive.
+        let codeMapsDisabled = false
+
+        // Construct before publishing registry metadata. The throwing initializer consumes
+        // ownership of clientFD, including cleanup if transport construction fails.
+        let manager: BootstrapSocketConnectionManager
+        do {
+            manager = try BootstrapSocketConnectionManager(
+                connectionID: connectionID,
+                sessionToken: sessionToken,
+                clientPid: clientPid,
+                clientName: clientName,
+                purpose: purpose,
+                codeMapsDisabled: codeMapsDisabled,
+                connectedFD: clientFD,
+                parentManager: self
+            )
+        } catch {
+            log.error("Failed to construct bootstrap connection manager \(connectionID): \(String(describing: error))")
+            return
+        }
+
+        // Initialize identity context only after manager construction succeeds.
         let identityContext = ConnectionIdentityContext(
             clientName: clientName,
             capabilityToken: sessionToken,
@@ -2533,29 +3135,8 @@ actor ServerNetworkManager {
         }
         mcpACPLog("[MCP-ACP] registered bootstrap connection connection=\(connectionID) pendingClientName=\(clientName ?? "unknown")")
 
-        let purpose = purposeForNewBootstrapConnection(
-            clientName: clientName,
-            sessionToken: sessionToken
-        )
-
-        // Do not block first-frame MCP startup on MainActor/global settings during bootstrap.
-        // The instructions resource path reads the live Code Maps setting later; defaulting
-        // the initial server instructions to enabled keeps CLI initialize responsive.
-        let codeMapsDisabled = false
-
-        // Create connection manager
-        let manager = BootstrapSocketConnectionManager(
-            connectionID: connectionID,
-            sessionToken: sessionToken,
-            clientPid: clientPid,
-            clientName: clientName,
-            purpose: purpose,
-            codeMapsDisabled: codeMapsDisabled,
-            connectedFD: clientFD,
-            parentManager: self
-        )
-
         connections[connectionID] = manager
+        connectionLifecycleGenerationByID[connectionID] = lifecycleGeneration
         bindSessionToken(sessionToken, to: connectionID)
         if connectionStats[connectionID] == nil {
             connectionStats[connectionID] = ConnectionStats(
@@ -2581,6 +3162,7 @@ actor ServerNetworkManager {
         // (CLI may send MCP frames immediately after receiving "accepted")
         startMCPServerForConnection(
             connectionID: connectionID,
+            lifecycleGeneration: lifecycleGeneration,
             sessionToken: sessionToken,
             clientPid: clientPid,
             manager: manager
@@ -2592,12 +3174,17 @@ actor ServerNetworkManager {
         Task { @MainActor [weak self] in
             guard let self else { return }
             let count = WindowStatesManager.shared.allWindows.count
-            await setWindowCountAtConnectionTime(connectionID: connectionID, count: count)
+            await setWindowCountAtConnectionTime(
+                connectionID: connectionID,
+                lifecycleGeneration: lifecycleGeneration,
+                count: count
+            )
         }
     }
 
     /// Sets the window count at connection time (called from MainActor task)
-    private func setWindowCountAtConnectionTime(connectionID: UUID, count: Int) {
+    private func setWindowCountAtConnectionTime(connectionID: UUID, lifecycleGeneration expectedLifecycleGeneration: UInt64, count: Int) {
+        guard isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return }
         windowCountAtConnectionTime[connectionID] = count
     }
 
@@ -2643,10 +3230,17 @@ actor ServerNetworkManager {
         return .unknown
     }
 
+    private func isCurrentConnection(_ connectionID: UUID, lifecycleGeneration expectedLifecycleGeneration: UInt64) -> Bool {
+        isCurrentLifecycle(expectedLifecycleGeneration)
+            && connectionLifecycleGenerationByID[connectionID] == expectedLifecycleGeneration
+            && connections[connectionID] != nil
+    }
+
     /// Starts the MCP server for a bootstrap connection.
     /// Called from postAccept after the "accepted" response has been sent to the CLI.
     private func startMCPServerForConnection(
         connectionID: UUID,
+        lifecycleGeneration expectedLifecycleGeneration: UInt64,
         sessionToken: String,
         clientPid: Int,
         manager: BootstrapSocketConnectionManager
@@ -2656,6 +3250,7 @@ actor ServerNetworkManager {
             defer {
                 self.connectionTasks.removeValue(forKey: connectionID)
             }
+            guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return }
             do {
                 guard let approvalHandler = self.connectionApprovalHandler else {
                     log.error("No connection approval handler set, rejecting bootstrap connection")
@@ -2666,6 +3261,7 @@ actor ServerNetworkManager {
                 connectionLog("Starting MCP server for bootstrap connection \(connectionID)")
                 mcpACPLog("[MCP-ACP] starting MCP server connection=\(connectionID)")
                 try await manager.start { clientInfo in
+                    guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return false }
                     connectionLog("MCP handshake callback for \(connectionID): clientName='\(clientInfo.name)'")
                     mcpACPLog("[MCP-ACP] handshake connection=\(connectionID) clientName=\(clientInfo.name)")
 
@@ -2697,6 +3293,7 @@ actor ServerNetworkManager {
 
                     connectionLog("Calling approval handler for \(connectionID) client='\(clientInfo.name)'")
                     let approved = await approvalHandler(connectionID, clientInfo)
+                    guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return false }
                     connectionLog("Approval handler returned \(approved) for \(connectionID)")
                     if approved {
                         let readiness = await self.awaitAgentPolicyAdmissionIfNeeded(
@@ -2706,6 +3303,7 @@ actor ServerNetworkManager {
                             sessionKey: sessionToken,
                             clientPid: clientPid
                         )
+                        guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return false }
                         if readiness == .timedOut {
                             self.pendingConnections.removeValue(forKey: connectionID)
                             return false
@@ -2717,16 +3315,24 @@ actor ServerNetworkManager {
                             clientPid: clientPid,
                             bootstrapClientName: bootstrapClientName
                         )
-                        self.notifyConnectionWaiters(connectionID: connectionID, clientName: clientInfo.name)
+                        guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return false }
+                        self.notifyConnectionWaiters(
+                            connectionID: connectionID,
+                            clientName: clientInfo.name,
+                            lifecycleGeneration: expectedLifecycleGeneration
+                        )
 
                         // Do not block MCP initialize on window binding/readiness/cache warming.
                         // Policy admission and waiter notification are complete; finish catalog prep opportunistically.
                         Task {
+                            guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return }
                             let windowID = await self.ensureWindowBindingIfUnambiguous(connectionID: connectionID, reason: "handshake")
+                            guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return }
                             let ready = await MCPToolCatalogReadiness.shared.awaitReady(
                                 windowID: windowID,
                                 timeout: MCPToolCatalogReadiness.defaultTimeout
                             )
+                            guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return }
                             if !ready {
                                 log.warning("Tool catalog not ready for connection \(connectionID) window=\(windowID.map(String.init) ?? "nil") - proceeding anyway")
                             }
@@ -2741,6 +3347,8 @@ actor ServerNetworkManager {
                     return approved
                 }
 
+                guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return }
+
                 // Update identity after successful start
                 if var ctx = self.identityContextByConnection[connectionID] {
                     ctx.hasHandshake = true
@@ -2750,50 +3358,131 @@ actor ServerNetworkManager {
 
             } catch {
                 log.error("Bootstrap connection \(connectionID) start failed: \(error)")
+                guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return }
                 await removeConnection(connectionID)
             }
         }
     }
 
-    /// Stops the bootstrap socket server.
-    private func stopBootstrapSocketServer() async {
-        bootstrapSocketTask?.cancel()
-        bootstrapSocketTask = nil
-        await bootstrapSocketServer?.stop()
+    /// Stops one published bootstrap listener. Actor reentrancy means a replacement
+    /// listener may be published while the cross-actor stop awaits; only clear the
+    /// listener slot when the identity and lifecycle generation still match.
+    private func stopBootstrapSocketServer(server: BootstrapSocketServer?, lifecycleGeneration expectedLifecycleGeneration: UInt64) async {
+        guard let server,
+              bootstrapSocketServer === server,
+              bootstrapSocketServerLifecycleGeneration == expectedLifecycleGeneration
+        else { return }
+
+        await server.stop()
+        #if DEBUG
+            await debugSuspendLifecycleFenceCheckpointIfNeeded(.listenerStopReturnedBeforeConditionalClear)
+        #endif
+
+        guard bootstrapSocketServer === server,
+              bootstrapSocketServerLifecycleGeneration == expectedLifecycleGeneration
+        else { return }
         bootstrapSocketServer = nil
+        bootstrapSocketServerLifecycleGeneration = nil
+
+        scheduleBootstrapSocketServerStartForCurrentLifecycleIfNeeded(excluding: expectedLifecycleGeneration)
+    }
+
+    /// If stale listener teardown or startup failure cleared an older publication after a
+    /// cold start began, restore the current lifecycle promptly. Maintenance is the fallback.
+    private func scheduleBootstrapSocketServerStartForCurrentLifecycleIfNeeded(excluding staleLifecycleGeneration: UInt64) {
+        let replacementLifecycleGeneration = lifecycleGeneration
+        guard replacementLifecycleGeneration != staleLifecycleGeneration,
+              isCurrentLifecycle(replacementLifecycleGeneration),
+              bootstrapSocketServer == nil
+        else { return }
+
+        Task { [weak self] in
+            await self?.startBootstrapSocketServer(lifecycleGeneration: replacementLifecycleGeneration)
+        }
     }
 
     func stop() async {
         connectionLog("Stopping network manager")
-        isRunningState = false
+        let stoppedLifecycleGeneration = lifecycleGeneration
+        let listenerToStop = bootstrapSocketServerLifecycleGeneration == stoppedLifecycleGeneration
+            ? bootstrapSocketServer
+            : nil
+        let connectionsToStop = connections.compactMap { connectionID, connectionManager -> (UUID, any MCPServerConnection)? in
+            guard connectionLifecycleGenerationByID[connectionID] == stoppedLifecycleGeneration else { return nil }
+            return (connectionID, connectionManager)
+        }
 
-        // Stop maintenance loop
+        // This synchronous invalidation boundary executes before the first await. New starts
+        // receive a new generation and stale listener/restart/connection resumptions can no
+        // longer publish into that lifecycle.
+        isRunningState = false
+        lifecycleGeneration &+= 1
+        invalidateBootstrapRestartState()
+        if bootstrapStartLifecycleGeneration == stoppedLifecycleGeneration {
+            bootstrapStartLifecycleGeneration = nil
+            bootstrapStartInProgress = false
+        }
+        bootstrapSocketTask?.cancel()
+        bootstrapSocketTask = nil
         maintenanceTask?.cancel()
         maintenanceTask = nil
 
-        // Stop bootstrap socket server
-        await stopBootstrapSocketServer()
-
-        // Clear any pending reservations
+        // Invalidate synchronous transfer publication and close transferred-but-unregistered
+        // sockets before awaiting listener teardown. This prevents old-lifecycle commits
+        // from surviving a full stop followed by restart.
+        let transferredBootstrapFDs = transferredBootstrapSockets.invalidateAndDrain(
+            lifecycleGeneration: stoppedLifecycleGeneration
+        )
+        for fd in transferredBootstrapFDs {
+            closeUnregisteredBootstrapFD(fd)
+        }
         bootstrapReservations.removeAll()
-
-        // Stop all connections
-        for (id, connectionManager) in connections {
-            connectionLog("Stopping connection: \(id)")
-            #if DEBUG
-                debugRecordConnectionEvent("removed", connectionID: id, reason: "serverShutdown")
-            #endif
-            await connectionManager.stop()
-            connectionTasks[id]?.cancel()
+        let waiterIDsToResume = connectionWaiters.compactMap { waiterID, waiter in
+            waiter.lifecycleGeneration == stoppedLifecycleGeneration ? waiterID : nil
+        }
+        for waiterID in waiterIDsToResume {
+            resumeWaiter(
+                waiterID,
+                lifecycleGeneration: stoppedLifecycleGeneration,
+                with: nil
+            )
         }
 
-        connections.removeAll()
-        connectionTasks.removeAll()
+        // Detach only captured old-generation connection registries before yielding. Their
+        // managers are stopped below, but a slow cross-actor stop must not leave stale sessions
+        // visible to a replacement lifecycle or clear replacement registries when it resumes.
+        for (id, _) in connectionsToStop {
+            connectionTasks[id]?.cancel()
+            connections.removeValue(forKey: id)
+            connectionLifecycleGenerationByID.removeValue(forKey: id)
+            connectionTasks.removeValue(forKey: id)
+            pendingConnections.removeValue(forKey: id)
+            identityContextByConnection.removeValue(forKey: id)
+            capabilityTokenByConnection.removeValue(forKey: id)
+            connectionStats.removeValue(forKey: id)
+        }
+
+        // Clear shared in-memory routing caches before yielding. A replacement lifecycle
+        // may repopulate them while this shutdown awaits, so stale teardown must never
+        // perform broad removeAll() operations after the first suspension point.
         pendingConnections.removeAll()
         identityContextByConnection.removeAll()
         capabilityTokenByConnection.removeAll()
         connectionIDBySessionToken.removeAll()
         resetInMemoryRoutingCachesForRestart()
+
+        await stopBootstrapSocketServer(server: listenerToStop, lifecycleGeneration: stoppedLifecycleGeneration)
+
+        // The registry detach above was synchronous; stale resumptions below only stop the
+        // captured manager objects and never mutate a replacement lifecycle's registries.
+        for (id, connectionManager) in connectionsToStop {
+            connectionLog("Stopping connection: \(id)")
+            #if DEBUG
+                debugRecordConnectionEvent("removed", connectionID: id, reason: "serverShutdown")
+            #endif
+            await connectionManager.stop()
+        }
+        emitDashboardUpdate()
     }
 
     private func resetInMemoryRoutingCachesForRestart() {
@@ -3121,7 +3810,12 @@ actor ServerNetworkManager {
     func removeConnection(_ id: UUID) async {
         // Always drop any lingering bootstrap reservation (commit/rollback should handle it,
         // but this is a leak safety-net for edge cases)
-        _ = bootstrapReservations.removeValue(forKey: id)
+        if let reservation = bootstrapReservations.removeValue(forKey: id) {
+            closeTransferredBootstrapSocket(
+                connectionID: id,
+                lifecycleGeneration: reservation.lifecycleGeneration
+            )
+        }
 
         // Idempotent guard – if already gone, do nothing (and do not log)
         guard connections[id] != nil
@@ -3203,6 +3897,7 @@ actor ServerNetworkManager {
 
         // Remove from all collections
         connections.removeValue(forKey: id)
+        connectionLifecycleGenerationByID.removeValue(forKey: id)
         connectionTasks.removeValue(forKey: id)
         pendingConnections.removeValue(forKey: id)
         connectionStats.removeValue(forKey: id)
@@ -5997,6 +6692,12 @@ actor ServerNetworkManager {
                     }
                 }
             #endif
+            let lifecycleCorrelation = EditFlowPerf.makeLifecycleCorrelationIfActive()
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.MCPToolCall.received,
+                correlation: lifecycleCorrelation,
+                EditFlowPerf.Dimensions(toolName: toolName)
+            )
             // CE exposes all MCP tools that are registered for the current connection.
             // Avoid calling the MainActor-backed ToolAvailabilityStore from this hot path;
             // it can block tool responses while settings/UI work is in flight.
@@ -6217,6 +6918,11 @@ actor ServerNetworkManager {
                 }
             }
             connectionLog("tools/call \(toolName): routing state windowCount=\(routingSnapshot.0) services=\(routingSnapshot.1.count) multi=\(routingSnapshot.2)")
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.MCPToolCall.routingSnapshotCompleted,
+                correlation: lifecycleCorrelation,
+                EditFlowPerf.Dimensions(toolName: toolName)
+            )
 
             // Per-connection concurrency limiter with safe release pattern
             connectionLog("tools/call \(toolName): acquiring limiter")
@@ -6236,14 +6942,24 @@ actor ServerNetworkManager {
                     EditFlowPerf.Stage.MCPToolCall.limiterWait,
                     EditFlowPerf.Dimensions(toolName: toolName)
                 )
+                EditFlowPerf.lifecycleEvent(
+                    EditFlowPerf.Lifecycle.MCPToolCall.limiterWaitBegan,
+                    correlation: lifecycleCorrelation,
+                    EditFlowPerf.Dimensions(toolName: toolName)
+                )
                 return await limiter.withPermit {
                     EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.limiterWait, limiterWaitState)
+                    EditFlowPerf.lifecycleEvent(
+                        EditFlowPerf.Lifecycle.MCPToolCall.limiterAcquired,
+                        correlation: lifecycleCorrelation,
+                        EditFlowPerf.Dimensions(toolName: toolName)
+                    )
                     return await EditFlowPerf.measure(
                         EditFlowPerf.Stage.MCPToolCall.permitBodyEnvelope,
                         EditFlowPerf.Dimensions(toolName: toolName)
                     ) {
                         // Wrap entire call so inner services can query current routing hints.
-                        await Self.$currentConnectionID.withValue(connectionID) {
+                        await Self.withConnectionID(connectionID, lifecycleCorrelation: lifecycleCorrelation) {
                             await Self.$currentTabContextHint.withValue(capturedTabContextHint) {
                                 let permitPreDispatchEnvelopeState = EditFlowPerf.begin(
                                     EditFlowPerf.Stage.MCPToolCall.permitPreDispatchEnvelope,
@@ -6700,6 +7416,10 @@ actor ServerNetworkManager {
                                                         #endif
                                                     }
                                                 }
+                                                EditFlowPerf.lifecycleEvent(
+                                                    EditFlowPerf.Lifecycle.MCPToolCall.completionObserverReturned,
+                                                    EditFlowPerf.Dimensions(toolName: toolName, status: "success")
+                                                )
 
                                                 // Note: context_builder caller termination is NOT done here.
                                                 // The spawned agent connection is terminated by ContextBuilderAgentViewModel
@@ -6729,6 +7449,10 @@ actor ServerNetworkManager {
                                                     #endif
                                                 }
                                             }
+                                            EditFlowPerf.lifecycleEvent(
+                                                EditFlowPerf.Lifecycle.MCPToolCall.completionObserverReturned,
+                                                EditFlowPerf.Dimensions(toolName: toolName, status: "dispatchError")
+                                            )
                                             return Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Error: \(error)")
                                         }
                                     } else {
@@ -6773,6 +7497,10 @@ actor ServerNetworkManager {
                                                     #endif
                                                 }
                                             }
+                                            EditFlowPerf.lifecycleEvent(
+                                                EditFlowPerf.Lifecycle.MCPToolCall.completionObserverReturned,
+                                                EditFlowPerf.Dimensions(toolName: toolName, status: "success")
+                                            )
 
                                             // Note: context_builder caller termination is NOT done here.
                                             // See comment in window-scoped branch above.
@@ -6799,6 +7527,10 @@ actor ServerNetworkManager {
                                                     #endif
                                                 }
                                             }
+                                            EditFlowPerf.lifecycleEvent(
+                                                EditFlowPerf.Lifecycle.MCPToolCall.completionObserverReturned,
+                                                EditFlowPerf.Dimensions(toolName: toolName, status: "dispatchError")
+                                            )
                                             return Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Error: \(error)")
                                         }
                                     }
@@ -6832,10 +7564,14 @@ actor ServerNetworkManager {
                                         )
                                     }
                                 }
+                                EditFlowPerf.lifecycleEvent(
+                                    EditFlowPerf.Lifecycle.MCPToolCall.completionObserverReturned,
+                                    EditFlowPerf.Dimensions(toolName: toolName, status: "toolNotFound")
+                                )
                                 log.error("Tool not found: \(toolName)")
                                 return Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Tool not found: \(toolName)")
                             } // TabContextHint TaskLocal wrapper
-                        } // ConnectionID TaskLocal wrapper
+                        } // ConnectionID + LifecycleCorrelation TaskLocal wrapper
                     } // PermitBodyEnvelope wrapper
                 } // withPermit wrapper
             } // LimiterEnvelope wrapper
@@ -7500,7 +8236,16 @@ actor ServerNetworkManager {
     }
 
     /// Evict least valuable eligible connection across all clients.
-    private func evictLeastValuableGlobalForAdmission(preserveOnePerClient: Bool) async -> Bool {
+    private func evictLeastValuableGlobalForAdmission(
+        preserveOnePerClient: Bool,
+        sourceListener: BootstrapSocketServer? = nil,
+        lifecycleGeneration: UInt64? = nil
+    ) async -> Bool {
+        guard isCurrentBootstrapAdmissionContext(
+            sourceListener: sourceListener,
+            lifecycleGeneration: lifecycleGeneration
+        ) else { return false }
+
         var countsByClient: [String: Int] = [:]
         for (cid, set) in activeConnectionsByClient {
             countsByClient[cid] = set.count
@@ -7508,11 +8253,25 @@ actor ServerNetworkManager {
 
         var candidates: [EvictionCandidate] = []
         for (id, _) in connections {
+            guard isCurrentBootstrapAdmissionContext(
+                sourceListener: sourceListener,
+                lifecycleGeneration: lifecycleGeneration
+            ) else { return false }
             guard await isEvictable(id) else { continue }
+            guard isCurrentBootstrapAdmissionContext(
+                sourceListener: sourceListener,
+                lifecycleGeneration: lifecycleGeneration
+            ) else { return false }
             if preserveOnePerClient, let cid = clientIDByConnection[id], (countsByClient[cid] ?? 0) <= 1 {
                 continue
             }
-            if let c = await makeCandidate(for: id) { candidates.append(c) }
+            if let c = await makeCandidate(for: id) {
+                guard isCurrentBootstrapAdmissionContext(
+                    sourceListener: sourceListener,
+                    lifecycleGeneration: lifecycleGeneration
+                ) else { return false }
+                candidates.append(c)
+            }
         }
 
         if candidates.isEmpty, preserveOnePerClient {
@@ -7523,14 +8282,39 @@ actor ServerNetworkManager {
                 }
             }
             if !anyHasMoreThanOne {
-                return await evictLeastValuableGlobalForAdmission(preserveOnePerClient: false)
+                return await evictLeastValuableGlobalForAdmission(
+                    preserveOnePerClient: false,
+                    sourceListener: sourceListener,
+                    lifecycleGeneration: lifecycleGeneration
+                )
             }
         }
 
+        guard isCurrentBootstrapAdmissionContext(
+            sourceListener: sourceListener,
+            lifecycleGeneration: lifecycleGeneration
+        ) else { return false }
         guard let victim = candidates.sorted(by: isLessValuable).first else { return false }
         log.warning("Global eviction: evicting \(victim.id) (client \(victim.clientID)) to admit a new connection.")
         await removeConnection(victim.id)
-        return true
+        return isCurrentBootstrapAdmissionContext(
+            sourceListener: sourceListener,
+            lifecycleGeneration: lifecycleGeneration
+        )
+    }
+
+    private func isCurrentBootstrapAdmissionContext(
+        sourceListener: BootstrapSocketServer?,
+        lifecycleGeneration: UInt64?
+    ) -> Bool {
+        switch (sourceListener, lifecycleGeneration) {
+        case (nil, nil):
+            true
+        case let (sourceListener?, lifecycleGeneration?):
+            isCurrentBootstrapListener(sourceListener, lifecycleGeneration: lifecycleGeneration)
+        default:
+            false
+        }
     }
 }
 

@@ -4826,7 +4826,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         }
 
         if aggressive {
-            let flushSamples = await workspaceFileContextStore.flushPendingServiceEventsForAllRoots()
+            let flushSamples = await workspaceFileContextStore.awaitAppliedIngressForAllRoots()
             #if DEBUG
                 preReplayServiceFlushes.append(contentsOf: flushSamples.map {
                     .init(rootKey: $0.rootPath, pendingRawEventCountBeforeFlush: $0.pendingRawEventCountBeforeFlush)
@@ -4861,7 +4861,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         }
 
         if aggressive {
-            let flushSamples = await workspaceFileContextStore.flushPendingServiceEventsForAllRoots()
+            let flushSamples = await workspaceFileContextStore.awaitAppliedIngressForAllRoots()
             #if DEBUG
                 postReplayServiceFlushes.append(contentsOf: flushSamples.map {
                     .init(rootKey: $0.rootPath, pendingRawEventCountBeforeFlush: $0.pendingRawEventCountBeforeFlush)

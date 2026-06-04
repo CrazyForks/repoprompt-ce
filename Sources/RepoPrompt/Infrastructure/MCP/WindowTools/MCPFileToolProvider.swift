@@ -28,6 +28,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
     private func fileActionsTool() -> Tool {
         runtime.tool(
             name: MCPWindowToolName.fileActions,
+            freshnessPolicy: .providerManaged,
             description: """
             Create, delete, or move files.
 
@@ -77,6 +78,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
     private func getCodeStructureTool() -> Tool {
         runtime.tool(
             name: MCPWindowToolName.getCodeStructure,
+            freshnessPolicy: .providerManaged,
             description: """
             Return code structure (function/type signatures) for files.
 
@@ -111,9 +113,13 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             }
             let scope = (args["scope"]?.stringValue ?? "paths").lowercased()
             let maxResults = max(0, args["max_results"]?.intValue ?? MCPWindowWorkspaceToolHelpers.defaultCodeStructureMaxResults)
+            let metadata = await dependencies.captureRequestMetadata()
+            let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+            _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
 
             switch scope {
             case "selected":
+                await dependencies.drainReadFileAutoSelection(metadata, .canonicalSelection)
                 let collections = try await dependencies.selectionCollectionsForCurrentTabContext()
                 var combined: [WorkspaceFileRecord] = []
                 var seenPaths = Set<String>()
@@ -125,8 +131,6 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                     let abs = entry.file.standardizedFullPath
                     if seenPaths.insert(abs).inserted { combined.append(entry.file) }
                 }
-                let metadata = await dependencies.captureRequestMetadata()
-                let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
                 return try await Value(dependencies.buildCodeStructureDTO(combined, maxResults, true, lookupContext.bindingProjection))
             default:
                 guard let rawPaths = args["paths"]?.arrayValue else {
@@ -136,8 +140,6 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 guard !paths.isEmpty else {
                     throw MCPError.invalidParams("paths array cannot be empty")
                 }
-                let metadata = await dependencies.captureRequestMetadata()
-                let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
                 let lookupRootScope = lookupContext.rootScope
                 let resolvedPaths = lookupContext.translateInputPaths(paths)
                 for path in resolvedPaths {
@@ -154,6 +156,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
     private func getFileTreeTool() -> Tool {
         runtime.tool(
             name: MCPWindowToolName.getFileTree,
+            freshnessPolicy: .providerManaged,
             description: """
             Generate ASCII directory tree of the project.
 
@@ -198,6 +201,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 let filePathDisplay = await MainActor.run { dependencies.promptVM.filePathDisplayOption }
                 let metadata = await dependencies.captureRequestMetadata()
                 let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+                _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
                 let worktreeScope = ToolResultDTOs.WorktreeScopeDTO.sessionBound(from: lookupContext.bindingProjection)
                 let snapshot = await dependencies.promptVM.workspaceFileContextStore.makeFileTreeSelectionSnapshot(
                     selection: StoredSelection(),
@@ -223,6 +227,10 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 }
                 let metadata = await dependencies.captureRequestMetadata()
                 let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+                _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
+                if mode.lowercased() == "selected" {
+                    await dependencies.drainReadFileAutoSelection(metadata, .canonicalSelection)
+                }
                 let worktreeScope = ToolResultDTOs.WorktreeScopeDTO.sessionBound(from: lookupContext.bindingProjection)
                 let resultAndRootCount = try await dependencies.buildStoreBackedFileTreeResult(mode, maxDepth, args["path"]?.stringValue, lookupContext)
                 return try Value(ToolResultDTOs.FileTreeDTO(
@@ -242,6 +250,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
     private func readFileTool() -> Tool {
         runtime.tool(
             name: MCPWindowToolName.readFile,
+            freshnessPolicy: .providerManaged,
             description: """
             Read file contents with optional line range.
 
@@ -327,7 +336,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             EditFlowPerf.Dimensions(outcome: readResult.shouldAutoSelect ? "attempted" : "skipped")
         ) {
             if readResult.shouldAutoSelect {
-                await dependencies.maybeAutoSelectReadFileSelection(readResult.reply, path)
+                await dependencies.enqueueReadFileAutoSelection(readResult.reply, path, metadata)
             }
         }
         return try EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerValueEncoding) {
@@ -338,6 +347,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
     private func fileSearchTool() -> Tool {
         runtime.tool(
             name: MCPWindowToolName.search,
+            freshnessPolicy: .providerManaged,
             description: """
             Search files by path pattern and/or content.
 

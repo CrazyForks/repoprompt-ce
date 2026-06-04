@@ -26,6 +26,7 @@ final class MCPAgentSessionControlToolProvider: MCPWindowToolProviding {
     private func shareThoughtsTool() -> Tool {
         runtime.tool(
             name: MCPWindowToolName.shareThoughts,
+            freshnessPolicy: .none,
             description: """
             Share real-time progress updates with the user.
 
@@ -64,6 +65,7 @@ final class MCPAgentSessionControlToolProvider: MCPWindowToolProviding {
     private func setStatusTool() -> Tool {
         runtime.tool(
             name: MCPWindowToolName.setStatus,
+            freshnessPolicy: .none,
             description: """
             Rename the current agent session/tab.
 
@@ -75,8 +77,7 @@ final class MCPAgentSessionControlToolProvider: MCPWindowToolProviding {
                     "session_name": .string(description: "Optional session/tab title to set for the active session tab.")
                 ],
                 required: []
-            ),
-            flushFS: false
+            )
         ) { [dependencies] _, args in
             try await Self.executeSetStatus(args: args, dependencies: dependencies)
         }
@@ -85,6 +86,7 @@ final class MCPAgentSessionControlToolProvider: MCPWindowToolProviding {
     private func waitForNextInstructionTool() -> Tool {
         runtime.tool(
             name: MCPWindowToolName.waitForNextInstruction,
+            freshnessPolicy: .none,
             description: """
             Complete your turn and receive the user's next message.
 

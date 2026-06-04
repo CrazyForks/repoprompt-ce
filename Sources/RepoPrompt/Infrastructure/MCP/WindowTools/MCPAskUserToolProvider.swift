@@ -25,6 +25,7 @@ final class MCPAskUserToolProvider: MCPWindowToolProviding {
     private func askUserTool() -> Tool {
         runtime.tool(
             name: MCPWindowToolName.askUser,
+            freshnessPolicy: .none,
             description: """
             Ask the user a clarifying question and wait for their response.
 

@@ -177,7 +177,8 @@ struct MCPWindowToolDependencies {
     typealias ResolveFilesForCodeStructure = @MainActor @Sendable (_ paths: [String], _ lookupRootScope: WorkspaceLookupRootScope) async -> [WorkspaceFileRecord]
     typealias BuildStoreBackedFileTreeResult = @MainActor @Sendable (_ mode: String, _ maxDepth: Int?, _ startPath: String?, _ lookupContext: WorkspaceLookupContext) async throws -> (result: FileTreeResult, rootCount: Int)
     typealias ReadFile = @MainActor @Sendable (_ path: String, _ startLine1Based: Int?, _ lineCount: Int?, _ lookupRootScope: WorkspaceLookupRootScope) async throws -> (reply: ToolResultDTOs.ReadFileReply, shouldAutoSelect: Bool)
-    typealias MaybeAutoSelectReadFileSelection = @MainActor @Sendable (_ reply: ToolResultDTOs.ReadFileReply, _ requestedPath: String) async -> Void
+    typealias EnqueueReadFileAutoSelection = @MainActor @Sendable (_ reply: ToolResultDTOs.ReadFileReply, _ requestedPath: String, _ metadata: MCPServerViewModel.RequestMetadata) async -> Void
+    typealias DrainReadFileAutoSelection = @MainActor @Sendable (_ metadata: MCPServerViewModel.RequestMetadata, _ requirement: MCPReadFileAutoSelectionCoordinator.DrainRequirement) async -> Void
     typealias MaybeAutoSelectFileSearchSlices = @MainActor @Sendable (_ mode: SearchMode, _ contextLines: Int, _ reply: ToolResultDTOs.SearchResultDTO) async -> Void
     typealias WorkspaceContextMessage = @MainActor @Sendable (_ operation: String?, _ path: String?) async -> String
     typealias ParseCopyPresetSelector = @Sendable (_ value: Value?) -> MCPServerViewModel.CopyPresetSelector?
@@ -256,7 +257,8 @@ struct MCPWindowToolDependencies {
     let resolveFilesForCodeStructure: ResolveFilesForCodeStructure
     let buildStoreBackedFileTreeResult: BuildStoreBackedFileTreeResult
     let readFile: ReadFile
-    let maybeAutoSelectReadFileSelection: MaybeAutoSelectReadFileSelection
+    let enqueueReadFileAutoSelection: EnqueueReadFileAutoSelection
+    let drainReadFileAutoSelection: DrainReadFileAutoSelection
     let maybeAutoSelectFileSearchSlices: MaybeAutoSelectFileSearchSlices
     let workspaceContextMessage: WorkspaceContextMessage
 

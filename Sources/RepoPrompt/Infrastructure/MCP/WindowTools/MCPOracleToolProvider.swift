@@ -27,6 +27,7 @@ final class MCPOracleToolProvider: MCPWindowToolProviding {
     private func oracleUtilsTool() -> Tool {
         runtime.tool(
             name: MCPWindowToolName.oracleUtils,
+            freshnessPolicy: .none,
             description: """
             Oracle helper utilities.
 
@@ -53,6 +54,7 @@ final class MCPOracleToolProvider: MCPWindowToolProviding {
     private func askOracleTool() -> Tool {
         runtime.tool(
             name: MCPWindowToolName.askOracle,
+            freshnessPolicy: .providerManaged,
             description: """
             Agent-mode oracle send/continue tool.
 
@@ -94,6 +96,7 @@ final class MCPOracleToolProvider: MCPWindowToolProviding {
     private func oracleSendTool() -> Tool {
         runtime.tool(
             name: MCPWindowToolName.oracleSend,
+            freshnessPolicy: .providerManaged,
             description: """
             Consult a second AI for planning, review, or questions.
 
@@ -139,6 +142,7 @@ final class MCPOracleToolProvider: MCPWindowToolProviding {
     private func oracleChatLogTool() -> Tool {
         runtime.tool(
             name: MCPWindowToolName.oracleChatLog,
+            freshnessPolicy: .none,
             description: """
             Read recent Oracle conversation messages to recover context during agent mode.
 

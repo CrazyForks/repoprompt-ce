@@ -84,7 +84,7 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
         codeMapsDisabled: Bool,
         connectedFD: Int32,
         parentManager: ServerNetworkManager
-    ) {
+    ) throws {
         self.connectionID = connectionID
         self.sessionToken = sessionToken
         self.clientPid = clientPid
@@ -93,7 +93,7 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
         self.parentManager = parentManager
 
         // Create transport with existing connected FD
-        transport = UnixSocketMCPTransport(connectedFD: connectedFD, logger: bootstrapLog)
+        transport = try UnixSocketMCPTransport(connectedFD: connectedFD, logger: bootstrapLog)
 
         server = MCP.Server(
             name: Bundle.main.appName,

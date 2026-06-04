@@ -710,6 +710,12 @@ final class CLIProcessRunner {
         switch error {
         case let .pipeCreationFailed(pipe):
             return .spawnFailed("Failed to create \(pipe) pipe for process startup")
+        case let .descriptorConfigurationFailed(label, fd, underlying):
+            let message = String(cString: strerror(underlying.errnoValue))
+            return .spawnFailed("Failed to configure \(label) pipe descriptor \(fd) for process startup: \(message)")
+        case let .spawnFileActionsFailed(operation, errnoValue):
+            let message = String(cString: strerror(errnoValue))
+            return .spawnFailed("Failed to configure spawn file actions (\(operation)) for \(command): \(message)")
         case let .changeDirectoryFailed(path, errnoValue):
             let message = String(cString: strerror(errnoValue))
             return .spawnFailed("Unable to set working directory to \(path): \(message)")

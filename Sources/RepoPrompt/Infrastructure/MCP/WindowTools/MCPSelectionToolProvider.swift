@@ -22,6 +22,7 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
     private func manageSelectionTool() -> Tool {
         runtime.tool(
             name: MCPWindowToolName.manageSelection,
+            freshnessPolicy: .providerManaged,
             description: """
             Manage the file selection used by all tools.
 
@@ -116,9 +117,11 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
         let display: FilePathDisplay = ((args["path_display"]?.stringValue ?? "relative").lowercased() == "full") ? .full : .relative
         let includeBlocks = view == "content"
         let metadata = await dependencies.captureRequestMetadata()
+        await dependencies.drainReadFileAutoSelection(metadata, .mirroredSelectionAndMetrics)
         var resolvedContext = try dependencies.resolveTabContextSnapshot(metadata, MCPWindowToolName.manageSelection, .allowLegacyImplicitRouting)
         let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
         let lookupRootScope = lookupContext.rootScope
+        _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupRootScope)
         if !resolvedContext.usesActiveTabCompatibility {
             resolvedContext.snapshot.selection = await dependencies.stabilizedVirtualSelection(resolvedContext.snapshot)
         }

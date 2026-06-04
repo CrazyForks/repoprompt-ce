@@ -30,125 +30,533 @@ private func detectEncodingFull(_ data: Data) -> String.Encoding {
     return guess != 0 ? .init(rawValue: guess) : .utf8
 }
 
-extension FileSystemService {
-    func loadContent(ofRelativePath relativePath: String) async throws -> String? {
-        let contentLoadState = EditFlowPerf.begin(EditFlowPerf.Stage.FileSystem.contentLoadActorBody)
-        defer { EditFlowPerf.end(EditFlowPerf.Stage.FileSystem.contentLoadActorBody, contentLoadState) }
+private enum ContentReadMode {
+    case automatic
+    case streamed
+}
 
-        // Early, no-IO short-circuit for known-binary extensions
-        let relExt = ((relativePath as NSString).pathExtension).lowercased()
-        if !relExt.isEmpty, Self.alwaysBinaryExtensions.contains(relExt) {
-            return nil
+private struct ContentReadFingerprint: Equatable {
+    let fileSize: Int64
+    let modificationDate: Date?
+    let systemFileNumber: UInt64?
+}
+
+private struct ContentReadRequest {
+    let cacheKey: String
+    let relativePath: String
+    let absolutePath: String
+    let standardizedRootPath: String
+    let canonicalRootPath: String
+    let skipSymlinks: Bool
+    let chunkSize: Int
+    let fileSizeLimit: Int64
+    let mode: ContentReadMode
+    let workloadClass: ContentReadWorkloadClass
+    #if DEBUG
+        let chunkReadHandler: (@Sendable (String) async -> Void)?
+    #endif
+}
+
+private struct ContentReadResult {
+    let absolutePath: String
+    let content: String?
+    let detectedEncodingRawValue: UInt?
+    let modificationDate: Date?
+    let fingerprint: ContentReadFingerprint?
+
+    var detectedEncoding: String.Encoding? {
+        detectedEncodingRawValue.map(String.Encoding.init(rawValue:))
+    }
+}
+
+private struct ValidatedContentFile {
+    let url: URL
+    let fileSize: Int64
+    let modificationDate: Date?
+    let fingerprint: ContentReadFingerprint
+}
+
+private enum BoundedDataReadResult {
+    case data(Data)
+    case tooLarge(observedByteCount: Int64)
+}
+
+private actor ContentReadAsyncLimiter {
+    private struct PermitAcquisition {
+        let waited: Bool
+        let queueDepth: Int
+        let waiterCount: Int
+    }
+
+    private enum WaiterState {
+        case waiting(
+            continuation: CheckedContinuation<PermitAcquisition, Error>,
+            workloadClass: ContentReadWorkloadClass,
+            lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?
+        )
+        case cancelled
+    }
+
+    private let capacity: Int
+    private var availablePermits: Int
+    private var waiterOrder: [UUID] = []
+    private var pendingWaiterIDs = Set<UUID>()
+    private var waiterStates: [UUID: WaiterState] = [:]
+
+    init(capacity: Int) {
+        precondition(capacity > 0, "Content read limiter must have at least one permit")
+        self.capacity = capacity
+        availablePermits = capacity
+    }
+
+    func withPermit<T>(
+        workloadClass: ContentReadWorkloadClass,
+        _ body: @Sendable () async throws -> T
+    ) async throws -> T {
+        let lifecycleCorrelation = EditFlowPerf.currentLifecycleCorrelation
+        let permitWaitState = EditFlowPerf.begin(
+            EditFlowPerf.Stage.FileSystem.contentReadWorkerPermitWait,
+            EditFlowPerf.Dimensions(
+                workloadClass: workloadClass.rawValue,
+                queueDepth: waiterOrder.count,
+                waiterCount: waiterStates.count
+            )
+        )
+        do {
+            let acquisition = try await acquire(
+                workloadClass: workloadClass,
+                lifecycleCorrelation: lifecycleCorrelation
+            )
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.FileSystem.contentReadWorkerPermitWait,
+                permitWaitState,
+                EditFlowPerf.Dimensions(
+                    outcome: acquisition.waited ? "acquiredAfterWait" : "immediate",
+                    workloadClass: workloadClass.rawValue,
+                    queueDepth: acquisition.queueDepth,
+                    waiterCount: acquisition.waiterCount
+                )
+            )
+        } catch {
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.FileSystem.contentReadWorkerPermitWait,
+                permitWaitState,
+                EditFlowPerf.Dimensions(
+                    outcome: error is CancellationError ? "cancelled" : "error",
+                    workloadClass: workloadClass.rawValue,
+                    queueDepth: waiterOrder.count,
+                    waiterCount: waiterStates.count
+                )
+            )
+            throw error
+        }
+        defer { release() }
+        try Task.checkCancellation()
+        return try await body()
+    }
+
+    private func acquire(
+        workloadClass: ContentReadWorkloadClass,
+        lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?
+    ) async throws -> PermitAcquisition {
+        try Task.checkCancellation()
+        if availablePermits > 0 {
+            availablePermits -= 1
+            return PermitAcquisition(waited: false, queueDepth: waiterOrder.count, waiterCount: waiterStates.count)
         }
 
-        let fm = fm // Cache for multiple calls in this method
-        let fullPath = fullPath(forRelativePath: relativePath)
-        guard fm.fileExists(atPath: fullPath, isDirectory: nil) else {
-            throw FileSystemError.fileNotFound
+        let waiterID = UUID()
+        pendingWaiterIDs.insert(waiterID)
+        defer {
+            pendingWaiterIDs.remove(waiterID)
+            waiterStates.removeValue(forKey: waiterID)
         }
-
-        let attrs = try fm.attributesOfItem(atPath: fullPath)
-        let fileSize = attrs[.size] as? Int64 ?? 0
-        let url = URL(fileURLWithPath: fullPath)
-        let ext = url.pathExtension.lowercased()
-
-        // (1) Whitelist → skip binary probe entirely
-        let skipProbe = Self.alwaysTextExtensions.contains(ext)
-            || (ext.isEmpty && Self.alwaysTextFilenames.contains(url.lastPathComponent.lowercased()))
-
-        // (2) Optional heuristic probe on first 8 KB
-        if !skipProbe {
-            if let handle = try? FileHandle(forReadingFrom: url) {
-                let probe = try handle.read(upToCount: 8192) ?? Data()
-                try? handle.close()
-                if Self.isProbablyBinary(probe) { return nil }
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                Task {
+                    await self.enqueueWaiter(
+                        id: waiterID,
+                        continuation: continuation,
+                        workloadClass: workloadClass,
+                        lifecycleCorrelation: lifecycleCorrelation
+                    )
+                }
             }
+        } onCancel: {
+            Task { await self.cancelWaiter(id: waiterID) }
         }
+    }
 
-        // (3) Small files – read once, detect encoding
-        if fileSize < 2_000_000 {
-            let detected = try readDataAndDetectEncoding(fullPath)
-            encodingMap[relativePath] = detected.encoding
-            return detected.string
+    private func enqueueWaiter(
+        id: UUID,
+        continuation: CheckedContinuation<PermitAcquisition, Error>,
+        workloadClass: ContentReadWorkloadClass,
+        lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?
+    ) {
+        if case .cancelled? = waiterStates.removeValue(forKey: id) {
+            continuation.resume(throwing: CancellationError())
+            return
         }
-
-        // (4) Larger files – streamed read
-        return try await loadEntireFileContentOptimized(
-            ofRelativePath: relativePath,
-            chunkSize: 1_048_576, // 1 MB
-            fileSizeLimit: 10_000_000 // 10 MB
+        if availablePermits > 0 {
+            availablePermits -= 1
+            continuation.resume(returning: PermitAcquisition(
+                waited: false,
+                queueDepth: waiterOrder.count,
+                waiterCount: waiterStates.count
+            ))
+            return
+        }
+        waiterStates[id] = .waiting(
+            continuation: continuation,
+            workloadClass: workloadClass,
+            lifecycleCorrelation: lifecycleCorrelation
+        )
+        waiterOrder.append(id)
+        EditFlowPerf.lifecycleEvent(
+            EditFlowPerf.Lifecycle.FileSystem.contentReadWorkerPermitWaitBegan,
+            correlation: lifecycleCorrelation,
+            EditFlowPerf.Dimensions(
+                workloadClass: workloadClass.rawValue,
+                queueDepth: waiterOrder.count,
+                waiterCount: waiterStates.count
+            )
         )
     }
 
-    /// For backward compatibility - delegates to the new implementation
-    func loadContent(of url: URL) async throws -> String? {
-        let relativePath = url.relativePath(from: URL(fileURLWithPath: path))
-        return try await loadContent(ofRelativePath: relativePath)
+    private func cancelWaiter(id: UUID) {
+        if case let .waiting(continuation, workloadClass, lifecycleCorrelation)? = waiterStates.removeValue(forKey: id) {
+            waiterOrder.removeAll { $0 == id }
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.FileSystem.contentReadWorkerPermitCancelled,
+                correlation: lifecycleCorrelation,
+                EditFlowPerf.Dimensions(
+                    workloadClass: workloadClass.rawValue,
+                    queueDepth: waiterOrder.count,
+                    waiterCount: waiterStates.count
+                )
+            )
+            continuation.resume(throwing: CancellationError())
+        } else if pendingWaiterIDs.contains(id), waiterStates[id] == nil {
+            waiterStates[id] = .cancelled
+        }
     }
 
-    func loadContentWithDate(ofRelativePath relativePath: String) async throws -> (content: String?, modificationDate: Date) {
-        // let _ = fullPath(forRelativePath: relativePath)
-        async let content = loadContent(ofRelativePath: relativePath)
+    #if DEBUG
+        func snapshotForTesting() -> (queueDepth: Int, waiterCount: Int, pendingWaiterCount: Int) {
+            (waiterOrder.count, waiterStates.count, pendingWaiterIDs.count)
+        }
+    #endif
+
+    private func release() {
+        while !waiterOrder.isEmpty {
+            let waiterID = waiterOrder.removeFirst()
+            guard let state = waiterStates.removeValue(forKey: waiterID) else { continue }
+            switch state {
+            case let .waiting(continuation, workloadClass, lifecycleCorrelation):
+                EditFlowPerf.lifecycleEvent(
+                    EditFlowPerf.Lifecycle.FileSystem.contentReadWorkerPermitAcquired,
+                    correlation: lifecycleCorrelation,
+                    EditFlowPerf.Dimensions(
+                        workloadClass: workloadClass.rawValue,
+                        queueDepth: waiterOrder.count,
+                        waiterCount: waiterStates.count
+                    )
+                )
+                continuation.resume(returning: PermitAcquisition(
+                    waited: true,
+                    queueDepth: waiterOrder.count,
+                    waiterCount: waiterStates.count
+                ))
+                return
+            case .cancelled:
+                continue
+            }
+        }
+        #if DEBUG
+            assert(availablePermits < capacity, "Content read limiter over-release detected")
+        #endif
+        availablePermits = min(availablePermits + 1, capacity)
+    }
+}
+
+extension FileSystemService {
+    private static let contentReadWorkerLimit = max(2, min(4, ProcessInfo.processInfo.activeProcessorCount))
+    private static let contentReadWorkerLimiter = ContentReadAsyncLimiter(capacity: contentReadWorkerLimit)
+
+    #if DEBUG
+        nonisolated static var contentReadWorkerLimitForTesting: Int {
+            contentReadWorkerLimit
+        }
+
+        nonisolated static func contentReadWorkerLimiterSnapshotForTesting() async -> (
+            queueDepth: Int,
+            waiterCount: Int,
+            pendingWaiterCount: Int
+        ) {
+            await contentReadWorkerLimiter.snapshotForTesting()
+        }
+    #endif
+
+    func loadContent(
+        ofRelativePath relativePath: String,
+        workloadClass: ContentReadWorkloadClass = .unspecified
+    ) async throws -> String? {
+        if Self.hasAlwaysBinaryExtension(relativePath) {
+            return nil
+        }
+
+        let request = try makeContentReadRequest(
+            cacheKey: relativePath,
+            chunkSize: 1_048_576,
+            fileSizeLimit: 10_000_000,
+            mode: .automatic,
+            workloadClass: workloadClass
+        )
+        #if DEBUG
+            if shouldUseSerialContentReadFallback {
+                return try await loadContentSerialForTesting(request)
+            }
+        #endif
+        let result = try await Self.performContentReadOffActor(request)
+        try Task.checkCancellation()
+        commitContentReadResultIfCurrent(result, cacheKey: request.cacheKey)
+        return result.content
+    }
+
+    /// For backward compatibility - delegates to the new implementation
+    func loadContent(
+        of url: URL,
+        workloadClass: ContentReadWorkloadClass = .unspecified
+    ) async throws -> String? {
+        let relativePath = url.relativePath(from: URL(fileURLWithPath: path))
+        return try await loadContent(ofRelativePath: relativePath, workloadClass: workloadClass)
+    }
+
+    func loadContentWithDate(
+        ofRelativePath relativePath: String,
+        workloadClass: ContentReadWorkloadClass = .unspecified
+    ) async throws -> (content: String?, modificationDate: Date) {
+        async let content = loadContent(ofRelativePath: relativePath, workloadClass: workloadClass)
         async let modDate = getFileModificationDate(atRelativePath: relativePath)
         return try await (content, modDate)
     }
 
-    /// Loads large files in chunks, detecting encoding on‑the‑fly.
+    /// Loads large files in chunks, detecting encoding on-the-fly.
     ///
     /// Order of precedence:
     ///   1. BOM (cheap, deterministic)
     ///   2. Cuchardet’s streaming detector
-    ///   3. Default to UTF‑8          ← no further fall‑backs
+    ///   3. Default to UTF-8          ← no further fall-backs
     func loadEntireFileContentOptimized(
         ofRelativePath relativePath: String,
-        chunkSize: Int = 1_048_576, // 1 MB
-        fileSizeLimit: Int64 = 10_000_000 // 10 MB
+        chunkSize: Int = 1_048_576, // 1 MB
+        fileSizeLimit: Int64 = 10_000_000, // 10 MB
+        workloadClass: ContentReadWorkloadClass = .unspecified
     ) async throws -> String? {
-        // Early, no-IO short-circuit for known-binary extensions
-        let relExt = ((relativePath as NSString).pathExtension).lowercased()
-        if !relExt.isEmpty, Self.alwaysBinaryExtensions.contains(relExt) {
+        if Self.hasAlwaysBinaryExtension(relativePath) {
             return nil
         }
 
-        let fm = fm // Cache for multiple calls in this method
+        let request = try makeContentReadRequest(
+            cacheKey: relativePath,
+            chunkSize: chunkSize,
+            fileSizeLimit: fileSizeLimit,
+            mode: .streamed,
+            workloadClass: workloadClass
+        )
+        #if DEBUG
+            if shouldUseSerialContentReadFallback {
+                return try await loadEntireFileContentOptimizedSerialForTesting(request)
+            }
+        #endif
+        let result = try await Self.performContentReadOffActor(request)
+        try Task.checkCancellation()
+        commitContentReadResultIfCurrent(result, cacheKey: request.cacheKey)
+        return result.content
+    }
 
-        let fullPath = fullPath(forRelativePath: relativePath)
-        guard fm.fileExists(atPath: fullPath, isDirectory: nil) else {
-            throw FileSystemError.fileNotFound
+    private func makeContentReadRequest(
+        cacheKey: String,
+        chunkSize: Int,
+        fileSizeLimit: Int64,
+        mode: ContentReadMode,
+        workloadClass: ContentReadWorkloadClass
+    ) throws -> ContentReadRequest {
+        let contentLoadState = EditFlowPerf.begin(EditFlowPerf.Stage.FileSystem.contentLoadActorBody)
+        defer { EditFlowPerf.end(EditFlowPerf.Stage.FileSystem.contentLoadActorBody, contentLoadState) }
+
+        guard !cacheKey.hasPrefix("/"), !StandardizedPath.containsNUL(cacheKey) else {
+            throw FileSystemError.invalidRelativePath
+        }
+        let relativePath = StandardizedPath.relative(cacheKey)
+        guard !relativePath.isEmpty, relativePath != "..", !relativePath.hasPrefix("../") else {
+            throw FileSystemError.invalidRelativePath
+        }
+        let absolutePath = StandardizedPath.join(
+            standardizedRoot: standardizedRootPath,
+            standardizedRelativePath: relativePath
+        )
+        guard absolutePath != standardizedRootPath,
+              StandardizedPath.isDescendant(absolutePath, of: standardizedRootPath)
+        else {
+            throw FileSystemError.invalidRelativePath
+        }
+        #if DEBUG
+            return ContentReadRequest(
+                cacheKey: cacheKey,
+                relativePath: relativePath,
+                absolutePath: absolutePath,
+                standardizedRootPath: standardizedRootPath,
+                canonicalRootPath: canonicalRootPath,
+                skipSymlinks: skipSymlinks,
+                chunkSize: chunkSize,
+                fileSizeLimit: fileSizeLimit,
+                mode: mode,
+                workloadClass: workloadClass,
+                chunkReadHandler: contentReadChunkHandler
+            )
+        #else
+            return ContentReadRequest(
+                cacheKey: cacheKey,
+                relativePath: relativePath,
+                absolutePath: absolutePath,
+                standardizedRootPath: standardizedRootPath,
+                canonicalRootPath: canonicalRootPath,
+                skipSymlinks: skipSymlinks,
+                chunkSize: chunkSize,
+                fileSizeLimit: fileSizeLimit,
+                mode: mode,
+                workloadClass: workloadClass
+            )
+        #endif
+    }
+
+    private func commitContentReadResultIfCurrent(_ result: ContentReadResult, cacheKey: String) {
+        guard let detectedEncoding = result.detectedEncoding,
+              let fingerprint = result.fingerprint
+        else { return }
+        let contentLoadState = EditFlowPerf.begin(EditFlowPerf.Stage.FileSystem.contentLoadActorBody)
+        defer { EditFlowPerf.end(EditFlowPerf.Stage.FileSystem.contentLoadActorBody, contentLoadState) }
+
+        guard let attributes = try? fm.attributesOfItem(atPath: result.absolutePath),
+              Self.contentReadFingerprint(from: attributes) == fingerprint
+        else { return }
+        encodingMap[cacheKey] = detectedEncoding
+    }
+
+    private nonisolated static func performContentReadOffActor(_ request: ContentReadRequest) async throws -> ContentReadResult {
+        try await contentReadWorkerLimiter.withPermit(workloadClass: request.workloadClass) {
+            try await withThrowingTaskGroup(of: ContentReadResult.self) { group in
+                group.addTask(priority: .utility) {
+                    try await readContentFromDisk(request)
+                }
+                guard let result = try await group.next() else {
+                    throw CancellationError()
+                }
+                group.cancelAll()
+                return result
+            }
+        }
+    }
+
+    private nonisolated static func readContentFromDisk(_ request: ContentReadRequest) async throws -> ContentReadResult {
+        if hasAlwaysBinaryExtension(request.relativePath) {
+            return ContentReadResult(
+                absolutePath: request.absolutePath,
+                content: nil,
+                detectedEncodingRawValue: nil,
+                modificationDate: nil,
+                fingerprint: nil
+            )
         }
 
-        // Size guard
-        let attrs = try fm.attributesOfItem(atPath: fullPath)
-        let fileSize = attrs[.size] as? Int64 ?? 0
-        if fileSize > fileSizeLimit {
-            return "[File too large: \(fileSize) bytes]"
+        try Task.checkCancellation()
+        let validated = try validateContentFileForReading(request)
+        switch request.mode {
+        case .automatic:
+            return try await readAutomaticContent(request, validated: validated)
+        case .streamed:
+            return try await readStreamedContent(request, validated: validated)
+        }
+    }
+
+    private nonisolated static func readAutomaticContent(
+        _ request: ContentReadRequest,
+        validated: ValidatedContentFile
+    ) async throws -> ContentReadResult {
+        let skipProbe = shouldSkipBinaryProbe(url: validated.url)
+        if !skipProbe, let handle = try? FileHandle(forReadingFrom: validated.url) {
+            defer { try? handle.close() }
+            try await runContentReadChunkHook(request)
+            let probe = try handle.read(upToCount: 8192) ?? Data()
+            try Task.checkCancellation()
+            if isProbablyBinary(probe) {
+                return noEncodingContentReadResult(request, validated: validated, content: nil)
+            }
         }
 
-        let url = URL(fileURLWithPath: fullPath)
-        let ext = url.pathExtension.lowercased()
-        let skipProbe = Self.alwaysTextExtensions.contains(ext)
-            || (ext.isEmpty && Self.alwaysTextFilenames.contains(url.lastPathComponent.lowercased()))
+        if validated.fileSize < 2_000_000 {
+            let data: Data
+            switch try await readBoundedData(request, url: validated.url) {
+            case let .data(readData):
+                data = readData
+            case let .tooLarge(observedByteCount):
+                return oversizedContentReadResult(request, validated: validated, observedByteCount: observedByteCount)
+            }
+            let detected = try decodeSmallFileData(data)
+            try Task.checkCancellation()
+            return ContentReadResult(
+                absolutePath: request.absolutePath,
+                content: detected.string,
+                detectedEncodingRawValue: detected.encoding.rawValue,
+                modificationDate: validated.modificationDate,
+                fingerprint: validated.fingerprint
+            )
+        }
+        return try await readStreamedContent(request, validated: validated)
+    }
 
-        let handle = try FileHandle(forReadingFrom: url)
+    private nonisolated static func readStreamedContent(
+        _ request: ContentReadRequest,
+        validated: ValidatedContentFile
+    ) async throws -> ContentReadResult {
+        if validated.fileSize > request.fileSizeLimit {
+            return noEncodingContentReadResult(
+                request,
+                validated: validated,
+                content: "[File too large: \(validated.fileSize) bytes]"
+            )
+        }
+
+        let skipProbe = shouldSkipBinaryProbe(url: validated.url)
+        let handle = try FileHandle(forReadingFrom: validated.url)
         defer { try? handle.close() }
 
         var fullData = Data()
-        fullData.reserveCapacity(Int(fileSize))
-
+        fullData.reserveCapacity(Int(validated.fileSize))
         let detector = CharacterEncodingDetector()
 
-        // First chunk
-        let initialData = try handle.read(upToCount: chunkSize) ?? Data()
-        if !skipProbe, Self.isProbablyBinary(initialData) { return nil }
+        try await runContentReadChunkHook(request)
+        let initialData = try handle.read(upToCount: request.chunkSize) ?? Data()
+        try Task.checkCancellation()
+        if !skipProbe, isProbablyBinary(initialData) {
+            return noEncodingContentReadResult(request, validated: validated, content: nil)
+        }
+        if Int64(initialData.count) > request.fileSizeLimit {
+            return oversizedContentReadResult(request, validated: validated, observedByteCount: Int64(initialData.count))
+        }
         fullData.append(initialData)
         _ = detector.analyzeNextChunk(initialData)
 
-        try Task.checkCancellation()
-
-        // Subsequent chunks
         while true {
-            let next = try handle.read(upToCount: chunkSize) ?? Data()
-            if next.isEmpty { break } // EOF
+            try await runContentReadChunkHook(request)
+            let next = try handle.read(upToCount: request.chunkSize) ?? Data()
+            try Task.checkCancellation()
+            if next.isEmpty { break }
+            let observedByteCount = Int64(fullData.count) + Int64(next.count)
+            if observedByteCount > request.fileSizeLimit {
+                return oversizedContentReadResult(request, validated: validated, observedByteCount: observedByteCount)
+            }
             fullData.append(next)
             _ = detector.analyzeNextChunk(next)
 
@@ -156,21 +564,238 @@ extension FileSystemService {
                 fullData.append("\n[Truncated large file...]\n".data(using: .utf8)!)
                 break
             }
-            try Task.checkCancellation()
         }
 
-        // Resolve encoding
-        let encoding: String.Encoding = if let bom = Self.detectBOMEncoding(in: initialData) {
+        let encoding: String.Encoding = if let bom = detectBOMEncoding(in: initialData) {
             bom
         } else if let label = detector.finish() {
             .init(ianaCharsetName: label)
         } else {
-            .utf8 // no secondary heuristics
+            .utf8
+        }
+        return ContentReadResult(
+            absolutePath: request.absolutePath,
+            content: String(data: fullData, encoding: encoding) ?? "[Binary data or unknown encoding]",
+            detectedEncodingRawValue: encoding.rawValue,
+            modificationDate: validated.modificationDate,
+            fingerprint: validated.fingerprint
+        )
+    }
+
+    private nonisolated static func validateContentFileForReading(_ request: ContentReadRequest) throws -> ValidatedContentFile {
+        let standardizedAbsolutePath = StandardizedPath.absolute(request.absolutePath)
+        guard standardizedAbsolutePath != request.standardizedRootPath,
+              StandardizedPath.isDescendant(standardizedAbsolutePath, of: request.standardizedRootPath)
+        else {
+            throw FileSystemError.invalidRelativePath
         }
 
-        encodingMap[relativePath] = encoding
-        return String(data: fullData, encoding: encoding) ?? "[Binary data or unknown encoding]"
+        var isDirectory = ObjCBool(false)
+        guard FileManager.default.fileExists(atPath: standardizedAbsolutePath, isDirectory: &isDirectory), !isDirectory.boolValue else {
+            throw FileSystemError.fileNotFound
+        }
+        let url = URL(fileURLWithPath: standardizedAbsolutePath)
+        if let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]) {
+            if values.isSymbolicLink == true { throw FileSystemError.invalidRelativePath }
+            if values.isRegularFile == false { throw FileSystemError.invalidRelativePath }
+        }
+        if request.skipSymlinks, pathContainsSymlinkComponent(request.relativePath, rootURL: URL(fileURLWithPath: request.standardizedRootPath)) {
+            throw FileSystemError.invalidRelativePath
+        }
+
+        let canonicalPath = url.resolvingSymlinksInPath().standardizedFileURL.path
+        guard StandardizedPath.isDescendant(canonicalPath, of: request.canonicalRootPath) else {
+            throw FileSystemError.invalidRelativePath
+        }
+        let attributes = try FileManager.default.attributesOfItem(atPath: standardizedAbsolutePath)
+        let fingerprint = contentReadFingerprint(from: attributes)
+        return ValidatedContentFile(
+            url: url,
+            fileSize: fingerprint.fileSize,
+            modificationDate: fingerprint.modificationDate,
+            fingerprint: fingerprint
+        )
     }
+
+    private nonisolated static func readBoundedData(_ request: ContentReadRequest, url: URL) async throws -> BoundedDataReadResult {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var data = Data()
+        while true {
+            try await runContentReadChunkHook(request)
+            let next = try handle.read(upToCount: request.chunkSize) ?? Data()
+            try Task.checkCancellation()
+            if next.isEmpty { break }
+            let observedByteCount = Int64(data.count) + Int64(next.count)
+            if observedByteCount > request.fileSizeLimit {
+                return .tooLarge(observedByteCount: observedByteCount)
+            }
+            data.append(next)
+        }
+        return .data(data)
+    }
+
+    private nonisolated static func oversizedContentReadResult(
+        _ request: ContentReadRequest,
+        validated: ValidatedContentFile,
+        observedByteCount: Int64
+    ) -> ContentReadResult {
+        noEncodingContentReadResult(
+            request,
+            validated: validated,
+            content: "[File too large: \(observedByteCount) bytes]"
+        )
+    }
+
+    private nonisolated static func noEncodingContentReadResult(
+        _ request: ContentReadRequest,
+        validated: ValidatedContentFile,
+        content: String?
+    ) -> ContentReadResult {
+        ContentReadResult(
+            absolutePath: request.absolutePath,
+            content: content,
+            detectedEncodingRawValue: nil,
+            modificationDate: validated.modificationDate,
+            fingerprint: validated.fingerprint
+        )
+    }
+
+    private nonisolated static func shouldSkipBinaryProbe(url: URL) -> Bool {
+        let ext = url.pathExtension.lowercased()
+        return alwaysTextExtensions.contains(ext)
+            || (ext.isEmpty && alwaysTextFilenames.contains(url.lastPathComponent.lowercased()))
+    }
+
+    private nonisolated static func hasAlwaysBinaryExtension(_ relativePath: String) -> Bool {
+        let ext = ((relativePath as NSString).pathExtension).lowercased()
+        return !ext.isEmpty && alwaysBinaryExtensions.contains(ext)
+    }
+
+    private nonisolated static func pathContainsSymlinkComponent(_ relativePath: String, rootURL: URL) -> Bool {
+        var current = rootURL
+        for component in relativePath.split(separator: "/") {
+            current.appendPathComponent(String(component))
+            if ((try? current.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) ?? false) == true {
+                return true
+            }
+        }
+        return false
+    }
+
+    private nonisolated static func contentReadFingerprint(from attributes: [FileAttributeKey: Any]) -> ContentReadFingerprint {
+        ContentReadFingerprint(
+            fileSize: (attributes[.size] as? NSNumber)?.int64Value ?? 0,
+            modificationDate: attributes[.modificationDate] as? Date,
+            systemFileNumber: (attributes[.systemFileNumber] as? NSNumber)?.uint64Value
+        )
+    }
+
+    private nonisolated static func decodeSmallFileData(_ data: Data) throws -> DetectedText {
+        if data.isEmpty {
+            return DetectedText(string: "", encoding: .utf8)
+        }
+        if let utf8String = String(data: data, encoding: .utf8) {
+            return DetectedText(string: utf8String, encoding: .utf8)
+        }
+        let encoding = detectEncodingFull(data)
+        guard let string = String(data: data, encoding: encoding) else {
+            throw FileSystemError.failedToReadFile
+        }
+        return DetectedText(string: string, encoding: encoding)
+    }
+
+    private nonisolated static func runContentReadChunkHook(_ request: ContentReadRequest) async throws {
+        try Task.checkCancellation()
+        #if DEBUG
+            if let chunkReadHandler = request.chunkReadHandler {
+                await chunkReadHandler(request.relativePath)
+            }
+        #endif
+        try Task.checkCancellation()
+    }
+
+    #if DEBUG
+        private var shouldUseSerialContentReadFallback: Bool {
+            isTestMode || fileManagerOverride != nil
+        }
+
+        private func loadContentSerialForTesting(_ request: ContentReadRequest) async throws -> String? {
+            let contentLoadState = EditFlowPerf.begin(EditFlowPerf.Stage.FileSystem.contentLoadActorBody)
+            defer { EditFlowPerf.end(EditFlowPerf.Stage.FileSystem.contentLoadActorBody, contentLoadState) }
+
+            let fm = fm
+            guard fm.fileExists(atPath: request.absolutePath, isDirectory: nil) else {
+                throw FileSystemError.fileNotFound
+            }
+            let attributes = try fm.attributesOfItem(atPath: request.absolutePath)
+            let fileSize = attributes[.size] as? Int64 ?? 0
+            let url = URL(fileURLWithPath: request.absolutePath)
+            let skipProbe = Self.shouldSkipBinaryProbe(url: url)
+            if !skipProbe, let handle = try? FileHandle(forReadingFrom: url) {
+                let probe = try handle.read(upToCount: 8192) ?? Data()
+                try? handle.close()
+                if Self.isProbablyBinary(probe) { return nil }
+            }
+            if fileSize < 2_000_000 {
+                let detected = try readDataAndDetectEncoding(request.absolutePath)
+                encodingMap[request.cacheKey] = detected.encoding
+                return detected.string
+            }
+            return try await loadEntireFileContentOptimizedSerialForTesting(request)
+        }
+
+        private func loadEntireFileContentOptimizedSerialForTesting(_ request: ContentReadRequest) async throws -> String? {
+            let contentLoadState = EditFlowPerf.begin(EditFlowPerf.Stage.FileSystem.contentLoadActorBody)
+            defer { EditFlowPerf.end(EditFlowPerf.Stage.FileSystem.contentLoadActorBody, contentLoadState) }
+
+            let fm = fm
+            guard fm.fileExists(atPath: request.absolutePath, isDirectory: nil) else {
+                throw FileSystemError.fileNotFound
+            }
+            let attributes = try fm.attributesOfItem(atPath: request.absolutePath)
+            let fileSize = attributes[.size] as? Int64 ?? 0
+            if fileSize > request.fileSizeLimit {
+                return "[File too large: \(fileSize) bytes]"
+            }
+
+            let url = URL(fileURLWithPath: request.absolutePath)
+            let skipProbe = Self.shouldSkipBinaryProbe(url: url)
+            let handle = try FileHandle(forReadingFrom: url)
+            defer { try? handle.close() }
+
+            var fullData = Data()
+            fullData.reserveCapacity(Int(fileSize))
+            let detector = CharacterEncodingDetector()
+            let initialData = try handle.read(upToCount: request.chunkSize) ?? Data()
+            if !skipProbe, Self.isProbablyBinary(initialData) { return nil }
+            fullData.append(initialData)
+            _ = detector.analyzeNextChunk(initialData)
+            try Task.checkCancellation()
+
+            while true {
+                let next = try handle.read(upToCount: request.chunkSize) ?? Data()
+                if next.isEmpty { break }
+                fullData.append(next)
+                _ = detector.analyzeNextChunk(next)
+                if fullData.count > 100_000_000 {
+                    fullData.append("\n[Truncated large file...]\n".data(using: .utf8)!)
+                    break
+                }
+                try Task.checkCancellation()
+            }
+
+            let encoding: String.Encoding = if let bom = Self.detectBOMEncoding(in: initialData) {
+                bom
+            } else if let label = detector.finish() {
+                .init(ianaCharsetName: label)
+            } else {
+                .utf8
+            }
+            encodingMap[request.cacheKey] = encoding
+            return String(data: fullData, encoding: encoding) ?? "[Binary data or unknown encoding]"
+        }
+    #endif
 
     /// Attempt to decode with all post‑UTF‑8 fall‑backs, including region‑specific ones.
     func tryDecodeWithFallbackEncodings(_ data: Data) -> String? {
@@ -426,13 +1051,44 @@ extension FileSystemService {
     // A minimal directory entry representation
 
     func detectFileEncoding(atRelativePath relativePath: String) async throws -> String.Encoding {
-        let fullPath = fullPath(forRelativePath: relativePath)
-        let url = URL(fileURLWithPath: fullPath)
+        let request = try makeContentReadRequest(
+            cacheKey: relativePath,
+            chunkSize: 1_048_576,
+            fileSizeLimit: 10_000_000,
+            mode: .automatic,
+            workloadClass: .encodingDetection
+        )
+        #if DEBUG
+            if shouldUseSerialContentReadFallback {
+                return try detectFileEncodingSerialForTesting(request.absolutePath)
+            }
+        #endif
+        return try await Self.performEncodingDetectionOffActor(request)
+    }
 
-        guard let data = try? Data(contentsOf: url) else {
-            throw FileSystemError.failedToReadFile
+    private nonisolated static func performEncodingDetectionOffActor(_ request: ContentReadRequest) async throws -> String.Encoding {
+        try await contentReadWorkerLimiter.withPermit(workloadClass: request.workloadClass) {
+            try await withThrowingTaskGroup(of: String.Encoding.self) { group in
+                group.addTask(priority: .utility) {
+                    try Task.checkCancellation()
+                    let validated = try validateContentFileForReading(request)
+                    switch try await readBoundedData(request, url: validated.url) {
+                    case let .data(data):
+                        return detectFileEncoding(in: data)
+                    case .tooLarge:
+                        throw FileSystemError.fileTooLarge
+                    }
+                }
+                guard let encoding = try await group.next() else {
+                    throw CancellationError()
+                }
+                group.cancelAll()
+                return encoding
+            }
         }
+    }
 
+    private nonisolated static func detectFileEncoding(in data: Data) -> String.Encoding {
         var usedLossyConversion = ObjCBool(false)
         let encodingValue = NSString.stringEncoding(
             for: data,
@@ -444,29 +1100,35 @@ extension FileSystemService {
             return String.Encoding(rawValue: encodingValue)
         }
 
-        let encodings: [(String.Encoding, String)] = [
-            (.utf8, "UTF-8"),
-            (.macOSRoman, "Mac OS Roman"),
-            (.ascii, "ASCII"),
-            (.utf16, "UTF-16"),
-            (.utf16BigEndian, "UTF-16 Big Endian"),
-            (.utf16LittleEndian, "UTF-16 Little Endian"),
-            (.utf32, "UTF-32"),
-            (.utf32BigEndian, "UTF-32 Big Endian"),
-            (.utf32LittleEndian, "UTF-32 Little Endian"),
-            (.windowsCP1252, "Windows-1252"),
-            (.isoLatin1, "ISO-8859-1"),
-            (.unicode, "Unicode"),
-            (.shiftJIS, "Shift JIS"),
-            (.nonLossyASCII, "Non-Lossy ASCII")
+        let encodings: [String.Encoding] = [
+            .utf8,
+            .macOSRoman,
+            .ascii,
+            .utf16,
+            .utf16BigEndian,
+            .utf16LittleEndian,
+            .utf32,
+            .utf32BigEndian,
+            .utf32LittleEndian,
+            .windowsCP1252,
+            .isoLatin1,
+            .unicode,
+            .shiftJIS,
+            .nonLossyASCII
         ]
 
-        for (encoding, _) in encodings {
-            if let _ = String(data: data, encoding: encoding) {
-                return encoding
-            }
+        for encoding in encodings where String(data: data, encoding: encoding) != nil {
+            return encoding
         }
-
         return .utf8
     }
+
+    #if DEBUG
+        private func detectFileEncodingSerialForTesting(_ fullPath: String) throws -> String.Encoding {
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: fullPath)) else {
+                throw FileSystemError.failedToReadFile
+            }
+            return Self.detectFileEncoding(in: data)
+        }
+    #endif
 }

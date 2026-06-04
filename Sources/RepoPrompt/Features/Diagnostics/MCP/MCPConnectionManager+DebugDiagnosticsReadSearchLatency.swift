@@ -25,7 +25,7 @@ import MCP
                 return debugDiagnosticsResult([
                     "ok": true,
                     "op": op,
-                    "capture": snapshot.payload
+                    "capture": snapshot.payload()
                 ])
             case let .busy(snapshot):
                 return debugDiagnosticsError(
@@ -38,11 +38,12 @@ import MCP
 
         func debugMCPReadSearchCaptureSnapshotPayload(op: String, arguments: [String: Value]) -> CallTool.Result {
             let finish = debugBool(arguments, "finish") ?? true
+            let includeTimeline = debugBool(arguments, "include_timeline") ?? true
             let snapshot = EditFlowPerf.debugCaptureSnapshot(finish: finish)
             return debugDiagnosticsResult([
                 "ok": true,
                 "op": op,
-                "capture": snapshot.payload
+                "capture": snapshot.payload(includeTimeline: includeTimeline)
             ])
         }
 

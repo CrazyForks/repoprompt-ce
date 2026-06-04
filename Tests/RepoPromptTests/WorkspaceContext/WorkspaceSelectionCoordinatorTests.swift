@@ -65,6 +65,28 @@ final class WorkspaceSelectionCoordinatorTests: XCTestCase {
         XCTAssertFalse(coordinator.isApplyingSelectionMirror)
     }
 
+    func testPersistVirtualSelectionStoresImmediatelyAndEmitsVirtualChange() {
+        let initial = StoredSelection(selectedPaths: ["/tmp/initial.swift"])
+        let next = StoredSelection(
+            selectedPaths: ["/tmp/virtual.swift"],
+            slices: ["/tmp/virtual.swift": [LineRange(start: 2, end: 5)]],
+            codemapAutoEnabled: false
+        )
+        let harness = CoordinatorHarness(initialSelection: initial)
+        let coordinator = WorkspaceSelectionCoordinator(workspaceManager: harness.manager, store: harness.store)
+        var changes: [WorkspaceSelectionCoordinator.Change] = []
+        coordinator.changes
+            .sink { changes.append($0) }
+            .store(in: &cancellables)
+
+        let persisted = coordinator.persistVirtualSelection(next, for: harness.tabID)
+
+        XCTAssertEqual(persisted, next)
+        XCTAssertEqual(harness.manager.composeTab(with: harness.tabID)?.selection, next)
+        XCTAssertEqual(harness.manager.updateStoredOnlyCallCount, 1)
+        XCTAssertEqual(changes.last, .init(tabID: harness.tabID, selection: next, source: .virtual))
+    }
+
     func testApplyingSelectionMirrorGuardSuppressesFlushPublication() async {
         let initial = StoredSelection(selectedPaths: ["/tmp/initial.swift"])
         let pending = StoredSelection(selectedPaths: ["/tmp/pending.swift"])

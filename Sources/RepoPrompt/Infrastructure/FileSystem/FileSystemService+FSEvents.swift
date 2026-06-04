@@ -21,8 +21,8 @@ struct FSEventCallbackPayload {
 extension FileSystemService {
     // MARK: - Public watchers API
 
-    /// Returns a publisher that emits a `[FileSystemDelta]` array whenever changes are detected in the file system.
-    func publisherForChanges() -> AnyPublisher<[FileSystemDelta], Never> {
+    /// Returns ordered publications whenever changes or watcher progress are detected.
+    func publisherForChanges() -> AnyPublisher<FileSystemDeltaPublication, Never> {
         changePublisher.eraseToAnyPublisher()
     }
 
@@ -145,18 +145,41 @@ extension FileSystemService {
         return false
     }
 
+    nonisolated func captureAcceptedWatcherWatermark() -> FileSystemWatcherIngressMailbox.Watermark {
+        watcherIngressMailbox.captureAcceptedWatermark()
+    }
+
     public func flushPendingEventsNow() async {
-        // Cancel any scheduled coalescing delay task
-        coalescingTask?.cancel()
-        coalescingTask = nil
+        _ = await flushPendingEventsNow(throughAcceptedWatcherWatermark: captureAcceptedWatcherWatermark())
+    }
 
-        // Snapshot and clear pending raw events
-        let events = takePendingFSEventsForProcessing()
+    /// Flushes watcher work through at least the callback-accepted watermark cut.
+    ///
+    /// Later callbacks may already have joined an actor-visible batch or an overflow
+    /// sentinel, so this is intentionally a lower-bound barrier rather than a strict
+    /// exclusion boundary. It never returns before the captured cut is published.
+    func flushPendingEventsNow(
+        throughAcceptedWatcherWatermark target: FileSystemWatcherIngressMailbox.Watermark
+    ) async -> UInt64 {
+        drainAcceptedWatcherIngressMailboxPayloads(through: target)
+        cancelScheduledCoalescingDelay()
 
-        // Process immediately and publish deltas (if any)
-        if !events.isEmpty {
-            _ = await handleBatchedEvents(events)
+        while lastPublishedWatcherAcceptedWatermark < target {
+            if let watcherBatchProcessingTask {
+                await watcherBatchProcessingTask.value
+                drainAcceptedWatcherIngressMailboxPayloads(through: target)
+                cancelScheduledCoalescingDelay()
+                continue
+            }
+
+            guard startProcessingPendingWatcherBatchIfNeeded() else {
+                // A callback cut must remain representable even if accepted payloads
+                // were explicitly abandoned during watcher teardown or produced no deltas.
+                publishFileSystemDeltas([], source: .watcherBarrierNoop, watcherAcceptedWatermark: target)
+                break
+            }
         }
+        return lastServicePublicationSequence
     }
 
     #if DEBUG
@@ -182,6 +205,7 @@ extension FileSystemService {
     func startFSEventStream() {
         guard fseventStreamRef == nil else { return }
 
+        watcherIngressMailbox.startAccepting()
         selfPointer = Unmanaged.passRetained(self).toOpaque()
 
         var streamContext = FSEventStreamContext(
@@ -370,76 +394,191 @@ extension FileSystemService {
             }
         #endif
 
-        // Hand off into the actor context
-        Task { [service, payload] in
-            await service.enqueueFSEventHandlingTask(payload)
+        let lifecycleCorrelation = EditFlowPerf.makeLifecycleCorrelationIfActive()
+        let acceptedWatermark = service.watcherIngressMailbox.accept(
+            payload,
+            lifecycleCorrelation: lifecycleCorrelation
+        ) { [weak service] in
+            await service?.drainAcceptedWatcherIngressMailbox()
         }
+        guard let acceptedWatermark else { return }
+        EditFlowPerf.lifecycleEvent(
+            EditFlowPerf.Lifecycle.FileSystem.callbackAccepted,
+            correlation: lifecycleCorrelation,
+            EditFlowPerf.Dimensions(
+                sourceItemCount: payload.count,
+                rootToken: service.diagnosticRootToken.uuidString,
+                ingressSequence: acceptedWatermark.rawValue
+            )
+        )
     }
 
     // MARK: - Core event coalescing & handling
 
-    func enqueueFSEventHandlingTask(_ payload: FSEventCallbackPayload) {
-        guard payload.count > 0 else { return }
+    func drainAcceptedWatcherIngressMailbox() async {
+        drainAcceptedWatcherIngressMailboxPayloads()
+    }
 
-        let payloadMaxEventID = payload.entries.map(\.id).max() ?? 0
-        if hasPendingOverflowRescan {
-            collapsePendingEventsToRootRescan(upTo: max(pendingFSEvents.first?.2 ?? 0, payloadMaxEventID))
-            scheduleCoalescingIfNeeded()
-            return
+    func drainAcceptedWatcherIngressMailboxPayloads(
+        through target: FileSystemWatcherIngressMailbox.Watermark? = nil
+    ) {
+        while let payload = watcherIngressMailbox.takeNextAcceptedPayload(through: target) {
+            enqueueAcceptedWatcherPayload(payload)
         }
+    }
 
-        let projectedCount = pendingFSEvents.count + payload.count
-        if projectedCount > Self.maxPendingRawEvents {
-            let bufferedMaxEventID = pendingFSEvents.map(\.2).max() ?? 0
-            let maxEventID = max(bufferedMaxEventID, payloadMaxEventID)
-            overflowChangedIgnoreDirs.formUnion(ignoreChangeDirs(in: pendingFSEvents))
-            overflowChangedIgnoreDirs.formUnion(ignoreChangeDirs(in: payload.entries.map { ($0.path, $0.flags, $0.id) }))
-            fileSystemDebugLog(
-                "FSEvents overflow for \(path): collapsing \(projectedCount) raw events into a root rescan at event \(maxEventID)"
+    func enqueueAcceptedWatcherPayload(_ payload: FileSystemWatcherIngressMailbox.AcceptedPayload) {
+        EditFlowPerf.lifecycleEvent(
+            EditFlowPerf.Lifecycle.FileSystem.serviceEnqueueEntered,
+            correlation: payload.lifecycleCorrelation,
+            EditFlowPerf.Dimensions(
+                sourceItemCount: payload.rawEntryCount,
+                rootToken: diagnosticRootToken.uuidString,
+                queueDepth: pendingFSEvents.count,
+                ingressSequence: payload.acceptedHighWatermark.rawValue
             )
-            collapsePendingEventsToRootRescan(upTo: maxEventID)
-            scheduleCoalescingIfNeeded()
-            return
-        }
+        )
 
-        pendingFSEvents.reserveCapacity(projectedCount)
-        for entry in payload.entries {
-            pendingFSEvents.append((entry.path, entry.flags, entry.id))
+        switch payload.contents {
+        case let .entries(entries):
+            enqueueFSEventEntries(entries, acceptedHighWatermark: payload.acceptedHighWatermark)
+        case let .overflowRootRescan(highestEventID, changedIgnoreAbsolutePaths):
+            overflowChangedIgnoreDirs.formUnion(ignoreChangeDirs(in: changedIgnoreAbsolutePaths.map { ($0, 0, 0) }))
+            collapsePendingEventsToRootRescan(
+                upTo: highestEventID,
+                acceptedHighWatermark: payload.acceptedHighWatermark
+            )
         }
         scheduleCoalescingIfNeeded()
     }
 
+    func enqueueFSEventEntries(
+        _ entries: [FSEventCallbackEntry],
+        acceptedHighWatermark: FileSystemWatcherIngressMailbox.Watermark? = nil
+    ) {
+        guard !entries.isEmpty else { return }
+        let payloadMaxEventID = entries.map(\.id).max() ?? 0
+        if hasPendingOverflowRescan {
+            overflowChangedIgnoreDirs.formUnion(ignoreChangeDirs(in: entries.map { ($0.path, $0.flags, $0.id) }))
+            collapsePendingEventsToRootRescan(
+                upTo: max(pendingFSEvents.first?.id ?? 0, payloadMaxEventID),
+                acceptedHighWatermark: acceptedHighWatermark
+            )
+            return
+        }
+
+        let projectedCount = pendingFSEvents.count + entries.count
+        if projectedCount > Self.maxPendingRawEvents {
+            let bufferedMaxEventID = pendingFSEvents.map(\.id).max() ?? 0
+            let maxEventID = max(bufferedMaxEventID, payloadMaxEventID)
+            overflowChangedIgnoreDirs.formUnion(ignoreChangeDirs(in: pendingFSEvents))
+            overflowChangedIgnoreDirs.formUnion(ignoreChangeDirs(in: entries.map { ($0.path, $0.flags, $0.id) }))
+            fileSystemDebugLog(
+                "FSEvents overflow for \(path): collapsing \(projectedCount) raw events into a root rescan at event \(maxEventID)"
+            )
+            collapsePendingEventsToRootRescan(
+                upTo: maxEventID,
+                acceptedHighWatermark: acceptedHighWatermark
+            )
+            return
+        }
+
+        pendingFSEvents.reserveCapacity(projectedCount)
+        pendingFSEvents.append(contentsOf: entries.map { ($0.path, $0.flags, $0.id) })
+        if let acceptedHighWatermark {
+            pendingWatcherAcceptedHighWatermark = max(pendingWatcherAcceptedHighWatermark ?? .zero, acceptedHighWatermark)
+        }
+    }
+
     func scheduleCoalescingIfNeeded() {
-        guard coalescingTask == nil else { return }
-        coalescingTask = Task {
+        guard coalescingTask == nil, !pendingFSEvents.isEmpty else { return }
+        coalescingTask = Task { [weak self] in
             do {
+                guard let self else { return }
                 try await Task.sleep(nanoseconds: UInt64(coalescingDelay * 1_000_000_000))
+                await scheduledCoalescingDelayDidFinish()
             } catch {
                 return
-            }
-            let events = takePendingFSEventsForProcessing()
-
-            _ = await handleBatchedEvents(events)
-            coalescingTask = nil
-
-            // Re-arm if more events arrived while handling
-            if !pendingFSEvents.isEmpty {
-                scheduleCoalescingIfNeeded()
             }
         }
     }
 
-    func collapsePendingEventsToRootRescan(upTo eventID: FSEventStreamEventId) {
+    func scheduledCoalescingDelayDidFinish() {
+        coalescingTask = nil
+        if !startProcessingPendingWatcherBatchIfNeeded(), !pendingFSEvents.isEmpty {
+            scheduleCoalescingIfNeeded()
+        }
+    }
+
+    func cancelScheduledCoalescingDelay() {
+        coalescingTask?.cancel()
+        coalescingTask = nil
+    }
+
+    @discardableResult
+    func startProcessingPendingWatcherBatchIfNeeded() -> Bool {
+        guard watcherBatchProcessingTask == nil else { return true }
+        let batch = takePendingFSEventsForProcessing()
+        guard !batch.isEmpty || batch.watcherAcceptedHighWatermark != nil else { return false }
+
+        nextWatcherBatchProcessingToken &+= 1
+        let token = nextWatcherBatchProcessingToken
+        watcherBatchProcessingToken = token
+        watcherBatchProcessingTask = Task { [weak self] in
+            await self?.processWatcherBatch(batch, token: token)
+        }
+        return true
+    }
+
+    func processWatcherBatch(_ batch: PendingFSEventBatch, token: UInt64) async {
+        #if DEBUG
+            if let watcherBatchWillProcessHandler {
+                await watcherBatchWillProcessHandler()
+            }
+        #endif
+        guard !Task.isCancelled else {
+            watcherBatchProcessingDidFinish(token: token)
+            return
+        }
+        _ = await handleBatchedEvents(batch)
+        watcherBatchProcessingDidFinish(token: token)
+    }
+
+    func watcherBatchProcessingDidFinish(token: UInt64) {
+        guard watcherBatchProcessingToken == token else { return }
+        watcherBatchProcessingTask = nil
+        watcherBatchProcessingToken = nil
+        if !pendingFSEvents.isEmpty {
+            scheduleCoalescingIfNeeded()
+        }
+    }
+
+    func collapsePendingEventsToRootRescan(
+        upTo eventID: FSEventStreamEventId,
+        acceptedHighWatermark: FileSystemWatcherIngressMailbox.Watermark? = nil
+    ) {
+        overflowChangedIgnoreDirs.formUnion(ignoreChangeDirs(in: pendingFSEvents))
         pendingFSEvents.removeAll(keepingCapacity: false)
         pendingFSEvents.append((standardizedRootPath, Self.overflowRescanEventFlags, eventID))
+        if let acceptedHighWatermark {
+            pendingWatcherAcceptedHighWatermark = max(pendingWatcherAcceptedHighWatermark ?? .zero, acceptedHighWatermark)
+        }
+        pendingWatcherPublicationSource = .overflowRootRescan
         hasPendingOverflowRescan = true
     }
 
-    func takePendingFSEventsForProcessing() -> [(String, FSEventStreamEventFlags, FSEventStreamEventId)] {
-        let events = pendingFSEvents
+    func takePendingFSEventsForProcessing() -> PendingFSEventBatch {
+        let batch = PendingFSEventBatch(
+            events: pendingFSEvents,
+            watcherAcceptedHighWatermark: pendingWatcherAcceptedHighWatermark,
+            publicationSource: pendingWatcherPublicationSource,
+            watcherIngressGeneration: watcherIngressGeneration
+        )
         pendingFSEvents.removeAll(keepingCapacity: false)
+        pendingWatcherAcceptedHighWatermark = nil
+        pendingWatcherPublicationSource = .watcher
         hasPendingOverflowRescan = false
-        return events
+        return batch
     }
 
     func ignoreChangeDirs(
@@ -455,15 +594,24 @@ extension FileSystemService {
     }
 
     func resetWatcherIngressState() {
-        coalescingTask?.cancel()
-        coalescingTask = nil
+        watcherIngressMailbox.stopAcceptingAndDiscardPending()
+        watcherIngressGeneration &+= 1
+        cancelScheduledCoalescingDelay()
+        watcherBatchProcessingTask?.cancel()
         pendingFSEvents.removeAll(keepingCapacity: false)
+        pendingWatcherAcceptedHighWatermark = nil
+        pendingWatcherPublicationSource = .watcher
         hasPendingOverflowRescan = false
         overflowChangedIgnoreDirs.removeAll(keepingCapacity: false)
         pendingScanTargets.removeAll(keepingCapacity: false)
         lastScannedEventIdByFolder.removeAll(keepingCapacity: false)
         lastVerifiedAtByFolder.removeAll(keepingCapacity: false)
         fileEventCountSinceLastScan.removeAll(keepingCapacity: false)
+    }
+
+    func watcherBatchBelongsToCurrentIngressGeneration(_ batch: PendingFSEventBatch) -> Bool {
+        guard let generation = batch.watcherIngressGeneration else { return true }
+        return generation == watcherIngressGeneration
     }
 
     // MARK: - FSEvents Flag Parsing
@@ -621,10 +769,19 @@ extension FileSystemService {
     }
 
     func handleBatchedEvents(
-        _ events: [(String, FSEventStreamEventFlags, FSEventStreamEventId)],
+        _ batch: PendingFSEventBatch,
         testMode: Bool = false
     ) async -> [FileSystemDelta]? {
-        guard !events.isEmpty else { return testMode ? [] : nil }
+        guard watcherBatchBelongsToCurrentIngressGeneration(batch) else {
+            return testMode ? [] : nil
+        }
+        let events = batch.events
+        guard !events.isEmpty else {
+            if let watermark = batch.watcherAcceptedHighWatermark {
+                publishFileSystemDeltas([], source: .watcherBarrierNoop, watcherAcceptedWatermark: watermark)
+            }
+            return testMode ? [] : nil
+        }
 
         #if DEBUG
             if Self.enableDebugLogging {
@@ -1160,6 +1317,10 @@ extension FileSystemService {
             }
         #endif
 
+        guard watcherBatchBelongsToCurrentIngressGeneration(batch) else {
+            return testMode ? [] : nil
+        }
+
         let publishSignpost = FileSystemPublishPerf.begin("coalesceAndPublishFileSystemDeltas")
         let publishableDeltas = coalescedPublishableDeltas(from: allDeltas)
         #if DEBUG
@@ -1168,11 +1329,6 @@ extension FileSystemService {
                 publishedDeltaCount: publishableDeltas.count
             )
         #endif
-        if !publishableDeltas.isEmpty {
-            changePublisher.send(publishableDeltas)
-        }
-        FileSystemPublishPerf.end("coalesceAndPublishFileSystemDeltas", publishSignpost)
-
         // Flush the split-components cache; next scan will repopulate lazily.
         pathCompsCache.removeAll()
 
@@ -1194,6 +1350,22 @@ extension FileSystemService {
                 Task { await rebuildPerFolderIgnoreCache(changedDirs: dirs) }
             #endif
         }
+
+        let publicationSource: FileSystemDeltaPublicationSource = if batch.publicationSource == .overflowRootRescan {
+            .overflowRootRescan
+        } else if publishableDeltas.isEmpty {
+            .watcherBarrierNoop
+        } else {
+            batch.publicationSource
+        }
+        if !publishableDeltas.isEmpty || batch.watcherAcceptedHighWatermark != nil {
+            publishFileSystemDeltas(
+                publishableDeltas,
+                source: publicationSource,
+                watcherAcceptedWatermark: batch.watcherAcceptedHighWatermark
+            )
+        }
+        FileSystemPublishPerf.end("coalesceAndPublishFileSystemDeltas", publishSignpost)
 
         // Return the published deltas in test mode.
         return testMode ? publishableDeltas : nil

@@ -109,6 +109,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
     private func contextBuilderTool() -> Tool {
         runtime.tool(
             name: MCPWindowToolName.contextBuilder,
+            freshnessPolicy: .providerManaged,
             description: """
             Intelligently explore the codebase and build optimal file context for a task.
 
@@ -168,6 +169,8 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
         dependencies: MCPWindowToolDependencies
     ) async throws -> ContextBuilderToolResult {
         let instructions = args["instructions"]?.stringValue ?? ""
+        let metadata = await dependencies.captureRequestMetadata()
+        await dependencies.drainReadFileAutoSelection(metadata, .mirroredSelectionAndMetrics)
         let responseType = try ContextBuilderResponseType.parse(from: args["response_type"])
         let exportResponse: Bool
         if let value = args["export_response"] {

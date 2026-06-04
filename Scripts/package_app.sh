@@ -271,8 +271,8 @@ sign_sparkle_framework(){
 verify_signed_app_identity(){
     local details identifier team authorities
     details="$(codesign -dv --verbose=4 "$APP_BUNDLE" 2>&1 || true)"
-    identifier="$(printf '%s\n' "$details" | awk -F= '/^Identifier=/{print $2; exit}')"
-    team="$(printf '%s\n' "$details" | awk -F= '/^TeamIdentifier=/{print $2; exit}')"
+    identifier="$(awk -F= '/^Identifier=/{print $2; exit}' <<< "$details")"
+    team="$(awk -F= '/^TeamIdentifier=/{print $2; exit}' <<< "$details")"
     authorities="$(printf '%s\n' "$details" | awk -F= '/^Authority=/{print $2}' | paste -sd ', ' -)"
     printf 'Signed app path: %s\n' "$APP_BUNDLE"
     printf 'Signed app identifier: %s\n' "${identifier:-<missing>}"
