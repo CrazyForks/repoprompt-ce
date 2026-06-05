@@ -107,6 +107,28 @@ final class WorkspaceSelectionCoordinatorTests: XCTestCase {
         XCTAssertEqual(harness.manager.publishSnapshotCallCount, 1)
     }
 
+    func testUIFlushDoesNotRepublishWhenSubscriberFlushesUnchangedSelection() {
+        let initial = StoredSelection(selectedPaths: ["/tmp/initial.swift"])
+        let pending = StoredSelection(selectedPaths: ["/tmp/pending.swift"])
+        let harness = CoordinatorHarness(initialSelection: initial)
+        harness.manager.pendingUISelection = pending
+        let coordinator = WorkspaceSelectionCoordinator(workspaceManager: harness.manager, store: harness.store)
+        var changes: [WorkspaceSelectionCoordinator.Change] = []
+
+        coordinator.changes
+            .sink { change in
+                changes.append(change)
+                _ = coordinator.activeSelectionSnapshot(flushPendingUI: true)
+            }
+            .store(in: &cancellables)
+
+        let flushed = coordinator.activeSelectionSnapshot(flushPendingUI: true)
+
+        XCTAssertEqual(flushed.selection, pending)
+        XCTAssertEqual(changes, [.init(tabID: harness.tabID, selection: pending, source: .uiFlush)])
+        XCTAssertEqual(harness.manager.publishSnapshotCallCount, 2)
+    }
+
     func testSaveSnapshotPrefersMatchingCanonicalSelectionOverStaleUISnapshot() {
         let activeTabID = UUID()
         let liveUI = StoredSelection(

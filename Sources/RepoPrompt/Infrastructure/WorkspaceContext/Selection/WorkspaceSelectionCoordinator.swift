@@ -88,8 +88,11 @@ final class WorkspaceSelectionCoordinator {
 
     func flushPendingUISelectionToActiveTab() {
         guard !isApplyingSelectionMirror, let workspaceManager else { return }
+        let previousTabID = activeTabID()
+        let previousSelection = previousTabID.flatMap { workspaceManager.composeTab(with: $0)?.selection } ?? StoredSelection()
         workspaceManager.publishActiveComposeTabSnapshot(commitToMemory: true, touchModified: false)
         let snapshot = activeSelectionSnapshot(flushPendingUI: false)
+        guard snapshot.tabID != previousTabID || snapshot.selection != previousSelection else { return }
         changeSubject.send(Change(tabID: snapshot.tabID, selection: snapshot.selection, source: .uiFlush))
     }
 
