@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPrompt
+@testable import RepoPromptCore
 import XCTest
 
 #if DEBUG
@@ -561,12 +562,14 @@ import XCTest
         ) -> Task<Int, Error> {
             Task {
                 try await EditFlowPerf.$currentLifecycleCorrelation.withValue(correlation) {
-                    try await coordinator.withBroadSearchPermit(
+                    try await WorkspaceRuntimePerf.withLifecycleCorrelation(id: correlation.id) {
+                        try await coordinator.withBroadSearchPermit(
                         for: store,
                         searchMode: .content,
                         admissionClass: .unscopedContent
-                    ) {
-                        value
+                        ) {
+                            value
+                        }
                     }
                 }
             }

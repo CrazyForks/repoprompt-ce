@@ -17,7 +17,7 @@ final class RepoPromptAppCoreContainer {
     let workspaceRepository: WorkspaceRepository
     let workspaceAccessPolicy: any WorkspaceAccessPolicy
     let appSessionAdapters: RepoPromptAppSessionAdapterRegistry
-    let platformDependencies: RepoPromptCorePlatformDependencies
+    let runtimeFactory: RepoPromptEmbeddedWorkspaceRuntimeFactory
     let mcpService: MCPService
     let coreHost: RepoPromptCoreHost
 
@@ -32,15 +32,14 @@ final class RepoPromptAppCoreContainer {
         self.workspaceRepository = workspaceRepository
         self.workspaceAccessPolicy = workspaceAccessPolicy
         self.appSessionAdapters = appSessionAdapters
-        let platformDependencies = MacOSRepoPromptCorePlatformDependencies.embeddedApp()
-        self.platformDependencies = platformDependencies
+        runtimeFactory = RepoPromptEmbeddedWorkspaceRuntimeFactory()
         mcpService = MCPService(networkManager: networkManager)
         coreHost = RepoPromptCoreHost(
             workspaceRepository: workspaceRepository,
             workspacePersistenceWriter: workspaceGraph.writer,
             workspaceAccessPolicy: workspaceAccessPolicy,
             runtimeSessionRegistry: networkManager.runtimeSessionRegistry,
-            platformDependencies: platformDependencies
+            runtimeFactory: runtimeFactory
         )
     }
 

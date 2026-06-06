@@ -49,7 +49,9 @@ final class RepoPromptCoreSession {
     let workspaceFileContextStore: WorkspaceFileContextStore
     let workspaceSearchService: WorkspaceSearchService
     let workspaceSessionController: WorkspaceSessionController
+    let workspaceSelectionController: WorkspaceSelectionController
     let selectionCoordinator: WorkspaceSelectionCoordinator
+    let selectionSliceCoordinator: SelectionSliceCoordinator
     fileprivate(set) var lifecycle: RepoPromptCoreSessionLifecycle = .created
 
     var snapshot: RepoPromptSessionSnapshot {
@@ -66,23 +68,30 @@ final class RepoPromptCoreSession {
         workspaceRepository: WorkspaceRepository,
         workspacePersistenceWriter: WorkspacePersistenceWriter,
         workspaceAccessPolicy: any WorkspaceAccessPolicy,
-        platformDependencies: RepoPromptCorePlatformDependencies
+        runtime: RepoPromptEmbeddedWorkspaceRuntime
     ) {
         self.sessionID = sessionID
         self.routingSessionID = routingSessionID
         self.workspaceRepository = workspaceRepository
         self.workspacePersistenceWriter = workspacePersistenceWriter
         self.workspaceAccessPolicy = workspaceAccessPolicy
-        workspaceFileContextStore = WorkspaceFileContextStore(
-            fileSystemWatcherFactory: platformDependencies.fileSystemWatcherFactory
-        )
-        workspaceSearchService = WorkspaceSearchService()
-        workspaceSessionController = WorkspaceSessionController(
+        workspaceFileContextStore = runtime.workspaceFileContextStore
+        workspaceSearchService = runtime.workspaceSearchService
+        selectionSliceCoordinator = runtime.selectionSliceCoordinator
+        let sessionController = WorkspaceSessionController(
             repository: workspaceRepository,
             persistenceWriter: workspacePersistenceWriter,
             accessPolicy: workspaceAccessPolicy
         )
-        selectionCoordinator = WorkspaceSelectionCoordinator(store: workspaceFileContextStore)
+        workspaceSessionController = sessionController
+        workspaceSelectionController = WorkspaceSelectionController(
+            sessionController: sessionController,
+            mutationService: runtime.selectionMutationService
+        )
+        selectionCoordinator = WorkspaceSelectionCoordinator(
+            controller: workspaceSelectionController,
+            store: workspaceFileContextStore
+        )
     }
 }
 
@@ -100,7 +109,7 @@ final class RepoPromptCoreHost {
     let workspacePersistenceWriter: WorkspacePersistenceWriter
     let workspaceAccessPolicy: any WorkspaceAccessPolicy
     let runtimeSessionRegistry: MCPRuntimeSessionRegistry
-    let platformDependencies: RepoPromptCorePlatformDependencies
+    let runtimeFactory: RepoPromptEmbeddedWorkspaceRuntimeFactory
     private var createdSessions: [RepoPromptSessionID: WeakSession] = [:]
     private var activeSessions: [RepoPromptSessionID: RepoPromptCoreSession] = [:]
 
@@ -109,22 +118,23 @@ final class RepoPromptCoreHost {
         workspacePersistenceWriter: WorkspacePersistenceWriter,
         workspaceAccessPolicy: any WorkspaceAccessPolicy,
         runtimeSessionRegistry: MCPRuntimeSessionRegistry,
-        platformDependencies: RepoPromptCorePlatformDependencies
+        runtimeFactory: RepoPromptEmbeddedWorkspaceRuntimeFactory
     ) {
         self.workspaceRepository = workspaceRepository
         self.workspacePersistenceWriter = workspacePersistenceWriter
         self.workspaceAccessPolicy = workspaceAccessPolicy
         self.runtimeSessionRegistry = runtimeSessionRegistry
-        self.platformDependencies = platformDependencies
+        self.runtimeFactory = runtimeFactory
     }
 
     func makeEmbeddedSession(routingSessionID: MCPRoutingSessionID) -> RepoPromptCoreSessionHandle {
+        let runtime = runtimeFactory.makeRuntime()
         let session = RepoPromptCoreSession(
             routingSessionID: routingSessionID,
             workspaceRepository: workspaceRepository,
             workspacePersistenceWriter: workspacePersistenceWriter,
             workspaceAccessPolicy: workspaceAccessPolicy,
-            platformDependencies: platformDependencies
+            runtime: runtime
         )
         createdSessions[session.sessionID] = WeakSession(session)
         return RepoPromptCoreSessionHandle(session: session)

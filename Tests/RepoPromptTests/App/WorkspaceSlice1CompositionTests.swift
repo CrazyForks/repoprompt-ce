@@ -39,7 +39,7 @@ final class WorkspaceSlice1CompositionTests: XCTestCase {
         XCTAssertTrue(selectedV2Codecs.isEmpty)
     }
 
-    func testWindowRetainsObservationAndTemporarySelectionForwarder() throws {
+    func testWindowRetainsObservationAndCanonicalSelectionController() throws {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
         defer { GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false) }
@@ -52,7 +52,7 @@ final class WorkspaceSlice1CompositionTests: XCTestCase {
 
         XCTAssertTrue(window.workspaceObservation === window.workspaceManager.workspaceObservation)
         XCTAssertEqual(window.selectionCoordinator.activeTabID(), tabID)
-        XCTAssertEqual(window.selectionForwarder.activeWorkspace?.id, workspace.id)
+        XCTAssertEqual(window.selectionCoordinator.controller.sessionController.activeWorkspace?.id, workspace.id)
     }
 
     func testPollSaveDoesNotAdvanceRepoBaselineFromStaleGeneration() async throws {

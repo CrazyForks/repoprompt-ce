@@ -74,7 +74,7 @@ if [[ "${#core_swift_files[@]}" -eq 0 ]]; then
 else
   report_matches \
     "forbidden Apple UI/native import found under $CORE_ROOT" \
-    '^[[:space:]]*(@[[:alnum:]_]+[[:space:]]+)*import([[:space:]]+(class|struct|enum|protocol|func|var|let|typealias))?[[:space:]]+(AppKit|SwiftUI|Cocoa|Sparkle|KeyboardShortcuts|CoreServices|Security|Darwin|Glibc|SystemPackage|OSLog|os|RepoPromptShared|RepoPromptPOSIXSupport|RepoPromptCoreMacOS)([.]|[[:space:]]|$)' \
+    '^[[:space:]]*(@[[:alnum:]_]+[[:space:]]+)*import([[:space:]]+(class|struct|enum|protocol|func|var|let|typealias))?[[:space:]]+(AppKit|SwiftUI|Cocoa|Sparkle|KeyboardShortcuts|CoreServices|Security|Darwin|Glibc|SystemPackage|OSLog|RepoPromptShared|RepoPromptPOSIXSupport|RepoPromptCoreMacOS)([.]|[[:space:]]|$)' \
     "${core_swift_files[@]}"
   report_matches \
     "app-owned runtime or embedded-policy reference found under $CORE_ROOT" \
@@ -82,8 +82,57 @@ else
     "${core_swift_files[@]}"
   report_matches \
     "Darwin-backed descriptor/socket type leaked into Core contracts" \
-    'POSIXDescriptorConfigurationError|connectedFileDescriptor|sockaddr|FileDescriptor|Darwin[.]|Glibc[.]' \
+    'POSIXDescriptorConfigurationError|connectedFileDescriptor|sockaddr|(^|[^[:alnum:]_])FileDescriptor([^[:alnum:]_]|$)|Darwin[.]|Glibc[.]' \
     "${core_swift_files[@]}"
+
+  if ! core_native_import_output="$(python3 <<'PY'
+from pathlib import Path
+
+root = Path("Sources/RepoPromptCore")
+contracts = {
+    "RepoPromptC": {
+        "FileSystem/GitignoreCompiler.swift",
+        "Utilities/StringFNV.swift",
+        "Utilities/StringLineEndingUtilities.swift",
+        "WorkspaceContext/Search/PathSearchIndex.swift",
+        "WorkspaceContext/Search/RepoSearchBatchScorer.swift",
+        "WorkspaceContext/Search/SearchMatch.swift",
+        "WorkspaceContext/Search/SearchPathFiltering.swift",
+    },
+    "CSwiftPCRE2": {
+        "Regex/PCRE2Error.swift",
+        "Regex/PCRE2JIT.swift",
+        "Regex/PCRE2Options.swift",
+        "Regex/PCRE2Regex.swift",
+    },
+    "RepoPromptSyntaxCBridge": {"SyntaxParsing/SyntaxManager.swift"},
+    "SwiftTreeSitter": {
+        "CodeMap/CodeMapCaptureIndex.swift",
+        "CodeMap/CodeMapGenerator.swift",
+        "CodeMap/LanguageStrategies/SwiftCodeMapStrategy.swift",
+        "CodeMap/LanguageStrategies/TypeScriptCodeMapStrategy.swift",
+        "SyntaxParsing/SyntaxManager.swift",
+    },
+    "Cuchardet": {"FileSystem/FileSystemService+ContentLoading.swift"},
+    "UniversalCharsetDetection": {"FileSystem/FileSystemService+ContentLoading.swift"},
+    "os": {"CodeMap/CodeMapGenerator.swift"},
+}
+errors = []
+for module, expected in contracts.items():
+    actual = {
+        str(path.relative_to(root))
+        for path in root.rglob("*.swift")
+        if f"import {module}" in path.read_text()
+    }
+    if actual != expected:
+        errors.append(f"{module} importer ownership drift: expected {sorted(expected)}, found {sorted(actual)}")
+if errors:
+    raise SystemExit("\n".join(errors))
+PY
+)"; then
+    fail "RepoPromptCore native/product imports escaped their moved importer ownership"
+    printf '%s\n' "$core_native_import_output" >&2
+  fi
 fi
 
 if [[ ! -f "$POSIX_ROOT/Descriptors/POSIXDescriptorSupport.swift" ]]; then

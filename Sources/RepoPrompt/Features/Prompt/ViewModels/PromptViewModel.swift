@@ -5875,8 +5875,3 @@ enum PromptError: Error {
 enum AIResponseError: Error {
     case invalidData
 }
-
-enum FilePathDisplay: String, CaseIterable {
-    case full = "Full"
-    case relative = "Relative"
-}

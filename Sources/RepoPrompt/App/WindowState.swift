@@ -126,7 +126,6 @@ class WindowState: ObservableObject {
     let workspaceSearchService: WorkspaceSearchService
     let selectionCoordinator: WorkspaceSelectionCoordinator
     let workspaceObservation: WorkspaceSessionObservationBridge
-    let selectionForwarder: WorkspaceSessionSelectionForwarder
     let workspaceFilesViewModel: WorkspaceFilesViewModel
     let settingsManager: WindowSettingsManager
     let promptManager: PromptViewModel
@@ -319,7 +318,6 @@ class WindowState: ObservableObject {
         workspaceSearchService = composition.workspaceSearchService
         selectionCoordinator = composition.selectionCoordinator
         workspaceObservation = composition.workspaceObservation
-        selectionForwarder = composition.selectionForwarder
         workspaceFilesViewModel = composition.workspaceFilesViewModel
         settingsManager = composition.settingsManager
         promptManager = composition.promptManager

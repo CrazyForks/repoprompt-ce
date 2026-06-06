@@ -1,4 +1,5 @@
 @testable import RepoPrompt
+@testable import RepoPromptCore
 import XCTest
 
 final class StoreBackedWorkspaceSearchTests: XCTestCase {
@@ -656,7 +657,7 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
 
     func testSearchScopeParserKeepsRequiredResolutionOrder() throws {
         let source = try String(
-            contentsOf: RepoRoot.url().appendingPathComponent("Sources/RepoPrompt/Features/Search/StoreBackedWorkspaceSearch.swift"),
+            contentsOf: RepoRoot.url().appendingPathComponent("Sources/RepoPromptCore/WorkspaceContext/Search/StoreBackedWorkspaceSearch.swift"),
             encoding: .utf8
         )
         try assertOrdered([
@@ -679,7 +680,7 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             paths: paths,
             rootScope: .visibleWorkspace,
             store: store,
-            workspaceManager: nil
+            readinessSource: nil
         )
     }
 
@@ -697,7 +698,7 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             maxPaths: 100,
             rootScope: .visibleWorkspace,
             store: store,
-            workspaceManager: nil,
+            readinessSource: nil,
             admissionCoordinator: coordinator,
             contentFetchCoordinator: contentFetchCoordinator
         )
@@ -712,20 +713,22 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
         coordinator: StoreBackedWorkspaceSearchAdmissionCoordinator,
         contentFetchCoordinator: StoreBackedWorkspaceSearchContentFetchAdmissionCoordinator = .shared
     ) async throws -> SearchResults {
-        try await StoreBackedWorkspaceSearch.search(
-            pattern: pattern,
-            mode: .content,
-            isRegex: false,
-            caseInsensitive: false,
-            maxMatches: maxMatches,
-            paths: paths,
-            countOnly: countOnly,
-            rootScope: .visibleWorkspace,
-            store: store,
-            workspaceManager: nil,
-            admissionCoordinator: coordinator,
-            contentFetchCoordinator: contentFetchCoordinator
-        )
+        try await withEmbeddedWorkspaceRuntimeDiagnostics {
+            try await StoreBackedWorkspaceSearch.search(
+                pattern: pattern,
+                mode: .content,
+                isRegex: false,
+                caseInsensitive: false,
+                maxMatches: maxMatches,
+                paths: paths,
+                countOnly: countOnly,
+                rootScope: .visibleWorkspace,
+                store: store,
+                readinessSource: nil,
+                admissionCoordinator: coordinator,
+                contentFetchCoordinator: contentFetchCoordinator
+            )
+        }
     }
 
     #if DEBUG

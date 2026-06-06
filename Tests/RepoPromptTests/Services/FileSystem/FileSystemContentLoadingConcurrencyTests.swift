@@ -311,10 +311,12 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
 
             let queued = Task {
                 try await EditFlowPerf.$currentLifecycleCorrelation.withValue(correlation) {
-                    try await service.loadContent(
-                        ofRelativePath: queuedPath,
-                        workloadClass: .interactiveRead
-                    )
+                    try await withEmbeddedWorkspaceRuntimeDiagnostics {
+                        try await service.loadContent(
+                            ofRelativePath: queuedPath,
+                            workloadClass: .interactiveRead
+                        )
+                    }
                 }
             }
             let waitBegan = await waitForLifecycleEvent(
@@ -376,10 +378,12 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
 
             let cancelled = Task {
                 try await EditFlowPerf.$currentLifecycleCorrelation.withValue(correlation) {
-                    try await service.loadContent(
-                        ofRelativePath: "Cancelled.txt",
-                        workloadClass: .interactiveRead
-                    )
+                    try await withEmbeddedWorkspaceRuntimeDiagnostics {
+                        try await service.loadContent(
+                            ofRelativePath: "Cancelled.txt",
+                            workloadClass: .interactiveRead
+                        )
+                    }
                 }
             }
             let waitBegan = await waitForLifecycleEvent(

@@ -12,7 +12,7 @@ final class RepoPromptCoreHostLifecycleTests: XCTestCase {
             workspacePersistenceWriter: graph.writer,
             workspaceAccessPolicy: UnrestrictedWorkspaceAccessPolicy(),
             runtimeSessionRegistry: registry,
-            platformDependencies: MacOSRepoPromptCorePlatformDependencies.embeddedApp()
+            runtimeFactory: RepoPromptEmbeddedWorkspaceRuntimeFactory()
         )
         let handle = host.makeEmbeddedSession(routingSessionID: MCPRoutingSessionID(rawValue: 42))
 
@@ -46,7 +46,7 @@ final class RepoPromptCoreHostLifecycleTests: XCTestCase {
             workspacePersistenceWriter: graph.writer,
             workspaceAccessPolicy: UnrestrictedWorkspaceAccessPolicy(),
             runtimeSessionRegistry: registry,
-            platformDependencies: MacOSRepoPromptCorePlatformDependencies.embeddedApp()
+            runtimeFactory: RepoPromptEmbeddedWorkspaceRuntimeFactory()
         )
         let owner = host.makeEmbeddedSession(routingSessionID: MCPRoutingSessionID(rawValue: 84))
         let duplicate = host.makeEmbeddedSession(routingSessionID: MCPRoutingSessionID(rawValue: 84))

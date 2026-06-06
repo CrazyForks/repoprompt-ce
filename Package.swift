@@ -90,6 +90,14 @@ let package = Package(
         .target(name: "RepoPromptPOSIXSupport", path: "Sources/RepoPromptPOSIXSupport"),
         .target(
             name: "RepoPromptCore",
+            dependencies: [
+                "RepoPromptC",
+                "CSwiftPCRE2",
+                "RepoPromptSyntaxCBridge",
+                .product(name: "SwiftTreeSitter", package: "SwiftTreeSitter"),
+                .product(name: "UniversalCharsetDetection", package: "UniversalCharsetDetection"),
+                .product(name: "Cuchardet", package: "UniversalCharsetDetection")
+            ],
             path: "Sources/RepoPromptCore"
         ),
         .target(
@@ -127,11 +135,7 @@ let package = Package(
         .testTarget(
             name: "RepoPromptTests",
             dependencies: ["RepoPrompt", "RepoPromptShared", "RepoPromptPOSIXSupport", "RepoPromptCore", "RepoPromptCoreMacOS"],
-            path: "Tests/RepoPromptTests",
-            resources: [
-                .copy("CodeMap/Fixtures"),
-                .copy("CodeMap/Goldens")
-            ]
+            path: "Tests/RepoPromptTests"
         ),
         .testTarget(
             name: "RepoPromptHeadlessTests",
@@ -141,7 +145,16 @@ let package = Package(
         .testTarget(
             name: "RepoPromptCoreTests",
             dependencies: ["RepoPromptCore"],
-            path: "Tests/RepoPromptCoreTests"
+            path: "Tests/RepoPromptCoreTests",
+            resources: [
+                .copy("CodeMap/Fixtures"),
+                .copy("CodeMap/Goldens")
+            ]
+        ),
+        .testTarget(
+            name: "RepoPromptCoreMacOSTests",
+            dependencies: ["RepoPromptCoreMacOS", "RepoPromptCore"],
+            path: "Tests/RepoPromptCoreMacOSTests"
         ),
         .testTarget(
             name: "RepoPromptPOSIXSupportTests",

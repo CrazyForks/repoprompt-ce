@@ -7,7 +7,6 @@ struct WindowStateComposition {
     let workspaceSearchService: WorkspaceSearchService
     let selectionCoordinator: WorkspaceSelectionCoordinator
     let workspaceObservation: WorkspaceSessionObservationBridge
-    let selectionForwarder: WorkspaceSessionSelectionForwarder
     let workspaceFilesViewModel: WorkspaceFilesViewModel
     let settingsManager: WindowSettingsManager
     let promptManager: PromptViewModel
@@ -40,7 +39,10 @@ enum WindowStateCompositionFactory {
         let coreSession = coreSessionHandle.session
         let workspaceFileContextStore = coreSession.workspaceFileContextStore
         let workspaceSearchService = coreSession.workspaceSearchService
-        let workspaceFilesViewModel = WorkspaceFilesViewModel(workspaceFileContextStore: workspaceFileContextStore)
+        let workspaceFilesViewModel = WorkspaceFilesViewModel(
+            workspaceFileContextStore: workspaceFileContextStore,
+            selectionSliceCoordinator: coreSession.selectionSliceCoordinator
+        )
 
         // 2) AI queries
         let keyManager = KeyManager()
@@ -73,12 +75,9 @@ enum WindowStateCompositionFactory {
             sessionController: coreSession.workspaceSessionController,
             workspaceObservation: workspaceObservation
         )
+        let searchReadinessSource = WorkspaceManagerSearchReadinessSource(workspaceManager)
         let selectionCoordinator = coreSession.selectionCoordinator
-        let selectionForwarder = WorkspaceSessionSelectionForwarder(
-            controller: coreSession.workspaceSessionController,
-            manager: workspaceManager
-        )
-        selectionCoordinator.attachWorkspaceManager(selectionForwarder)
+        selectionCoordinator.attachWorkspaceManager(workspaceManager)
         workspaceFilesViewModel.attachSelectionCoordinator(selectionCoordinator)
         workspaceManager.attachSelectionCoordinator(selectionCoordinator)
         promptManager.attachSelectionCoordinator(selectionCoordinator)
@@ -103,9 +102,10 @@ enum WindowStateCompositionFactory {
             coreSessionHandle: coreSessionHandle,
             appSessionAdapters: coreContainer.appSessionAdapters,
             windowID: windowID,
-            workspaceSearch: { [store = workspaceFileContextStore, searchService = workspaceSearchService, workspaceManager] pattern, mode, isRegex, caseInsensitive, maxPaths, maxMatches, paths, includeExtensions, excludePatterns, contextLines, wholeWord, countOnly, fuzzySpaceMatching, rootScope in
-                try await StoreBackedWorkspaceSearch.search(
-                    pattern: pattern,
+            workspaceSearch: { [store = workspaceFileContextStore, searchService = workspaceSearchService, searchReadinessSource] pattern, mode, isRegex, caseInsensitive, maxPaths, maxMatches, paths, includeExtensions, excludePatterns, contextLines, wholeWord, countOnly, fuzzySpaceMatching, rootScope in
+                try await withEmbeddedWorkspaceRuntimeDiagnostics {
+                    try await StoreBackedWorkspaceSearch.search(
+                        pattern: pattern,
                     mode: mode,
                     isRegex: isRegex,
                     caseInsensitive: caseInsensitive,
@@ -121,8 +121,9 @@ enum WindowStateCompositionFactory {
                     rootScope: rootScope,
                     store: store,
                     searchService: searchService,
-                    workspaceManager: workspaceManager
-                )
+                        readinessSource: searchReadinessSource
+                    )
+                }
             },
             ensureGitDataRootLoaded: { [fileManager = workspaceFilesViewModel] workspace, workspaceManager in
                 guard let workspace, let workspaceManager else { return }
@@ -192,7 +193,6 @@ enum WindowStateCompositionFactory {
                 workspaceSearchService: workspaceSearchService,
                 selectionCoordinator: selectionCoordinator,
                 workspaceObservation: workspaceObservation,
-                selectionForwarder: selectionForwarder,
                 workspaceFilesViewModel: workspaceFilesViewModel,
                 settingsManager: settingsManager,
                 promptManager: promptManager,
@@ -215,7 +215,6 @@ enum WindowStateCompositionFactory {
                 workspaceSearchService: workspaceSearchService,
                 selectionCoordinator: selectionCoordinator,
                 workspaceObservation: workspaceObservation,
-                selectionForwarder: selectionForwarder,
                 workspaceFilesViewModel: workspaceFilesViewModel,
                 settingsManager: settingsManager,
                 promptManager: promptManager,

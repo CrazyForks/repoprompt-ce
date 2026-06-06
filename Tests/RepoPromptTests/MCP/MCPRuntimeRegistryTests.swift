@@ -16,14 +16,14 @@ final class MCPRuntimeSessionRegistryTests: XCTestCase {
             workspaceRepository: repository,
             workspacePersistenceWriter: graph.writer,
             workspaceAccessPolicy: policy,
-            platformDependencies: MacOSRepoPromptCorePlatformDependencies.embeddedApp()
+            runtime: RepoPromptEmbeddedWorkspaceRuntimeFactory().makeRuntime()
         )
         let second = RepoPromptCoreSession(
             routingSessionID: MCPRoutingSessionID(rawValue: 2),
             workspaceRepository: repository,
             workspacePersistenceWriter: graph.writer,
             workspaceAccessPolicy: policy,
-            platformDependencies: MacOSRepoPromptCorePlatformDependencies.embeddedApp()
+            runtime: RepoPromptEmbeddedWorkspaceRuntimeFactory().makeRuntime()
         )
 
         registry.setMCPEnabled(windowID: first.routingSessionID.rawValue, enabled: true)
@@ -61,14 +61,14 @@ final class MCPRuntimeSessionRegistryTests: XCTestCase {
             workspaceRepository: repository,
             workspacePersistenceWriter: graph.writer,
             workspaceAccessPolicy: policy,
-            platformDependencies: MacOSRepoPromptCorePlatformDependencies.embeddedApp()
+            runtime: RepoPromptEmbeddedWorkspaceRuntimeFactory().makeRuntime()
         )
         let duplicate = RepoPromptCoreSession(
             routingSessionID: MCPRoutingSessionID(rawValue: 7),
             workspaceRepository: repository,
             workspacePersistenceWriter: graph.writer,
             workspaceAccessPolicy: policy,
-            platformDependencies: MacOSRepoPromptCorePlatformDependencies.embeddedApp()
+            runtime: RepoPromptEmbeddedWorkspaceRuntimeFactory().makeRuntime()
         )
 
         XCTAssertEqual(registry.register(session: owner), .accepted)

@@ -326,6 +326,19 @@ package final class WorkspaceSessionController {
         selectionRevisionByKey[WorkspaceTabSelectionKey(workspaceID: workspaceID, tabID: tabID), default: 0]
     }
 
+    package func recordExternallyCommittedSelectionRevision(
+        workspaceID: UUID,
+        tabID: UUID,
+        previous: StoredSelection,
+        current: StoredSelection
+    ) {
+        guard previous != current,
+              workspace(id: workspaceID)?.composeTabs.first(where: { $0.id == tabID })?.selection == current
+        else { return }
+        selectionRevisionByKey[WorkspaceTabSelectionKey(workspaceID: workspaceID, tabID: tabID)] =
+            persistenceWriter.allocateSelectionRevision()
+    }
+
     package func saveMetadata(
         for workspace: WorkspaceModel,
         source: WorkspaceSaveSource,

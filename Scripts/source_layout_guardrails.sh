@@ -25,8 +25,8 @@ print_matches() {
 required_dirs=(
   "Sources/RepoPrompt/Features"
   "Sources/RepoPrompt/Infrastructure"
-  "Sources/RepoPrompt/Infrastructure/SyntaxParsing"
   "Sources/RepoPromptCore"
+  "Sources/RepoPromptCore/SyntaxParsing"
   "Sources/RepoPromptCoreMacOS"
   "Sources/RepoPromptPOSIXSupport/Descriptors"
   "Sources/RepoPromptHeadless"
@@ -316,20 +316,46 @@ if syntax_bridge_by_name_dependencies != ["TreeSitterScannerSupport"]:
     errors.append("RepoPromptSyntaxCBridge must directly depend only on TreeSitterScannerSupport plus the curated grammar products")
 if has_by_name(repo_prompt_dependencies, "TreeSitterScannerSupport"):
     errors.append("RepoPrompt must not directly depend on TreeSitterScannerSupport")
-unexpected_core_native_dependencies = sorted(
+core_by_name_dependencies = {
     dependency["byName"][0]
     for dependency in core_dependencies
     if "byName" in dependency
-    and dependency["byName"][0] in {"RepoPromptShared", "RepoPromptPOSIXSupport", "RepoPromptC", "CSwiftPCRE2", "RepoPromptSyntaxCBridge"}
-)
-if unexpected_core_native_dependencies:
-    errors.append(f"RepoPromptCore has premature dependency edges: {unexpected_core_native_dependencies}")
+}
+core_product_dependencies = {
+    dependency["product"][0]
+    for dependency in core_dependencies
+    if "product" in dependency
+}
+expected_core_by_name_dependencies = {"RepoPromptC", "CSwiftPCRE2", "RepoPromptSyntaxCBridge"}
+expected_core_product_dependencies = {"SwiftTreeSitter", "UniversalCharsetDetection", "Cuchardet"}
+if core_by_name_dependencies != expected_core_by_name_dependencies:
+    errors.append(
+        "RepoPromptCore by-name dependencies must match moved native importers: "
+        f"expected {sorted(expected_core_by_name_dependencies)}, found {sorted(core_by_name_dependencies)}"
+    )
+if core_product_dependencies != expected_core_product_dependencies:
+    errors.append(
+        "RepoPromptCore product dependencies must match moved syntax/content importers: "
+        f"expected {sorted(expected_core_product_dependencies)}, found {sorted(core_product_dependencies)}"
+    )
+core_import_contract = {
+    "RepoPromptC": "import RepoPromptC",
+    "CSwiftPCRE2": "import CSwiftPCRE2",
+    "RepoPromptSyntaxCBridge": "import RepoPromptSyntaxCBridge",
+    "SwiftTreeSitter": "import SwiftTreeSitter",
+    "UniversalCharsetDetection": "import UniversalCharsetDetection",
+    "Cuchardet": "import Cuchardet",
+}
+core_sources = "\n".join(path.read_text() for path in Path("Sources/RepoPromptCore").rglob("*.swift"))
+for dependency, import_line in core_import_contract.items():
+    if import_line not in core_sources:
+        errors.append(f"RepoPromptCore dependency is not importer-backed: {dependency}")
 if not has_by_name(repo_prompt_dependencies, "RepoPromptCore") or not has_by_name(repo_prompt_dependencies, "RepoPromptCoreMacOS"):
     errors.append("RepoPrompt must directly depend on RepoPromptCore and RepoPromptCoreMacOS")
-if not has_by_name(repo_prompt_dependencies, "RepoPromptSyntaxCBridge"):
-    errors.append("RepoPrompt must directly depend on RepoPromptSyntaxCBridge while SyntaxManager remains app-owned")
-if not has_by_name(repo_prompt_dependencies, "RepoPromptC") or not has_by_name(repo_prompt_dependencies, "CSwiftPCRE2"):
-    errors.append("RepoPrompt must retain direct native dependencies while current app sources import them")
+if not has_by_name(repo_prompt_dependencies, "RepoPromptC"):
+    errors.append("RepoPrompt must retain RepoPromptC while app StringExtensions imports it")
+if not any(dependency.get("product", [None])[0] == "SwiftTreeSitter" for dependency in repo_prompt_dependencies):
+    errors.append("RepoPrompt must retain SwiftTreeSitter while app UI/file view importers remain")
 if not has_by_name(repo_prompt_dependencies, "RepoPromptPOSIXSupport"):
     errors.append("RepoPrompt must directly depend on RepoPromptPOSIXSupport while app socket sources import it")
 if not has_by_name(repo_prompt_mcp_dependencies, "RepoPromptPOSIXSupport"):
@@ -425,13 +451,13 @@ if [[ "${#mcp_bootstrap_endpoint_files[@]}" -ne 1 || "${mcp_bootstrap_endpoint_f
   printf '%s\n' "${mcp_bootstrap_endpoint_files[@]}" >&2
 fi
 
-# 4. Parser fixtures and sample parser inputs must not live in app source.
+# 4. Parser fixtures and sample parser inputs must not live in Core syntax source.
 print_matches \
-  "parser fixture/test directory found under app syntax parsing source" \
-  find Sources/RepoPrompt/Infrastructure/SyntaxParsing -type d \( -iname '*fixture*' -o -iname '*test*' \) -print
+  "parser fixture/test directory found under Core syntax parsing source" \
+  find Sources/RepoPromptCore/SyntaxParsing -type d \( -iname '*fixture*' -o -iname '*test*' \) -print
 print_matches \
-  "parser fixture-like sample input found under app syntax parsing source" \
-  find Sources/RepoPrompt/Infrastructure/SyntaxParsing -type f \( \
+  "parser fixture-like sample input found under Core syntax parsing source" \
+  find Sources/RepoPromptCore/SyntaxParsing -type f \( \
     -iname '*fixture*' -o -iname '*test*' -o \
     -name '*.dart' -o -name '*.go' -o -name '*.java' -o -name '*.js' -o -name '*.jsx' -o \
     -name '*.py' -o -name '*.rb' -o -name '*.rs' -o -name '*.ts' -o -name '*.tsx' -o \
