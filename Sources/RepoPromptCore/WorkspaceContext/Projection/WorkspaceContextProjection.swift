@@ -57,6 +57,19 @@ package struct WorkspaceContextProjection: Equatable {
     }
 }
 
+package enum WorkspaceTokenProjectionInput: Equatable {
+    case componentEstimate(
+        source: TokenProjection.Source,
+        nonFile: TokenProjectionService.WorkspaceNonFileComponents
+    )
+    case activeLive(TokenProjectionService.ActiveLiveWorkspaceInput)
+
+    package static let emptyVirtual = WorkspaceTokenProjectionInput.componentEstimate(
+        source: .virtualRecomputed,
+        nonFile: .init(prompt: 0, fileTree: 0, meta: 0, git: 0)
+    )
+}
+
 package struct WorkspaceContextProjectionRequest: Equatable {
     package struct Sections: OptionSet, Equatable {
         package let rawValue: Int
@@ -81,8 +94,7 @@ package struct WorkspaceContextProjectionRequest: Equatable {
     package let alternatePolicy: WorkspaceSelectionProjectionRequest.AlternatePolicy?
     package let codeStructureBudget: CodeStructureProjectionRequest.Budget
     package let includeUnmappedCodeStructurePaths: Bool
-    package let tokenSource: TokenProjection.Source
-    package let nonFileTokenComponents: TokenProjectionService.WorkspaceNonFileComponents
+    package let tokenProjectionInput: WorkspaceTokenProjectionInput
 
     package init(
         sections: Sections = .all,
@@ -92,13 +104,7 @@ package struct WorkspaceContextProjectionRequest: Equatable {
         alternatePolicy: WorkspaceSelectionProjectionRequest.AlternatePolicy? = nil,
         codeStructureBudget: CodeStructureProjectionRequest.Budget = .init(resultLimit: 25),
         includeUnmappedCodeStructurePaths: Bool = true,
-        tokenSource: TokenProjection.Source = .virtualRecomputed,
-        nonFileTokenComponents: TokenProjectionService.WorkspaceNonFileComponents = .init(
-            prompt: 0,
-            fileTree: 0,
-            meta: 0,
-            git: 0
-        )
+        tokenProjectionInput: WorkspaceTokenProjectionInput = .emptyVirtual
     ) {
         self.sections = sections
         self.promptText = promptText
@@ -107,8 +113,7 @@ package struct WorkspaceContextProjectionRequest: Equatable {
         self.alternatePolicy = alternatePolicy
         self.codeStructureBudget = codeStructureBudget
         self.includeUnmappedCodeStructurePaths = includeUnmappedCodeStructurePaths
-        self.tokenSource = tokenSource
-        self.nonFileTokenComponents = nonFileTokenComponents
+        self.tokenProjectionInput = tokenProjectionInput
     }
 }
 

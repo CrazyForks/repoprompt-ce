@@ -155,13 +155,9 @@ package actor PromptContextAccountingService {
         try Task.checkCancellation()
 
         let tokenCalculationService = TokenCalculationService()
-        let tokenResult = await withTaskCancellationHandler {
-            await tokenCalculationService.calculatePromptStats(snapshot: calculationSnapshot)
-        } onCancel: {
-            Task {
-                await tokenCalculationService.shutdown()
-            }
-        }
+        let tokenResult = try await tokenCalculationService.calculatePromptStatsScoped(
+            snapshot: calculationSnapshot
+        )
         try Task.checkCancellation()
 
         let usedCodemaps = codemapSnapshots.filter { fileID, _ in

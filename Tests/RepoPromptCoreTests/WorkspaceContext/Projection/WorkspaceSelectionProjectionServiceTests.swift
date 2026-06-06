@@ -46,17 +46,19 @@ final class WorkspaceSelectionProjectionServiceTests: XCTestCase {
         ))
         XCTAssertEqual(projection.slices.map(\.file.standardizedRelativePath), ["Sources/Sliced.swift"])
         XCTAssertEqual(projection.slices.map(\.ranges), [ranges])
-        XCTAssertEqual(projection.files.map(\.alternate?.mode), [.codemap, .codemap, .hidden])
-        XCTAssertEqual(projection.files.map(\.alternate?.tokens), [10, 11, 0])
+        XCTAssertEqual(projection.files.map(\.alternate?.mode), [.codemap, .codemap, nil])
+        XCTAssertEqual(projection.files.map(\.alternate?.tokens), [10, 11, nil])
         XCTAssertEqual(projection.files.map(\.alternate?.codemapOrigin), [.selectedMode, .selectedMode, nil])
-        XCTAssertEqual(projection.alternate, .init(
-            codeMapUsage: .selected,
-            includesFiles: true,
-            contentTokens: 0,
-            codemapTokens: 21,
-            totalTokens: 21,
-            includedTotalTokens: 21
-        ))
+        XCTAssertEqual(projection.alternate?.contentTokens, 0)
+        XCTAssertEqual(projection.alternate?.codemapTokens, 33)
+        XCTAssertEqual(projection.alternate?.totalTokens, 33)
+        XCTAssertEqual(projection.alternate?.includedTotalTokens, 33)
+        XCTAssertEqual(projection.alternate?.includedFiles.map(\.file.standardizedRelativePath), [
+            "Sources/Full.swift",
+            "Sources/Sliced.swift",
+            "Sources/Auto.swift"
+        ])
+        XCTAssertEqual(projection.alternate?.includedFiles.map(\.mode), [.codemap, .codemap, .codemap])
     }
 
     func testCompleteNoneAndAutoAlternatesPreserveBaseAndAggregateSemantics() {
@@ -132,14 +134,15 @@ final class WorkspaceSelectionProjectionServiceTests: XCTestCase {
             codemapTokens: 12
         ))
         XCTAssertEqual(projection.files.map(\.alternate?.tokens), [10, nil])
-        XCTAssertEqual(projection.alternate, .init(
-            codeMapUsage: .complete,
-            includesFiles: true,
-            contentTokens: 0,
-            codemapTokens: 36,
-            totalTokens: 36,
-            includedTotalTokens: 36
-        ))
+        XCTAssertEqual(projection.alternate?.contentTokens, 0)
+        XCTAssertEqual(projection.alternate?.codemapTokens, 36)
+        XCTAssertEqual(projection.alternate?.totalTokens, 36)
+        XCTAssertEqual(projection.alternate?.includedTotalTokens, 36)
+        XCTAssertEqual(projection.alternate?.includedFiles.map(\.file.standardizedRelativePath), [
+            "Selected.swift",
+            "Auto.swift",
+            "CompleteOnly.swift"
+        ])
     }
 
     func testAlternateIncludeFilesFalseUsesFrozenBaseCodemapTotalRule() {
@@ -149,8 +152,9 @@ final class WorkspaceSelectionProjectionServiceTests: XCTestCase {
         ]
 
         let selected = project(entries, alternateUsage: .selected, includeFiles: false)
-        XCTAssertEqual(selected.alternate?.totalTokens, 10)
+        XCTAssertEqual(selected.alternate?.totalTokens, 22)
         XCTAssertEqual(selected.alternate?.includedTotalTokens, 12)
+        XCTAssertEqual(selected.alternate?.includedFiles.map(\.file.standardizedRelativePath), ["Auto.swift"])
 
         let complete = project(entries, alternateUsage: .complete, includeFiles: false)
         XCTAssertEqual(complete.alternate?.totalTokens, 22)

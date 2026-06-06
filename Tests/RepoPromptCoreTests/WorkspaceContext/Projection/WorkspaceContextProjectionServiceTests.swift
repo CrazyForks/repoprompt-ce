@@ -126,7 +126,10 @@ final class WorkspaceContextProjectionServiceTests: XCTestCase {
         let projection = try await service.project(.init(
             promptText: "user prompt",
             alternatePolicy: .init(includeFiles: true, codeMapUsage: .none),
-            nonFileTokenComponents: .init(prompt: 2, fileTree: 1, meta: 0, git: 0)
+            tokenProjectionInput: .componentEstimate(
+                source: .virtualRecomputed,
+                nonFile: .init(prompt: 2, fileTree: 1, meta: 0, git: 0)
+            )
         ))
 
         XCTAssertEqual(projection.prompt?.value, "user prompt")

@@ -226,6 +226,10 @@ package actor TokenCalculationService {
         }
     }
 
+    package static func composeCodemapContent(_ parts: [String]) -> String {
+        joinWithNewlines(parts.filter { !$0.isEmpty })
+    }
+
     /// Join an array of strings with newline separators using reserved capacity to avoid churn.
     @inline(__always)
     private static func joinWithNewlines(_ parts: [String]) -> String {
@@ -301,7 +305,7 @@ package actor TokenCalculationService {
                 fileCount += 1
                 tokenCount += entry.availableCodeMapTokenCount
             }
-            return (Self.joinWithNewlines(snippets), fileCount, tokenCount)
+            return (Self.composeCodemapContent(snippets), fileCount, tokenCount)
         }()
 
         let aggregated = Self.calculateEntryTokens(

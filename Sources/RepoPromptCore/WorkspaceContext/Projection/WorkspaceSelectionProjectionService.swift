@@ -11,9 +11,13 @@ package enum WorkspaceSelectionProjectionService {
         _ request: WorkspaceSelectionProjectionRequest
     ) -> WorkspaceSelectionProjection {
         var files: [WorkspaceSelectionProjection.File] = []
+        var normalizedFiles: [WorkspaceSelectionProjection.IncludedFile] = []
         var slices: [WorkspaceSelectionProjection.Slice] = []
+        var alternateCandidates: [WorkspaceSelectionProjection.IncludedFile] = []
         files.reserveCapacity(request.entries.count)
+        normalizedFiles.reserveCapacity(request.entries.count)
         slices.reserveCapacity(request.entries.count)
+        alternateCandidates.reserveCapacity(request.entries.count + request.completeAlternateEntries.count)
 
         var fullCount = 0
         var sliceCount = 0
@@ -21,8 +25,6 @@ package enum WorkspaceSelectionProjectionService {
         var fullTokens = 0
         var sliceTokens = 0
         var codemapTokens = 0
-        var alternateContentTokens = 0
-        var alternateCodemapTokens = 0
 
         for entry in request.entries {
             let mode = renderMode(for: entry.mode)
@@ -51,6 +53,14 @@ package enum WorkspaceSelectionProjectionService {
                 break
             }
 
+            normalizedFiles.append(makeIncludedFile(
+                entry: entry,
+                mode: mode,
+                tokens: entry.tokens.displayTokens,
+                fullTokens: entry.tokens.fullTokens,
+                codemapOrigin: origin
+            ))
+
             let alternateState: AlternateState? = request.alternatePolicy.map {
                 makeAlternateState(
                     for: entry,
@@ -59,15 +69,14 @@ package enum WorkspaceSelectionProjectionService {
                     codeMapUsage: $0.codeMapUsage
                 )
             }
-            if let alternateState {
-                switch alternateState.mode {
-                case .full, .slice:
-                    alternateContentTokens += alternateState.tokens
-                case .codemap:
-                    alternateCodemapTokens += alternateState.tokens
-                case .hidden:
-                    break
-                }
+            if let alternateState, alternateState.mode != .hidden {
+                alternateCandidates.append(makeIncludedFile(
+                    entry: entry,
+                    mode: alternateState.mode,
+                    tokens: alternateState.tokens,
+                    fullTokens: entry.tokens.fullTokens,
+                    codemapOrigin: alternateState.codemapOrigin
+                ))
             }
 
             let alternate = alternateState.flatMap { state -> WorkspaceSelectionProjection.FileAlternate? in
@@ -92,7 +101,13 @@ package enum WorkspaceSelectionProjectionService {
 
         if request.alternatePolicy?.codeMapUsage == .complete {
             for entry in request.completeAlternateEntries where entry.codemapAvailable {
-                alternateCodemapTokens += entry.tokens.codemapTokens
+                alternateCandidates.append(makeIncludedFile(
+                    entry: entry,
+                    mode: .codemap,
+                    tokens: entry.tokens.codemapTokens,
+                    fullTokens: nil,
+                    codemapOrigin: .completeMode
+                ))
             }
         }
 
@@ -105,32 +120,63 @@ package enum WorkspaceSelectionProjectionService {
             codemapTokens: codemapTokens
         )
         let alternate = request.alternatePolicy.map { policy in
-            let totalTokens = alternateContentTokens + alternateCodemapTokens
-            let includedTotalTokens: Int = if policy.includeFiles {
-                totalTokens
+            let alternateContentTokens = alternateCandidates.reduce(into: 0) { total, file in
+                if file.mode == .full || file.mode == .slice {
+                    total += file.tokens
+                }
+            }
+            let alternateCodemapTokens = alternateCandidates.reduce(into: 0) { total, file in
+                if file.mode == .codemap {
+                    total += file.tokens
+                }
+            }
+            let includedFiles: [WorkspaceSelectionProjection.IncludedFile] = if policy.includeFiles {
+                alternateCandidates
             } else if policy.codeMapUsage == .none {
-                0
+                []
             } else {
-                summary.codemapTokens
+                normalizedFiles.filter { $0.mode == .codemap }
             }
             return WorkspaceSelectionProjection.Alternate(
                 codeMapUsage: policy.codeMapUsage,
                 includesFiles: policy.includeFiles,
                 contentTokens: alternateContentTokens,
                 codemapTokens: alternateCodemapTokens,
-                totalTokens: totalTokens,
-                includedTotalTokens: includedTotalTokens
+                totalTokens: alternateContentTokens + alternateCodemapTokens,
+                includedTotalTokens: includedFiles.reduce(0) { $0 + $1.tokens },
+                includedFiles: includedFiles
             )
         }
 
         return WorkspaceSelectionProjection(
             files: files,
+            normalizedFiles: normalizedFiles,
             slices: slices,
             summary: summary,
             invalidPaths: request.missingPaths + request.invalidPaths,
             codeMapUsage: request.codeMapUsage,
             codemapAutoEnabled: request.codemapAutoEnabled,
             alternate: alternate
+        )
+    }
+
+    private static func makeIncludedFile(
+        entry: WorkspaceSelectionProjectionRequest.Entry,
+        mode: WorkspaceSelectionProjection.RenderMode,
+        tokens: Int,
+        fullTokens: Int?,
+        codemapOrigin: WorkspaceSelectionProjection.CodemapOrigin?
+    ) -> WorkspaceSelectionProjection.IncludedFile {
+        WorkspaceSelectionProjection.IncludedFile(
+            file: entry.file,
+            metadata: entry.metadata,
+            mode: mode,
+            ranges: mode == .slice ? entry.ranges : nil,
+            tokens: tokens,
+            fullTokens: fullTokens,
+            codemapTokens: entry.tokens.codemapTokens,
+            codemapOrigin: codemapOrigin,
+            codemapContent: mode == .codemap ? entry.codemapContent : nil
         )
     }
 
@@ -180,7 +226,11 @@ package enum WorkspaceSelectionProjectionService {
             )
         case .selected:
             if baseMode == .codemap {
-                return AlternateState(mode: .hidden, tokens: 0, codemapOrigin: nil)
+                return AlternateState(
+                    mode: .codemap,
+                    tokens: entry.tokens.displayTokens,
+                    codemapOrigin: baseOrigin
+                )
             }
             if entry.codemapAvailable {
                 return AlternateState(

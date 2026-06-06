@@ -134,6 +134,40 @@ package struct WorkspaceSelectionProjection: Equatable {
         )
     }
 
+    package struct IncludedFile: Equatable {
+        package let file: WorkspaceFileRecord
+        package let metadata: PathMetadata
+        package let mode: RenderMode
+        package let ranges: [LineRange]?
+        package let tokens: Int
+        package let fullTokens: Int?
+        package let codemapTokens: Int
+        package let codemapOrigin: CodemapOrigin?
+        package let codemapContent: String?
+
+        package init(
+            file: WorkspaceFileRecord,
+            metadata: PathMetadata,
+            mode: RenderMode,
+            ranges: [LineRange]?,
+            tokens: Int,
+            fullTokens: Int?,
+            codemapTokens: Int,
+            codemapOrigin: CodemapOrigin?,
+            codemapContent: String?
+        ) {
+            self.file = file
+            self.metadata = metadata
+            self.mode = mode
+            self.ranges = ranges
+            self.tokens = tokens
+            self.fullTokens = fullTokens
+            self.codemapTokens = codemapTokens
+            self.codemapOrigin = codemapOrigin
+            self.codemapContent = codemapContent
+        }
+    }
+
     package struct Alternate: Equatable {
         package let codeMapUsage: CodeMapUsage
         package let includesFiles: Bool
@@ -141,6 +175,7 @@ package struct WorkspaceSelectionProjection: Equatable {
         package let codemapTokens: Int
         package let totalTokens: Int
         package let includedTotalTokens: Int
+        package let includedFiles: [IncludedFile]
 
         package init(
             codeMapUsage: CodeMapUsage,
@@ -148,7 +183,8 @@ package struct WorkspaceSelectionProjection: Equatable {
             contentTokens: Int,
             codemapTokens: Int,
             totalTokens: Int,
-            includedTotalTokens: Int
+            includedTotalTokens: Int,
+            includedFiles: [IncludedFile] = []
         ) {
             self.codeMapUsage = codeMapUsage
             self.includesFiles = includesFiles
@@ -156,10 +192,12 @@ package struct WorkspaceSelectionProjection: Equatable {
             self.codemapTokens = codemapTokens
             self.totalTokens = totalTokens
             self.includedTotalTokens = includedTotalTokens
+            self.includedFiles = includedFiles
         }
     }
 
     package let files: [File]
+    package let normalizedFiles: [IncludedFile]
     package let slices: [Slice]
     package let summary: Summary
     package let invalidPaths: [String]
@@ -173,6 +211,7 @@ package struct WorkspaceSelectionProjection: Equatable {
 
     package init(
         files: [File],
+        normalizedFiles: [IncludedFile] = [],
         slices: [Slice],
         summary: Summary,
         invalidPaths: [String],
@@ -181,6 +220,7 @@ package struct WorkspaceSelectionProjection: Equatable {
         alternate: Alternate?
     ) {
         self.files = files
+        self.normalizedFiles = normalizedFiles
         self.slices = slices
         self.summary = summary
         self.invalidPaths = invalidPaths
@@ -210,6 +250,7 @@ package struct WorkspaceSelectionProjectionRequest: Equatable {
         package let ranges: [LineRange]
         package let tokens: TokenFacts
         package let codemapAvailable: Bool
+        package let codemapContent: String?
 
         package init(
             file: WorkspaceFileRecord,
@@ -217,7 +258,8 @@ package struct WorkspaceSelectionProjectionRequest: Equatable {
             mode: WorkspaceSelectionProjection.BaseMode,
             ranges: [LineRange] = [],
             tokens: TokenFacts,
-            codemapAvailable: Bool
+            codemapAvailable: Bool,
+            codemapContent: String? = nil
         ) {
             self.file = file
             self.metadata = metadata
@@ -225,6 +267,7 @@ package struct WorkspaceSelectionProjectionRequest: Equatable {
             self.ranges = ranges
             self.tokens = tokens
             self.codemapAvailable = codemapAvailable
+            self.codemapContent = codemapContent
         }
     }
 

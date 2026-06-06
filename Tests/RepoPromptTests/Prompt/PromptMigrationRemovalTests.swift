@@ -135,6 +135,59 @@ final class PromptMigrationRemovalTests: XCTestCase {
         }
     }
 
+    func testCanonicalTokenProjectionOwnershipAndRecountDelegationCannotRegress() throws {
+        let root = try RepoRoot.url(filePath: #filePath)
+        let coreProjection = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPromptCore/WorkspaceContext/Projection/TokenProjection.swift"
+            ),
+            encoding: .utf8
+        )
+        let coreService = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPromptCore/WorkspaceContext/Projection/TokenProjectionService.swift"
+            ),
+            encoding: .utf8
+        )
+        let contextRequest = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPromptCore/WorkspaceContext/Projection/WorkspaceContextProjection.swift"
+            ),
+            encoding: .utf8
+        )
+        let contextService = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPromptCore/WorkspaceContext/Projection/WorkspaceContextProjectionService.swift"
+            ),
+            encoding: .utf8
+        )
+        let adapter = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPrompt/Features/Prompt/Services/WorkspacePromptProjectionAdapter.swift"
+            ),
+            encoding: .utf8
+        )
+        let recount = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPrompt/Features/Prompt/ViewModels/TokenCountingViewModel.swift"
+            ),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(coreProjection.contains("package struct TokenProjection"))
+        XCTAssertTrue(coreService.contains("package enum TokenProjectionService"))
+        XCTAssertTrue(coreService.contains("activeLiveWorkspaceEstimates"))
+        XCTAssertTrue(contextRequest.contains("package enum WorkspaceTokenProjectionInput"))
+        XCTAssertTrue(contextService.contains("case let .activeLive(input)"))
+        XCTAssertTrue(contextService.contains("TokenProjectionService.activeLiveWorkspaceEstimates"))
+        XCTAssertTrue(adapter.contains("tokenProjectionInput: WorkspaceTokenProjectionInput"))
+        XCTAssertTrue(recount.contains("tokenProjectionInput: .activeLive"))
+        XCTAssertTrue(recount.contains(".virtualRecomputed"))
+        XCTAssertFalse(recount.contains("private let tokenCalculationService"))
+        XCTAssertFalse(recount.contains("normalizedTotal - normalizedFiles"))
+        XCTAssertFalse(adapter.contains("normalizedTotal - normalizedFiles"))
+    }
+
     func testLegacyCopyOverridesAndCustomizationsIgnoreRemovedFields() throws {
         let presetID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000456"))
         let overridesRaw = """

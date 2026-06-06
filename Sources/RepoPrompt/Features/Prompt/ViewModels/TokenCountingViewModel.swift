@@ -76,10 +76,20 @@ class TokenCountingViewModel: ObservableObject {
     private static let tokenUpdateDebounceNanoseconds: UInt64 = 500_000_000
 
     typealias ProjectionAdapterFactory = @MainActor (WorkspaceFileContextStore) -> WorkspacePromptProjectionAdapter
+    typealias AccountingOperation = (
+        PromptContextAccountingRequest,
+        WorkspaceFileContextStore
+    ) async throws -> PromptContextAccountingResult
+    typealias LightProjectionOperation = (
+        WorkspaceSelectionProjection,
+        TokenProjection.Source,
+        TokenProjectionService.WorkspaceNonFileComponents
+    ) async throws -> TokenProjectionService.WorkspaceViews
 
-    private let tokenCalculationService = TokenCalculationService()
     private let promptContextAccountingService = PromptContextAccountingService()
     private let projectionAdapterFactory: ProjectionAdapterFactory
+    private let accountingOperation: AccountingOperation?
+    private let lightProjectionOperation: LightProjectionOperation
     private var tokenUpdateDebounceTask: Task<Void, Never>?
     private var updateTokenCountTask: Task<Void, Never>?
     private var cancellables = Set<AnyCancellable>()
@@ -92,6 +102,7 @@ class TokenCountingViewModel: ObservableObject {
     private var selectionObservationRevision: UInt64 = 0
     private var lastObservedSelectionObservationRevision: UInt64 = 0
     private var automaticRecountSuspendDepth: Int = 0
+    private var heavyRecoveryAttempted = false
 
     // MARK: - Dependencies
 
@@ -144,9 +155,19 @@ class TokenCountingViewModel: ObservableObject {
     init(
         projectionAdapterFactory: @escaping ProjectionAdapterFactory = { store in
             WorkspacePromptProjectionAdapter(store: store)
+        },
+        accountingOperation: AccountingOperation? = nil,
+        lightProjectionOperation: @escaping LightProjectionOperation = { selection, source, nonFile in
+            TokenProjectionService.workspaceComponentEstimates(
+                from: selection,
+                source: source,
+                nonFile: nonFile
+            )
         }
     ) {
         self.projectionAdapterFactory = projectionAdapterFactory
+        self.accountingOperation = accountingOperation
+        self.lightProjectionOperation = lightProjectionOperation
     }
 
     func configure(
@@ -260,7 +281,6 @@ class TokenCountingViewModel: ObservableObject {
         tokenUpdateDebounceTask = nil
         updateTokenCountTask?.cancel()
         updateTokenCountTask = nil
-        await tokenCalculationService.shutdown()
     }
 
     private func scheduleTokenCountUpdateIfNeeded() {
@@ -334,6 +354,7 @@ class TokenCountingViewModel: ObservableObject {
         pendingDirty.formUnion(kind)
 
         if !kind.intersection(heavyDirtyKinds).isEmpty {
+            heavyRecoveryAttempted = false
             invalidateAcceptedSelectionProjection()
         }
 
@@ -414,6 +435,10 @@ class TokenCountingViewModel: ObservableObject {
 
         var hasAcceptedSelectionProjectionForTesting: Bool {
             acceptedSelectionProjection != nil
+        }
+
+        var publishedTokenProjectionForTesting: TokenProjection? {
+            publishedWorkspaceTokenProjection
         }
     #endif
 
@@ -510,6 +535,53 @@ class TokenCountingViewModel: ObservableObject {
         views.userConfigured ?? views.normalized
     }
 
+    private func selectedIncludedFiles(
+        from selection: WorkspaceSelectionProjection
+    ) -> [WorkspaceSelectionProjection.IncludedFile] {
+        selection.alternate?.includedFiles ?? selection.normalizedFiles
+    }
+
+    private func retryHeavyImmediatelyAfterRecoverableError(
+        _ error: Error,
+        run: RecountRun
+    ) async -> Bool {
+        guard isCurrent(run), !(error is CancellationError), !Task.isCancelled else { return false }
+        guard isRecoverableHeavyError(error), !heavyRecoveryAttempted else { return false }
+        heavyRecoveryAttempted = true
+        await performTokenCountOffMainThread(isRetry: true)
+        return true
+    }
+
+    private func isRecoverableHeavyError(_ error: Error) -> Bool {
+        if let adapterError = error as? WorkspacePromptProjectionAdapter.Error {
+            switch adapterError {
+            case .missingTokenFacts, .unusedTokenFacts, .projectionProvenanceMismatch:
+                return true
+            case .missingSelectionProjection, .missingTokenProjection:
+                return false
+            }
+        }
+        if let projectionError = error as? WorkspaceContextProjectionError {
+            switch projectionError {
+            case .captureProvenanceMismatch,
+                 .recordAssociationMismatch,
+                 .codemapAssociationMismatch,
+                 .materializationProvenanceMismatch,
+                 .missingOccurrenceIDs,
+                 .missingTokenFacts:
+                return true
+            case .duplicateRootID,
+                 .rootAssociationMismatch,
+                 .duplicateCodemapFileID,
+                 .duplicateOccurrenceID,
+                 .unexpectedOccurrenceIDs,
+                 .invalidTokenFacts:
+                return false
+            }
+        }
+        return true
+    }
+
     private func allStoreFileRecords(from store: WorkspaceFileContextStore) async -> [WorkspaceFileRecord] {
         let roots = await store.roots()
         var records: [WorkspaceFileRecord] = []
@@ -522,7 +594,10 @@ class TokenCountingViewModel: ObservableObject {
     // MARK: - Token Calculation
 
     /// Heavy path (rebuild baseline and everything else).
-    private func performTokenCountOffMainThread() async {
+    private func performTokenCountOffMainThread(isRetry: Bool = false) async {
+        if !isRetry {
+            heavyRecoveryAttempted = false
+        }
         let run = beginRecountRun()
         defer { finishRecountRun(run) }
         #if DEBUG
@@ -572,7 +647,10 @@ class TokenCountingViewModel: ObservableObject {
 
         let detectedExts = allFileRecords.map { (($0.name as NSString).pathExtension).lowercased() }
         let detectedLanguages = Set(detectedExts.compactMap { SyntaxManager.shared.extensionToLanguage[$0] })
-        let effectiveCodeMapUsage = copySnapshot.codeMapUsage
+        let normalizedCodeMapUsage: CodeMapUsage = settings.codeMapsGloballyDisabled ? .none : .auto
+        let configuredCodeMapUsage: CodeMapUsage = settings.codeMapsGloballyDisabled
+            ? .none
+            : copySnapshot.codeMapUsage
         let effectiveFileTreeOption: FileTreeOption = copySnapshot.includeFileTree
             ? copySnapshot.fileTreeMode
             : .none
@@ -583,7 +661,8 @@ class TokenCountingViewModel: ObservableObject {
                     "includeFiles": "\(includeFiles)",
                     "includeFileTree": "\(copySnapshot.includeFileTree)",
                     "fileTreeMode": "\(effectiveFileTreeOption)",
-                    "codeMapUsage": "\(effectiveCodeMapUsage)",
+                    "normalizedCodeMapUsage": "\(normalizedCodeMapUsage)",
+                    "configuredCodeMapUsage": "\(configuredCodeMapUsage)",
                     "gitInclusion": "\(copySnapshot.gitInclusion)"
                 ]
             )
@@ -615,17 +694,21 @@ class TokenCountingViewModel: ObservableObject {
             selectedInstructionsText: selectedInstructionsText,
             duplicateUserInstructionsAtTop: duplicatePromptAtTop,
             fileTree: fileTreeInput,
-            codeMapUsage: effectiveCodeMapUsage,
+            codeMapUsage: normalizedCodeMapUsage,
             filePathDisplay: settings.filePathDisplayOption,
             rootScope: .allLoaded,
             pathLocateProfile: .uiAssisted
         )
         let accountingResult: PromptContextAccountingResult
         do {
-            accountingResult = try await promptContextAccountingService.calculatePromptStats(
-                request: accountingRequest,
-                store: store
-            )
+            if let accountingOperation {
+                accountingResult = try await accountingOperation(accountingRequest, store)
+            } else {
+                accountingResult = try await promptContextAccountingService.calculatePromptStats(
+                    request: accountingRequest,
+                    store: store
+                )
+            }
         } catch {
             #if DEBUG
                 PromptTokenRecountDiagnostics.event(
@@ -637,6 +720,7 @@ class TokenCountingViewModel: ObservableObject {
                     ]
                 )
             #endif
+            _ = await retryHeavyImmediatelyAfterRecoverableError(error, run: run)
             return
         }
         guard isCurrent(run) else { return }
@@ -686,16 +770,22 @@ class TokenCountingViewModel: ObservableObject {
         do {
             adapterProjection = try await adapter.projectTokens(
                 selection: selectionAtStart,
-                codeMapUsage: effectiveCodeMapUsage,
+                codeMapUsage: normalizedCodeMapUsage,
                 filePathDisplay: settings.filePathDisplayOption,
                 alternatePolicy: .init(
                     includeFiles: includeFiles,
-                    codeMapUsage: effectiveCodeMapUsage
+                    codeMapUsage: configuredCodeMapUsage
                 ),
                 resolvedEntries: accountingResult.resolvedEntries,
                 promptFileEntrySnapshots: accountingResult.promptFileEntrySnapshots,
-                nonFileComponents: .init(breakdown: componentBreakdown),
-                tokenSource: .activeLive
+                tokenProjectionInput: .activeLive(.init(
+                    reportedTotal: detailResult.totalTokenCount + componentBreakdown.gitDiff,
+                    prompt: componentBreakdown.promptDisplay,
+                    fileTree: componentBreakdown.fileTree,
+                    meta: componentBreakdown.instructions,
+                    git: componentBreakdown.gitDiff,
+                    requestedFileTreeEstimate: detailResult.fileTreeTokenCountRaw
+                ))
             )
         } catch {
             #if DEBUG
@@ -708,6 +798,7 @@ class TokenCountingViewModel: ObservableObject {
                     ]
                 )
             #endif
+            _ = await retryHeavyImmediatelyAfterRecoverableError(error, run: run)
             return
         }
         guard isCurrent(run) else { return }
@@ -734,10 +825,7 @@ class TokenCountingViewModel: ObservableObject {
         let gitTokenString = String(format: "%.2fk", Double(gitTokens) / 1000.0)
         let projectionDetails = projectionDetailData(
             selection: adapterProjection.selection,
-            includeFiles: includeFiles,
-            totalFileTokens: components.files ?? 0,
-            fallbackFileTokenInfo: detailResult.fileTokenInfo,
-            fileManager: fileManager
+            totalFileTokens: components.files ?? 0
         )
         let selectedCharCount = includeFiles
             ? detailResult.charCount
@@ -766,7 +854,7 @@ class TokenCountingViewModel: ObservableObject {
         fileTokenInfo = projectionDetails.fileTokenInfo
         folderTokenInfo = projectionDetails.folderTokenInfo
         fileTreeContent = detailResult.fileTreeContent
-        codeMapContent = detailResult.codeMapContent
+        codeMapContent = projectionDetails.codeMapContent
         lastFileTreeTokens = fileTreeTokens
         charCount = selectedCharCount
         totalTokenCount = totalTokens
@@ -785,6 +873,7 @@ class TokenCountingViewModel: ObservableObject {
         publishedWorkspaceTokenProjection = selectedProjection
         acceptedHasSelectedArtifacts = hasSelectedArtifacts
         didComputeBaseline = true
+        heavyRecoveryAttempted = false
 
         tokenCalculationCompletedPublisher.send()
         #if DEBUG
@@ -799,44 +888,51 @@ class TokenCountingViewModel: ObservableObject {
         let fileTokenInfo: [UUID: TokenInfo]
         let folderTokenInfo: [String: TokenInfo]
         let codeMapFileCount: Int
+        let codeMapContent: String
     }
 
     private func projectionDetailData(
         selection: WorkspaceSelectionProjection,
-        includeFiles: Bool,
-        totalFileTokens: Int,
-        fallbackFileTokenInfo: [UUID: TokenInfo],
-        fileManager: WorkspaceFilesViewModel
+        totalFileTokens: Int
     ) -> ProjectionDetailData {
-        var mappedFiles: [UUID: TokenInfo] = [:]
+        let includedFiles = selectedIncludedFiles(from: selection)
+        var fileCounts: [UUID: Int] = [:]
+        var fullCounts: [UUID: Int] = [:]
+        var codemapCounts: [UUID: Int] = [:]
         var folderTokens: [String: Int] = [:]
+        var codemapContents: [String] = []
         var codeMapFileCount = 0
 
-        for file in selection.files {
-            let mode = file.alternate?.mode ?? file.mode
-            let tokens = file.alternate?.tokens ?? file.tokens
-            if mode == .hidden || (!includeFiles && mode != .codemap) {
-                continue
+        for file in includedFiles {
+            fileCounts[file.file.id, default: 0] += file.tokens
+            if let fullTokens = file.fullTokens {
+                if let existing = fullCounts[file.file.id] {
+                    assert(existing == fullTokens, "Duplicate occurrences disagree on full token facts")
+                }
+                fullCounts[file.file.id] = max(fullCounts[file.file.id] ?? 0, fullTokens)
             }
-            if mode == .codemap {
-                codeMapFileCount += 1
-            }
+            codemapCounts[file.file.id] = max(codemapCounts[file.file.id] ?? 0, file.codemapTokens)
 
-            let fallback = fallbackFileTokenInfo[file.file.id]
-            let tokenInfo = TokenInfo(
-                count: tokens,
-                fullCount: fallback?.fullCount ?? tokens,
-                codemapCount: mode == .codemap ? tokens : (fallback?.codemapCount ?? 0),
-                totalTokens: totalFileTokens
-            )
-            if let liveFile = fileManager.findFileByFullPath(file.file.standardizedFullPath),
-               liveFile.id == file.file.id
-            {
-                mappedFiles[liveFile.id] = tokenInfo
+            if file.mode == .codemap {
+                codeMapFileCount += 1
+                if let content = file.codemapContent, !content.isEmpty {
+                    codemapContents.append(content)
+                }
             }
 
             let folderPath = (file.metadata.pathWithinRoot as NSString).deletingLastPathComponent
-            folderTokens[folderPath == "." ? "" : folderPath, default: 0] += tokens
+            folderTokens[folderPath == "." ? "" : folderPath, default: 0] += file.tokens
+        }
+
+        assert(fileCounts.values.reduce(0, +) == totalFileTokens, "Projection details must match aggregate file tokens")
+        var mappedFiles: [UUID: TokenInfo] = [:]
+        for (fileID, count) in fileCounts {
+            mappedFiles[fileID] = TokenInfo(
+                count: count,
+                fullCount: fullCounts[fileID] ?? 0,
+                codemapCount: codemapCounts[fileID] ?? 0,
+                totalTokens: totalFileTokens
+            )
         }
 
         let mappedFolders = folderTokens.reduce(into: [String: TokenInfo]()) { result, item in
@@ -845,7 +941,8 @@ class TokenCountingViewModel: ObservableObject {
         return ProjectionDetailData(
             fileTokenInfo: mappedFiles,
             folderTokenInfo: mappedFolders,
-            codeMapFileCount: codeMapFileCount
+            codeMapFileCount: codeMapFileCount,
+            codeMapContent: TokenCalculationService.composeCodemapContent(codemapContents)
         )
     }
 
@@ -853,6 +950,7 @@ class TokenCountingViewModel: ObservableObject {
     private func recalculateLight(kinds: DirtyKind) async {
         guard didComputeBaseline,
               let acceptedSelectionProjection,
+              let acceptedViews = acceptedWorkspaceTokenViews,
               let promptSource = getPromptText?(),
               let instructionsSource = getSelectedInstructionsText?()
         else {
@@ -889,16 +987,28 @@ class TokenCountingViewModel: ObservableObject {
         let componentBreakdown = TokenCalculationService.calculateComponentBreakdown(
             promptText: promptText,
             selectedInstructionsText: selectedInstructionsText,
-            fileTreeText: fileTreeContent,
+            fileTreeText: "",
             gitDiffText: gitDiffText,
             metadataText: nil,
             duplicateUserInstructionsAtTop: duplicatePrompt
         )
-        let workspaceViews = TokenProjectionService.workspaceComponentEstimates(
-            from: acceptedSelectionProjection,
-            source: .activeLive,
-            nonFile: .init(breakdown: componentBreakdown)
+        let nonFile = TokenProjectionService.WorkspaceNonFileComponents(
+            prompt: componentBreakdown.promptDisplay,
+            fileTree: acceptedViews.normalized.components.fileTree ?? 0,
+            meta: componentBreakdown.instructions,
+            git: componentBreakdown.gitDiff,
+            other: acceptedViews.normalized.components.other ?? 0
         )
+        let workspaceViews: TokenProjectionService.WorkspaceViews
+        do {
+            workspaceViews = try await lightProjectionOperation(
+                acceptedSelectionProjection,
+                .virtualRecomputed,
+                nonFile
+            )
+        } catch {
+            return
+        }
         let selectedProjection = selectedTokenProjection(from: workspaceViews)
         let gitTokens = selectedProjection.components.git ?? 0
         let totalTokens = selectedProjection.total

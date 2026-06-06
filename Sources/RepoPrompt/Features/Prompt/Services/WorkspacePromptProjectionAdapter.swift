@@ -7,6 +7,7 @@ struct WorkspacePromptProjectionAdapter {
         case missingTokenProjection
         case projectionProvenanceMismatch
         case missingTokenFacts(OccurrenceIdentity)
+        case unusedTokenFacts([OccurrenceIdentity])
     }
 
     struct OccurrenceIdentity: Equatable, Hashable {
@@ -110,8 +111,7 @@ struct WorkspacePromptProjectionAdapter {
         alternatePolicy: WorkspaceSelectionProjectionRequest.AlternatePolicy?,
         resolvedEntries: [ResolvedPromptFileEntry],
         promptFileEntrySnapshots: [PromptFileEntrySnapshot],
-        nonFileComponents: TokenProjectionService.WorkspaceNonFileComponents,
-        tokenSource: TokenProjection.Source = .activeLive
+        tokenProjectionInput: WorkspaceTokenProjectionInput
     ) async throws -> TokenAwareProjection {
         let tokenFacts = try await Self.makeOccurrenceTokenFacts(
             resolvedEntries: resolvedEntries,
@@ -123,8 +123,7 @@ struct WorkspacePromptProjectionAdapter {
             filePathDisplay: filePathDisplay,
             sections: [.selection, .tokens],
             alternatePolicy: alternatePolicy,
-            tokenSource: tokenSource,
-            nonFileComponents: nonFileComponents,
+            tokenProjectionInput: tokenProjectionInput,
             materializer: { request in
                 try Self.materializeTokenProjection(request, tokenFacts: tokenFacts)
             }
@@ -171,13 +170,7 @@ struct WorkspacePromptProjectionAdapter {
         filePathDisplay: FilePathDisplay,
         sections: WorkspaceContextProjectionRequest.Sections,
         alternatePolicy: WorkspaceSelectionProjectionRequest.AlternatePolicy? = nil,
-        tokenSource: TokenProjection.Source = .virtualRecomputed,
-        nonFileComponents: TokenProjectionService.WorkspaceNonFileComponents = .init(
-            prompt: 0,
-            fileTree: 0,
-            meta: 0,
-            git: 0
-        ),
+        tokenProjectionInput: WorkspaceTokenProjectionInput = .emptyVirtual,
         materializer: @escaping WorkspaceContextProjectionService.Materializer
     ) async throws -> WorkspaceContextProjection {
         let capture = capture
@@ -203,8 +196,7 @@ struct WorkspacePromptProjectionAdapter {
             filePathDisplay: filePathDisplay,
             codeMapUsage: codeMapUsage,
             alternatePolicy: alternatePolicy,
-            tokenSource: tokenSource,
-            nonFileTokenComponents: nonFileComponents
+            tokenProjectionInput: tokenProjectionInput
         ))
     }
 
@@ -247,25 +239,35 @@ struct WorkspacePromptProjectionAdapter {
         _ request: WorkspaceContextProjectionMaterializationRequest,
         tokenFacts: [OccurrenceTokenFact]
     ) throws -> WorkspaceContextProjectionMaterialization {
-        try WorkspaceContextProjectionMaterialization(
-            provenance: request.provenance,
-            occurrences: request.occurrences.map { occurrence in
-                let identity = occurrenceIdentity(for: occurrence)
-                guard let fact = tokenFacts.first(where: {
-                    $0.identity == identity
-                        && $0.modificationDate == occurrence.file.modificationDate
-                }) else {
-                    throw Error.missingTokenFacts(identity)
-                }
-                return .init(
-                    id: occurrence.id,
-                    content: nil,
-                    tokenFacts: .init(
-                        displayTokens: fact.displayTokens,
-                        fullTokens: fact.fullTokens
-                    )
-                )
+        var remainingFacts = tokenFacts
+        var occurrences: [WorkspaceContextProjectionMaterialization.Occurrence] = []
+        occurrences.reserveCapacity(request.occurrences.count)
+
+        for occurrence in request.occurrences {
+            let identity = occurrenceIdentity(for: occurrence)
+            guard let factIndex = remainingFacts.firstIndex(where: {
+                $0.identity == identity
+                    && $0.modificationDate == occurrence.file.modificationDate
+            }) else {
+                throw Error.missingTokenFacts(identity)
             }
+            let fact = remainingFacts.remove(at: factIndex)
+            occurrences.append(.init(
+                id: occurrence.id,
+                content: nil,
+                tokenFacts: .init(
+                    displayTokens: fact.displayTokens,
+                    fullTokens: fact.fullTokens
+                )
+            ))
+        }
+
+        guard remainingFacts.isEmpty else {
+            throw Error.unusedTokenFacts(remainingFacts.map(\.identity))
+        }
+        return WorkspaceContextProjectionMaterialization(
+            provenance: request.provenance,
+            occurrences: occurrences
         )
     }
 

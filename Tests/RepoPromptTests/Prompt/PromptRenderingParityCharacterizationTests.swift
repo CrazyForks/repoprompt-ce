@@ -409,7 +409,13 @@ final class PromptRenderingParityCharacterizationTests: XCTestCase {
             alternatePolicy: .init(includeFiles: true, codeMapUsage: .complete),
             resolvedEntries: normalizedAccounting.resolvedEntries,
             promptFileEntrySnapshots: normalizedAccounting.promptFileEntrySnapshots,
-            nonFileComponents: .init(prompt: 0, fileTree: 0, meta: 0, git: 0)
+            tokenProjectionInput: .activeLive(.init(
+                reportedTotal: normalizedAccounting.tokenResult.totalTokenCount,
+                prompt: 0,
+                fileTree: 0,
+                meta: 0,
+                git: 0
+            ))
         )
 
         XCTAssertEqual(projection.selection.files.map(\.file.standardizedRelativePath), [

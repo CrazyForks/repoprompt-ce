@@ -203,7 +203,13 @@ final class WorkspacePromptProjectionAdapterTests: XCTestCase {
             alternatePolicy: .init(includeFiles: true, codeMapUsage: .selected),
             resolvedEntries: resolvedEntries,
             promptFileEntrySnapshots: snapshots,
-            nonFileComponents: .init(prompt: 7, fileTree: 5, meta: 3, git: 2)
+            tokenProjectionInput: .activeLive(.init(
+                reportedTotal: 1000,
+                prompt: 7,
+                fileTree: 5,
+                meta: 3,
+                git: 2
+            ))
         )
 
         XCTAssertEqual(projection.provenance, capture.provenance)
@@ -211,8 +217,7 @@ final class WorkspacePromptProjectionAdapterTests: XCTestCase {
         XCTAssertEqual(projection.selection.files.map(\.ranges), [nil, ranges, nil])
         XCTAssertEqual(projection.selection.files[0].alternate?.mode, .codemap)
         XCTAssertEqual(projection.selection.files[0].alternate?.tokens, fullCodemapTokens)
-        XCTAssertEqual(projection.selection.files[2].alternate?.mode, .hidden)
-        XCTAssertEqual(projection.selection.files[2].alternate?.tokens, 0)
+        XCTAssertNil(projection.selection.files[2].alternate)
         XCTAssertEqual(projection.tokens.normalized.components.files, projection.selection.summary.totalTokens)
         XCTAssertEqual(
             projection.tokens.normalized.components.filesContent,
@@ -220,11 +225,19 @@ final class WorkspacePromptProjectionAdapterTests: XCTestCase {
         )
         XCTAssertEqual(projection.tokens.normalized.components.codemaps, autoTokens)
         XCTAssertEqual(projection.tokens.normalized.components.prompt, 7)
-        XCTAssertEqual(projection.tokens.userConfigured?.components.codemaps, fullCodemapTokens)
+        XCTAssertEqual(projection.tokens.normalized.total, 1000)
+        let normalizedComponentFloor = projection.selection.summary.totalTokens + 7 + 5 + 3 + 2
+        XCTAssertEqual(projection.tokens.normalized.components.other, 1000 - normalizedComponentFloor)
+        XCTAssertEqual(
+            projection.tokens.userConfigured?.components.other,
+            projection.tokens.normalized.components.other
+        )
+        XCTAssertEqual(projection.tokens.userConfigured?.components.codemaps, fullCodemapTokens + autoTokens)
         XCTAssertEqual(
             projection.tokens.userConfigured?.components.files,
-            fullCodemapTokens + projection.selection.summary.sliceTokens
+            fullCodemapTokens + projection.selection.summary.sliceTokens + autoTokens
         )
+        XCTAssertEqual(projection.selection.alternate?.includedFiles.map(\.file.id), [full.id, sliced.id, auto.id])
     }
 
     func testTokenProjectionIncludesCompleteOnlyCodemapsAndCanHideContent() async throws {
@@ -285,15 +298,86 @@ final class WorkspacePromptProjectionAdapterTests: XCTestCase {
                     availableCodeMapTokenCount: autoTokens
                 )
             ],
-            nonFileComponents: .init(prompt: 4, fileTree: 0, meta: 0, git: 0)
+            tokenProjectionInput: .activeLive(.init(
+                reportedTotal: 0,
+                prompt: 4,
+                fileTree: 0,
+                meta: 0,
+                git: 0
+            ))
         )
 
         XCTAssertEqual(projection.selection.alternate?.codemapTokens, selectedTokens + autoTokens + completeTokens)
         XCTAssertEqual(projection.selection.alternate?.includedTotalTokens, autoTokens)
+        XCTAssertEqual(projection.selection.alternate?.includedFiles.map(\.file.id), [auto.id])
         XCTAssertEqual(projection.tokens.userConfigured?.components.files, autoTokens)
         XCTAssertEqual(projection.tokens.userConfigured?.components.filesContent, nil)
         XCTAssertEqual(projection.tokens.userConfigured?.components.codemaps, autoTokens)
         XCTAssertEqual(projection.tokens.userConfigured?.total, autoTokens + 4)
+    }
+
+    func testTokenProjectionRejectsUnusedAccountingOccurrenceFacts() async throws {
+        let root = makeRoot()
+        let selected = makeFile(root: root, path: "Selected.swift")
+        let extra = makeFile(root: root, path: "Extra.swift")
+        let selection = StoredSelection(selectedPaths: [selected.fullPath])
+        let capture = makeCapture(
+            root: root,
+            files: [selected, extra],
+            selection: selection,
+            selectedPaths: [.init(input: selected.fullPath, resolution: .file(selected))]
+        )
+        let selectedContent = "struct Selected {}\n"
+        let extraContent = "struct Extra {}\n"
+        let adapter = WorkspacePromptProjectionAdapter { _, _, _ in capture }
+
+        do {
+            _ = try await adapter.projectTokens(
+                selection: selection,
+                codeMapUsage: .none,
+                filePathDisplay: .relative,
+                alternatePolicy: nil,
+                resolvedEntries: [
+                    ResolvedPromptFileEntry(file: selected, loadedContent: selectedContent),
+                    ResolvedPromptFileEntry(file: extra, loadedContent: extraContent)
+                ],
+                promptFileEntrySnapshots: [
+                    PromptFileEntrySnapshot(
+                        fileID: selected.id,
+                        relativePath: selected.relativePath,
+                        isCodemapRequested: false,
+                        ranges: nil,
+                        cachedFullTokenCount: TokenCalculationService.estimateTokens(for: selectedContent),
+                        loadedContent: selectedContent,
+                        codeMapContent: nil,
+                        availableCodeMapTokenCount: 0
+                    ),
+                    PromptFileEntrySnapshot(
+                        fileID: extra.id,
+                        relativePath: extra.relativePath,
+                        isCodemapRequested: false,
+                        ranges: nil,
+                        cachedFullTokenCount: TokenCalculationService.estimateTokens(for: extraContent),
+                        loadedContent: extraContent,
+                        codeMapContent: nil,
+                        availableCodeMapTokenCount: 0
+                    )
+                ],
+                tokenProjectionInput: .activeLive(.init(
+                    reportedTotal: 0,
+                    prompt: 0,
+                    fileTree: 0,
+                    meta: 0,
+                    git: 0
+                ))
+            )
+            XCTFail("Expected unused accounting occurrence facts")
+        } catch let error as WorkspacePromptProjectionAdapter.Error {
+            guard case let .unusedTokenFacts(identities) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertEqual(identities.map(\.fileID), [extra.id])
+        }
     }
 
     func testTokenProjectionRejectsFactsFromAnOlderFileRevision() async throws {
@@ -344,7 +428,13 @@ final class WorkspacePromptProjectionAdapterTests: XCTestCase {
                         availableCodeMapTokenCount: 0
                     )
                 ],
-                nonFileComponents: .init(prompt: 0, fileTree: 0, meta: 0, git: 0)
+                tokenProjectionInput: .activeLive(.init(
+                    reportedTotal: 0,
+                    prompt: 0,
+                    fileTree: 0,
+                    meta: 0,
+                    git: 0
+                ))
             )
             XCTFail("Expected stale occurrence token facts")
         } catch let error as WorkspacePromptProjectionAdapter.Error {
@@ -396,7 +486,13 @@ final class WorkspacePromptProjectionAdapterTests: XCTestCase {
                         availableCodeMapTokenCount: 0
                     )
                 ],
-                nonFileComponents: .init(prompt: 0, fileTree: 0, meta: 0, git: 0)
+                tokenProjectionInput: .activeLive(.init(
+                    reportedTotal: 0,
+                    prompt: 0,
+                    fileTree: 0,
+                    meta: 0,
+                    git: 0
+                ))
             )
             XCTFail("Expected missing occurrence token facts")
         } catch let error as WorkspacePromptProjectionAdapter.Error {

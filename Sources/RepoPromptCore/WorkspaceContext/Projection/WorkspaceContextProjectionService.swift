@@ -142,7 +142,8 @@ package struct WorkspaceContextProjectionService {
                             fullTokens: tokenFacts.fullTokens,
                             codemapTokens: occurrence.codemap?.tokens ?? 0
                         ),
-                        codemapAvailable: occurrence.codemap != nil
+                        codemapAvailable: occurrence.codemap != nil,
+                        codemapContent: occurrence.codemap?.content
                     )
                 },
                 completeAlternateEntries: completeAlternateOccurrences.compactMap { prepared in
@@ -157,7 +158,8 @@ package struct WorkspaceContextProjectionService {
                             fullTokens: 0,
                             codemapTokens: codemap.tokens
                         ),
-                        codemapAvailable: true
+                        codemapAvailable: true,
+                        codemapContent: codemap.content
                     )
                 },
                 codeMapUsage: request.codeMapUsage,
@@ -248,11 +250,19 @@ package struct WorkspaceContextProjectionService {
         let tokensSection: WorkspaceContextProjection.Section<WorkspaceContextProjection.TokenViews>?
         if request.sections.contains(.tokens), let selectionProjection {
             try Task.checkCancellation()
-            let views = TokenProjectionService.workspaceComponentEstimates(
-                from: selectionProjection,
-                source: request.tokenSource,
-                nonFile: request.nonFileTokenComponents
-            )
+            let views: TokenProjectionService.WorkspaceViews = switch request.tokenProjectionInput {
+            case let .componentEstimate(source, nonFile):
+                TokenProjectionService.workspaceComponentEstimates(
+                    from: selectionProjection,
+                    source: source,
+                    nonFile: nonFile
+                )
+            case let .activeLive(input):
+                TokenProjectionService.activeLiveWorkspaceEstimates(
+                    from: selectionProjection,
+                    input: input
+                )
+            }
             tokensSection = .init(
                 provenance: capture.provenance,
                 value: .init(

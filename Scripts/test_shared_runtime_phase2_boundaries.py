@@ -59,6 +59,10 @@ REQUIRED_PROMPT_ASSEMBLY_PATHS = (
     "Sources/RepoPromptCore/Prompt/PromptRenderPolicy.swift",
     "Sources/RepoPromptCore/WorkspaceContext/Projection/WorkspaceSelectionProjection.swift",
     "Sources/RepoPromptCore/WorkspaceContext/Projection/WorkspaceSelectionProjectionService.swift",
+    "Sources/RepoPromptCore/WorkspaceContext/Projection/TokenProjection.swift",
+    "Sources/RepoPromptCore/WorkspaceContext/Projection/TokenProjectionService.swift",
+    "Sources/RepoPromptCore/WorkspaceContext/Projection/WorkspaceContextProjection.swift",
+    "Sources/RepoPromptCore/WorkspaceContext/Projection/WorkspaceContextProjectionService.swift",
     "Sources/RepoPromptCore/Prompt/PromptSection.swift",
     "Sources/RepoPrompt/Features/Prompt/Models/PromptSection+DisplayName.swift",
     "Sources/RepoPrompt/Features/Prompt/Services/PromptContextAccountingService.swift",
@@ -347,6 +351,57 @@ def main() -> int:
                 "Core selection projection service must remain synchronous and request-scoped: "
                 f"{forbidden_service_token}"
             )
+
+    core_token_projection_source = (
+        ROOT / "Sources/RepoPromptCore/WorkspaceContext/Projection/TokenProjection.swift"
+    ).read_text()
+    core_token_projection_service_source = (
+        ROOT / "Sources/RepoPromptCore/WorkspaceContext/Projection/TokenProjectionService.swift"
+    ).read_text()
+    core_context_projection_source = (
+        ROOT / "Sources/RepoPromptCore/WorkspaceContext/Projection/WorkspaceContextProjection.swift"
+    ).read_text()
+    core_context_projection_service_source = (
+        ROOT / "Sources/RepoPromptCore/WorkspaceContext/Projection/WorkspaceContextProjectionService.swift"
+    ).read_text()
+    app_projection_adapter_source = (
+        ROOT / "Sources/RepoPrompt/Features/Prompt/Services/WorkspacePromptProjectionAdapter.swift"
+    ).read_text()
+    app_token_recount_source = (
+        ROOT / "Sources/RepoPrompt/Features/Prompt/ViewModels/TokenCountingViewModel.swift"
+    ).read_text()
+    if token_files("package struct TokenProjection", ROOT / "Sources") != [
+        "Sources/RepoPromptCore/WorkspaceContext/Projection/TokenProjection.swift"
+    ]:
+        fail("Canonical TokenProjection ownership must remain in RepoPromptCore")
+    if token_files("package enum TokenProjectionService", ROOT / "Sources") != [
+        "Sources/RepoPromptCore/WorkspaceContext/Projection/TokenProjectionService.swift"
+    ]:
+        fail("Canonical TokenProjectionService ownership must remain in RepoPromptCore")
+    if "package enum WorkspaceTokenProjectionInput" not in core_context_projection_source:
+        fail("Typed workspace token projection input must remain Core-owned")
+    if "TokenProjectionService.activeLiveWorkspaceEstimates" not in core_context_projection_service_source:
+        fail("Workspace context projection must delegate active-live repair to TokenProjectionService")
+    if "tokenProjectionInput: WorkspaceTokenProjectionInput" not in app_projection_adapter_source:
+        fail("App workspace projection adapter must forward the typed Core token input")
+    if "tokenProjectionInput: .activeLive" not in app_token_recount_source:
+        fail("Active recount must request canonical active-live projection semantics")
+    if ".virtualRecomputed" not in app_token_recount_source:
+        fail("Light recount must retain virtual recomputation provenance")
+    for forbidden_app_recount_token in (
+        "private let tokenCalculationService",
+        "normalizedTotal - normalizedFiles",
+        "max(userComponentSum, replacementTotal)",
+    ):
+        if forbidden_app_recount_token in app_token_recount_source or forbidden_app_recount_token in app_projection_adapter_source:
+            fail(f"App recount reconstructs canonical token arithmetic: {forbidden_app_recount_token}")
+    for required_core_token in (
+        "package struct TokenProjection",
+        "package enum TokenProjectionService",
+        "activeLiveWorkspaceEstimates",
+    ):
+        if required_core_token not in core_token_projection_source + core_token_projection_service_source:
+            fail(f"Canonical Core token projection declaration missing: {required_core_token}")
 
     for retired_app_helper in (
         "private static func renderFullFileBlock",
