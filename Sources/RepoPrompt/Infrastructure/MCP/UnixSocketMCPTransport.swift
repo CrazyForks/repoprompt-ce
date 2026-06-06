@@ -21,6 +21,85 @@ import RepoPromptShared
     private func unixSocketMCPTransportDebugLog(_ message: @autoclosure () -> String) {}
 #endif
 
+private final class MCPTransportIngressGate: @unchecked Sendable {
+    enum OfferResult {
+        case accepted
+        case overflow(MCPReceiveBufferOverflowError)
+        case terminal
+    }
+
+    private let lock = NSLock()
+    private let capacity: Int
+    private var acceptedFrameCount = 0
+    private var droppedFrameCount = 0
+    private var highWaterMark = 0
+    private var isTerminal = false
+    private var terminalCause: MCPTransportTerminalCause?
+
+    init(capacity: Int) {
+        self.capacity = max(1, capacity)
+    }
+
+    func offer(
+        _ frame: Data,
+        to continuation: AsyncThrowingStream<Data, Swift.Error>.Continuation
+    ) -> OfferResult {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard !isTerminal else {
+            return .terminal
+        }
+
+        switch continuation.yield(frame) {
+        case let .enqueued(remainingCapacity):
+            acceptedFrameCount += 1
+            highWaterMark = max(highWaterMark, capacity - remainingCapacity)
+            return .accepted
+        case .dropped:
+            droppedFrameCount += 1
+            highWaterMark = capacity
+            isTerminal = true
+            terminalCause = .receiveBufferOverflow
+            return .overflow(MCPReceiveBufferOverflowError(
+                capacity: capacity,
+                highWaterMark: highWaterMark
+            ))
+        case .terminated:
+            isTerminal = true
+            return .terminal
+        @unknown default:
+            isTerminal = true
+            return .terminal
+        }
+    }
+
+    func closeAndSnapshot() -> MCPTransportIngressSnapshot {
+        lock.lock()
+        isTerminal = true
+        let snapshot = makeSnapshot()
+        lock.unlock()
+        return snapshot
+    }
+
+    func snapshot() -> MCPTransportIngressSnapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return makeSnapshot()
+    }
+
+    private func makeSnapshot() -> MCPTransportIngressSnapshot {
+        MCPTransportIngressSnapshot(
+            receiveBufferCapacity: capacity,
+            acceptedFrameCount: acceptedFrameCount,
+            droppedFrameCount: droppedFrameCount,
+            receiveBufferHighWaterMark: highWaterMark,
+            isTerminal: isTerminal,
+            terminalCause: terminalCause
+        )
+    }
+}
+
 /// A Transport implementation using UNIX domain sockets for local MCP communication.
 ///
 /// This transport connects to a UNIX socket created by the CLI within a connection folder.
@@ -41,6 +120,7 @@ public actor UnixSocketMCPTransport: Transport {
     // Message stream for received data
     private nonisolated let messageStream: AsyncThrowingStream<Data, Swift.Error>
     private var messageContinuation: AsyncThrowingStream<Data, Swift.Error>.Continuation
+    private let ingressGate: MCPTransportIngressGate
 
     // Close notification stream for cleanup signaling
     private nonisolated let closeStream: AsyncStream<Void>
@@ -78,6 +158,8 @@ public actor UnixSocketMCPTransport: Transport {
     #if DEBUG
         /// Forces the adopted-FD startup path to fail after preparation but before reader ownership.
         private var failNextExistingFDConnectBeforeReaderStart = false
+        /// Leaves a selected overflow pending so tests can race it with another teardown path.
+        private var deferNextReceiveOverflowTeardown = false
     #endif
 
     /// Generation counter that increments on each connection close/open cycle.
@@ -103,19 +185,22 @@ public actor UnixSocketMCPTransport: Transport {
         socketURL: URL,
         logger: Logger? = nil,
         writeStallTimeout: TimeInterval = 30.0,
-        writePollIntervalMilliseconds: Int32 = 250
+        writePollIntervalMilliseconds: Int32 = 250,
+        receiveBufferCapacity: Int = 1024
     ) {
+        let sanitizedReceiveBufferCapacity = max(1, receiveBufferCapacity)
         self.socketURL = socketURL
         ownsExistingFD = false
         self.logger = Self.createLogger(logger)
         self.writeStallTimeout = writeStallTimeout
         self.writePollIntervalMilliseconds = Self.sanitizedWritePollIntervalMilliseconds(writePollIntervalMilliseconds)
+        ingressGate = MCPTransportIngressGate(capacity: sanitizedReceiveBufferCapacity)
 
         // Initialize streams
         var msgCont: AsyncThrowingStream<Data, Swift.Error>.Continuation!
         messageStream = AsyncThrowingStream(
             Data.self,
-            bufferingPolicy: .bufferingOldest(1024)
+            bufferingPolicy: .bufferingOldest(sanitizedReceiveBufferCapacity)
         ) { continuation in
             msgCont = continuation
         }
@@ -137,8 +222,10 @@ public actor UnixSocketMCPTransport: Transport {
         connectedFD: Int32,
         logger: Logger? = nil,
         writeStallTimeout: TimeInterval = 30.0,
-        writePollIntervalMilliseconds: Int32 = 250
+        writePollIntervalMilliseconds: Int32 = 250,
+        receiveBufferCapacity: Int = 1024
     ) throws {
+        let sanitizedReceiveBufferCapacity = max(1, receiveBufferCapacity)
         do {
             try POSIXDescriptorSupport.setCloseOnExec(connectedFD)
         } catch {
@@ -156,12 +243,13 @@ public actor UnixSocketMCPTransport: Transport {
         self.logger = Self.createLogger(logger)
         self.writeStallTimeout = writeStallTimeout
         self.writePollIntervalMilliseconds = Self.sanitizedWritePollIntervalMilliseconds(writePollIntervalMilliseconds)
+        ingressGate = MCPTransportIngressGate(capacity: sanitizedReceiveBufferCapacity)
 
         // Initialize streams
         var msgCont: AsyncThrowingStream<Data, Swift.Error>.Continuation!
         messageStream = AsyncThrowingStream(
             Data.self,
-            bufferingPolicy: .bufferingOldest(1024)
+            bufferingPolicy: .bufferingOldest(sanitizedReceiveBufferCapacity)
         ) { continuation in
             msgCont = continuation
         }
@@ -300,6 +388,10 @@ public actor UnixSocketMCPTransport: Transport {
         closeStream
     }
 
+    func ingressSnapshot() -> MCPTransportIngressSnapshot {
+        ingressGate.snapshot()
+    }
+
     /// Returns seconds since last activity, or nil if never active.
     public func secondsSinceLastActivity() -> TimeInterval? {
         guard let lastActivityTime else { return nil }
@@ -388,7 +480,21 @@ public actor UnixSocketMCPTransport: Transport {
     /// Wakes blocked I/O and deterministically transfers final-close responsibility.
     /// If a reader exists, its cancel handler remains the sole final-close owner to
     /// avoid a stale callback closing a reused descriptor number.
-    private func tearDownSocket(error: Swift.Error?) {
+    private func tearDownSocket(error proposedError: Swift.Error?) {
+        guard !streamFinished else { return }
+        let ingressSnapshot = ingressGate.closeAndSnapshot()
+        let resolvedError: Swift.Error? = if ingressSnapshot.terminalCause == .receiveBufferOverflow {
+            MCPReceiveBufferOverflowError(
+                capacity: ingressSnapshot.receiveBufferCapacity,
+                highWaterMark: ingressSnapshot.receiveBufferHighWaterMark
+            )
+        } else {
+            proposedError
+        }
+        if ingressSnapshot.terminalCause == .receiveBufferOverflow {
+            readError = resolvedError
+            logger.error("UnixSocketMCPTransport ingress terminated: \(String(describing: resolvedError))")
+        }
         isConnected = false
         isStopping = true
 
@@ -399,7 +505,7 @@ public actor UnixSocketMCPTransport: Transport {
         if !pendingReaderCancellationOwnsCurrentSocket() {
             closeSocket()
         }
-        transitionToClosed(error: error)
+        transitionToClosed(error: resolvedError)
     }
 
     private func connectExistingFD() throws {
@@ -456,6 +562,10 @@ public actor UnixSocketMCPTransport: Transport {
 
         func debugFailNextExistingFDConnectBeforeReaderStart() {
             failNextExistingFDConnectBeforeReaderStart = true
+        }
+
+        func debugDeferNextReceiveOverflowTeardown() {
+            deferNextReceiveOverflowTeardown = true
         }
     #endif
 
@@ -625,15 +735,24 @@ public actor UnixSocketMCPTransport: Transport {
         readSourceSocketOwnershipGeneration = socketOwnershipGeneration
 
         let cont = messageContinuation
+        let ingressGate = ingressGate
         let log = logger
 
         let newReader = NewlineDelimitedSocketReader(
             fd: fd,
             queue: readQueue,
             logger: log,
-            onFrame: { frame in
-                mcpTransportLog("UnixSocketMCPTransport yielding message of \(frame.count) bytes")
-                cont.yield(frame)
+            onFrame: { [weak self] frame in
+                guard let self else { return }
+                switch ingressGate.offer(frame, to: cont) {
+                case .accepted:
+                    mcpTransportLog("UnixSocketMCPTransport accepted message of \(frame.count) bytes")
+                case let .overflow(error):
+                    mcpConnectionLog("UnixSocketMCPTransport receive buffer overflow; terminating connection")
+                    Task { await self.handleReceiveBufferOverflow(error) }
+                case .terminal:
+                    break
+                }
             },
             onEOF: { hasResidual in
                 mcpConnectionLog("UnixSocketMCPTransport received EOF")
@@ -716,6 +835,18 @@ public actor UnixSocketMCPTransport: Transport {
             socketFD = -1
             socketOwnershipGeneration &+= 1
         }
+    }
+
+    private func handleReceiveBufferOverflow(_ error: MCPReceiveBufferOverflowError) {
+        guard !streamFinished else { return }
+        #if DEBUG
+            if deferNextReceiveOverflowTeardown {
+                deferNextReceiveOverflowTeardown = false
+                return
+            }
+        #endif
+        readError = error
+        tearDownSocket(error: error)
     }
 
     /// Called when read encounters an error.
