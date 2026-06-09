@@ -67,6 +67,67 @@ final class MCPBootstrapLeaseTests: XCTestCase {
             throw XCTSkip("Gate ownership inspection is DEBUG-only.")
         #endif
     }
+
+    func testDeferredRoutingReleaseFreesGateAndTerminalCleanupClearsPolicy() async throws {
+        #if DEBUG
+            let leaseGateID = UUID()
+            let probeGateID = UUID()
+            let runID = UUID()
+            let recorder = PolicyRecorder()
+
+            await HeadlessAgentConnectionGate.cancelAll()
+            await MCPRoutingWaiter.cleanup(runID: runID)
+
+            let lease = MCPBootstrapLease(
+                spec: MCPBootstrapLeaseSpec(
+                    runID: runID,
+                    gateID: leaseGateID,
+                    windowID: 1,
+                    tabID: nil,
+                    clientName: "bootstrap-lease-deferred-test",
+                    restrictedTools: [],
+                    additionalTools: nil,
+                    oneShot: true,
+                    reason: "deferred routing regression",
+                    ttl: 10,
+                    purpose: .agentModeRun,
+                    taskLabelKind: nil,
+                    allowsAgentExternalControlTools: false,
+                    requiresExpectedAgentPID: false
+                ),
+                policyInstaller: { _ in await recorder.recordInstall() },
+                policyClearer: { _ in await recorder.recordClear() }
+            )
+
+            let acquired = await lease.acquire()
+            XCTAssertTrue(acquired)
+            let installCount = await recorder.installCount
+            let activeGateAfterAcquire = await HeadlessAgentConnectionGate.shared.debugActiveConnectionID()
+            XCTAssertEqual(installCount, 1)
+            XCTAssertEqual(activeGateAfterAcquire, leaseGateID)
+
+            await lease.releaseGateForDeferredRouting()
+            let activeGateAfterDeferredRelease = await HeadlessAgentConnectionGate.shared.debugActiveConnectionID()
+            let clearCountAfterDeferredRelease = await recorder.clearCount
+            XCTAssertNil(activeGateAfterDeferredRelease)
+            XCTAssertEqual(clearCountAfterDeferredRelease, 0)
+
+            let didAcquireProbe = await HeadlessAgentConnectionGate.acquire(probeGateID)
+            XCTAssertTrue(didAcquireProbe)
+            let activeProbeGate = await HeadlessAgentConnectionGate.shared.debugActiveConnectionID()
+            XCTAssertEqual(activeProbeGate, probeGateID)
+            await HeadlessAgentConnectionGate.completeConnection(probeGateID)
+
+            await lease.cleanupDeferredRouting()
+            let clearCountAfterCleanup = await recorder.clearCount
+            let continuationCount = await MCPRoutingWaiter.debugContinuationCount(runID: runID)
+            XCTAssertEqual(clearCountAfterCleanup, 1)
+            XCTAssertEqual(continuationCount, 0)
+            await MCPRoutingWaiter.cleanup(runID: runID)
+        #else
+            throw XCTSkip("Gate ownership inspection is DEBUG-only.")
+        #endif
+    }
 }
 
 private actor PolicyRecorder {

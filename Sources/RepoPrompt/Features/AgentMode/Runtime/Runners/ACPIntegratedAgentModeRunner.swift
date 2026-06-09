@@ -217,15 +217,24 @@ final class ACPIntegratedAgentModeRunner {
 
         await controller.setExpectedMCPRunID(runID)
         session.acpController = controller
+        let requiresPrePromptMCPRouting = runRequest.agentKind.requiresPrePromptAgentModeMCPRouting
         session.installRunAttemptTerminalResources(ownership: ownership) { [weak self] terminalState in
             let trackerTeardown = self?.prepareToolTrackingTeardown(for: session, matchingRunID: runID)
             return {
                 await trackerTeardown?()
                 switch terminalState {
                 case .failed:
-                    await lease.failAndRelease()
+                    if requiresPrePromptMCPRouting {
+                        await lease.failAndRelease()
+                    } else {
+                        await lease.failAndCleanup()
+                    }
                 case .cancelled:
                     await lease.cancelAndCleanup()
+                case .completed:
+                    if !requiresPrePromptMCPRouting {
+                        await lease.cleanupDeferredRouting()
+                    }
                 default:
                     break
                 }
@@ -483,21 +492,26 @@ final class ACPIntegratedAgentModeRunner {
             try await applyRequestedSessionModeIfNeeded(runRequest.sessionModeID, controller: controller, runID: runID)
             setRunningStatus(waitingForConnectionStatusText(for: runRequest.agentKind), source: .transport, session: session, urgent: true)
 
-            let routed = await lease.releaseWhenRouted()
-            log("releaseWhenRouted routed=\(routed)", runID: runID)
-            guard routed else {
-                await finalize(
-                    session: session,
-                    runID: runID,
-                    runAttemptID: runAttemptID,
-                    controller: controller,
-                    attachmentReservationID: attachmentReservationID,
-                    terminalState: .failed,
-                    errorText: "RepoPrompt MCP routing did not complete before \(runRequest.agentKind.displayName) ACP prompt submission.",
-                    notifyTurnComplete: false,
-                    shouldShutdownController: true
-                )
-                return
+            if runRequest.agentKind.requiresPrePromptAgentModeMCPRouting {
+                let routed = await lease.releaseWhenRouted()
+                log("releaseWhenRouted routed=\(routed)", runID: runID)
+                guard routed else {
+                    await finalize(
+                        session: session,
+                        runID: runID,
+                        runAttemptID: runAttemptID,
+                        controller: controller,
+                        attachmentReservationID: attachmentReservationID,
+                        terminalState: .failed,
+                        errorText: "RepoPrompt MCP routing did not complete before \(runRequest.agentKind.displayName) ACP prompt submission.",
+                        notifyTurnComplete: false,
+                        shouldShutdownController: true
+                    )
+                    return
+                }
+            } else {
+                await lease.releaseGateForDeferredRouting()
+                log("deferred MCP routing until ACP prompt", runID: runID)
             }
 
             await runPromptTurn(
