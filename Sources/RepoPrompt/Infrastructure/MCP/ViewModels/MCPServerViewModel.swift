@@ -753,8 +753,8 @@ final class MCPServerViewModel: ObservableObject {
             return await computeSelectionSlicesVirtual(base: base, entries: entries, mode: mode, lookupRootScope: lookupRootScope)
         },
         persistResolvedTabContextSnapshot: { [weak self] resolvedContext, metadata, mutated in
-            guard let self else { return }
-            await persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: mutated)
+            guard let self else { return nil }
+            return await persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: mutated)
         },
         makeSelectionHintError: { [weak self] paths, operation, lookupRootScope in
             guard let self else { return "Window deallocated while resolving selection inputs." }
@@ -762,7 +762,7 @@ final class MCPServerViewModel: ObservableObject {
         },
         performFileAction: { [weak self] action, path, content, newPath, ifExists in
             guard let self else { throw MCPError.internalError("Window deallocated while performing file action") }
-            try await performFileAction(action: action, path: path, content: content, newPath: newPath, ifExists: ifExists)
+            return try await performFileAction(action: action, path: path, content: content, newPath: newPath, ifExists: ifExists)
         },
         buildCodeStructureDTO: { [weak self] files, maxResults, includeUnmappedPaths, projection in
             guard let self else { throw MCPError.internalError("Window deallocated while building code structure") }
@@ -2816,12 +2816,19 @@ final class MCPServerViewModel: ObservableObject {
                 return
             }
             resolvedContext.snapshot.selection = clearedSelection
-            await EditFlowPerf.measure(
+            let verification = await EditFlowPerf.measure(
                 EditFlowPerf.Stage.ReadFile.AutoSelect.persistence,
                 EditFlowPerf.Dimensions(outcome: "attempted")
             ) {
                 await persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: true)
             }
+            _ = try MCPSelectionToolProvider.requireCanonicalSelection(
+                verification,
+                requested: clearedSelection,
+                tabID: resolvedContext.snapshot.tabID,
+                operation: "read_file auto-selection",
+                recovery: "Retry the read or manage_selection for the same context_id before relying on the selection."
+            )
             #if DEBUG || EDIT_FLOW_PERF
                 fullFlowOutcome = "changed"
             #endif
@@ -2925,6 +2932,10 @@ final class MCPServerViewModel: ObservableObject {
             readFileAutoSelectionCoordinator.setCanonicalApplyGateForTesting(gate)
         }
 
+        @MainActor
+        func readFileAutoSelectionDiagnosticsSnapshot() -> MCPReadFileAutoSelectionCoordinator.DebugSnapshot {
+            readFileAutoSelectionCoordinator.debugSnapshot()
+        }
     #endif
 
     @MainActor
@@ -3248,7 +3259,14 @@ final class MCPServerViewModel: ObservableObject {
         )
         if computed.mutated {
             resolvedContext.snapshot.selection = computed.selection
-            await persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: true)
+            let verification = await persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: true)
+            _ = try MCPSelectionToolProvider.requireCanonicalSelection(
+                verification,
+                requested: computed.selection,
+                tabID: resolvedContext.snapshot.tabID,
+                operation: "selection slice update",
+                recovery: "Retry the selection slice mutation for the same context_id before continuing."
+            )
         }
         return computed.result
     }
@@ -3498,7 +3516,7 @@ final class MCPServerViewModel: ObservableObject {
         try Task.checkCancellation()
         let store = promptVM.workspaceFileContextStore
         let readableService = WorkspaceReadableFileService(store: store)
-        await readableService.awaitFreshnessForExplicitRequest(path, fallbackScope: lookupRootScope)
+        try await readableService.awaitFreshnessForExplicitRequest(path, fallbackScope: lookupRootScope)
         try Task.checkCancellation()
         let (roots, readableFile): ([WorkspaceRootRef], WorkspaceReadableFileHandle?) = try await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.resolveReadableFile) {
             let exactPathIssueDetection = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.exactPathIssueDetection)
@@ -3716,7 +3734,7 @@ final class MCPServerViewModel: ObservableObject {
         content: String? = nil,
         newPath: String? = nil,
         ifExists: String? = nil
-    ) async throws {
+    ) async throws -> String? {
         // Enforce workspace presence in multi-window mode
         try await requireWorkspaceForTool(MCPWindowToolName.fileActions)
         let metadata = await captureRequestMetadata()
@@ -3802,10 +3820,22 @@ final class MCPServerViewModel: ObservableObject {
                 mode: "full",
                 lookupRootScope: lookupContext.rootScope
             )
-            guard addResult.selection != resolvedContext.snapshot.selection else { return }
+            guard addResult.selection != resolvedContext.snapshot.selection else { return nil }
             resolvedContext.snapshot.selection = addResult.selection
-            await persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: true)
+            let verification = await persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: true)
+            do {
+                _ = try MCPSelectionToolProvider.requireCanonicalSelection(
+                    verification,
+                    requested: addResult.selection,
+                    tabID: resolvedContext.snapshot.tabID,
+                    operation: "file_actions create selection update",
+                    recovery: "Retry manage_selection for the same context_id."
+                )
+            } catch {
+                return "The file was created, but its selection was not confirmed. \(error)"
+            }
         }
+        return nil
     }
 
     /// Creates a **new** file, with optional overwrite behavior.
