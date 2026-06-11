@@ -107,6 +107,9 @@ final class MCPToolExecutionContractTests: XCTestCase {
             ("normalized switch", ["action": .string("  SwItCh  ")]),
             ("create default", ["action": .string("create")]),
             ("create true", ["action": .string("create"), "switch_to_created": .bool(true)]),
+            // The handler resolves a present-but-non-bool flag as `?? true` and switches,
+            // so the contract must keep the watchdog on that path.
+            ("create malformed flag", ["action": .string("create"), "switch_to_created": .string("true")]),
             ("delete close window", ["action": .string("delete"), "close_window": .bool(true)])
         ]
 
@@ -125,7 +128,6 @@ final class MCPToolExecutionContractTests: XCTestCase {
         let unboundedCases: [(label: String, arguments: [String: Value])] = [
             ("list", ["action": .string("list")]),
             ("create false", ["action": .string("create"), "switch_to_created": .bool(false)]),
-            ("create malformed flag", ["action": .string("create"), "switch_to_created": .string("true")]),
             ("delete default", ["action": .string("delete")]),
             ("delete false", ["action": .string("delete"), "close_window": .bool(false)]),
             ("delete malformed flag", ["action": .string("delete"), "close_window": .string("true")]),

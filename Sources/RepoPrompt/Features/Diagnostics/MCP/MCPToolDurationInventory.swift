@@ -148,7 +148,7 @@ import RepoPromptShared
                     ),
                     ConditionalExecutionOverride(
                         action: "create",
-                        condition: "switch_to_created omitted or true",
+                        condition: "switch_to_created != false (handler default)",
                         executionDeadlineSeconds: workspaceSwitchExecutionDeadlineSeconds,
                         cleanupGraceSeconds: boundedCleanupGraceSeconds
                     ),

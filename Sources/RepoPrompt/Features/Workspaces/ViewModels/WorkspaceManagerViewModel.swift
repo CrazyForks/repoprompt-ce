@@ -460,8 +460,10 @@ class WorkspaceManagerViewModel: ObservableObject {
     private var pendingSwitchConfirmationRequest: PendingSwitchConfirmationRequest?
     private let switchSessionRegistry = WorkspaceSwitchSessionRegistry()
     private let switchTimingPolicy: WorkspaceSwitchTimingPolicy
-    private var workspaceSwitchPhaseDidChangeHandlerForTesting: ((WorkspaceSwitchPhase) -> Void)?
-    private var workspaceSwitchRecoveryWillBeginHandlerForTesting: (@MainActor () async -> Void)?
+    #if DEBUG
+        private var workspaceSwitchPhaseDidChangeHandlerForTesting: ((WorkspaceSwitchPhase) -> Void)?
+        private var workspaceSwitchRecoveryWillBeginHandlerForTesting: (@MainActor () async -> Void)?
+    #endif
 
     private struct WorkspaceDidSwitchListener {
         let label: String
@@ -1908,7 +1910,9 @@ class WorkspaceManagerViewModel: ObservableObject {
             startedAt: activity.startedAt,
             phaseStartedAt: switchTimingPolicy.now()
         )
-        workspaceSwitchPhaseDidChangeHandlerForTesting?(phase)
+        #if DEBUG
+            workspaceSwitchPhaseDidChangeHandlerForTesting?(phase)
+        #endif
     }
 
     private func finishWorkspaceSwitchOperation(_ operationID: UUID) {
@@ -1972,7 +1976,9 @@ class WorkspaceManagerViewModel: ObservableObject {
             startedAt: activity.startedAt,
             phaseStartedAt: switchTimingPolicy.now()
         )
-        workspaceSwitchPhaseDidChangeHandlerForTesting?(.preparing)
+        #if DEBUG
+            workspaceSwitchPhaseDidChangeHandlerForTesting?(.preparing)
+        #endif
     }
 
     private func completeWorkspaceSwitchOperation(
@@ -2038,9 +2044,11 @@ class WorkspaceManagerViewModel: ObservableObject {
             }
         }
         committedWorkspaceSwitchOperationID = nil
-        if let workspaceSwitchRecoveryWillBeginHandlerForTesting {
-            await workspaceSwitchRecoveryWillBeginHandlerForTesting()
-        }
+        #if DEBUG
+            if let workspaceSwitchRecoveryWillBeginHandlerForTesting {
+                await workspaceSwitchRecoveryWillBeginHandlerForTesting()
+            }
+        #endif
 
         var failures: [String] = []
         for recoveryTarget in recoveryTargets {
@@ -2178,9 +2186,10 @@ class WorkspaceManagerViewModel: ObservableObject {
             )
         }
         if newWorkspace.id == activeWorkspaceID {
-            return userVisibleWorkspaceSwitchResult(
-                .blocked("Already on workspace \"\(newWorkspace.name)\".")
-            )
+            // Benign no-op (launch restore, save-and-exit on the system workspace, MCP
+            // switch to the current workspace): stay silent instead of raising the
+            // blocked-notice alert reserved for actionable blockages.
+            return .blocked("Already on workspace \"\(newWorkspace.name)\".")
         }
         if isRefreshing {
             return userVisibleWorkspaceSwitchResult(
@@ -2352,17 +2361,19 @@ class WorkspaceManagerViewModel: ObservableObject {
         pendingWorkspaceSwitchBlockedNotice = nil
     }
 
-    func setWorkspaceSwitchPhaseDidChangeHandlerForTesting(
-        _ handler: ((WorkspaceSwitchPhase) -> Void)?
-    ) {
-        workspaceSwitchPhaseDidChangeHandlerForTesting = handler
-    }
+    #if DEBUG
+        func setWorkspaceSwitchPhaseDidChangeHandlerForTesting(
+            _ handler: ((WorkspaceSwitchPhase) -> Void)?
+        ) {
+            workspaceSwitchPhaseDidChangeHandlerForTesting = handler
+        }
 
-    func setWorkspaceSwitchRecoveryWillBeginHandlerForTesting(
-        _ handler: (@MainActor () async -> Void)?
-    ) {
-        workspaceSwitchRecoveryWillBeginHandlerForTesting = handler
-    }
+        func setWorkspaceSwitchRecoveryWillBeginHandlerForTesting(
+            _ handler: (@MainActor () async -> Void)?
+        ) {
+            workspaceSwitchRecoveryWillBeginHandlerForTesting = handler
+        }
+    #endif
 
     @discardableResult
     func reactivateWorkspaceAfterReplacement(
@@ -2844,9 +2855,11 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     @MainActor
     private func exitToSystemWorkspaceAfterCancellation() async {
-        if let workspaceSwitchRecoveryWillBeginHandlerForTesting {
-            await workspaceSwitchRecoveryWillBeginHandlerForTesting()
-        }
+        #if DEBUG
+            if let workspaceSwitchRecoveryWillBeginHandlerForTesting {
+                await workspaceSwitchRecoveryWillBeginHandlerForTesting()
+            }
+        #endif
         let fallback = workspaces.first(where: { $0.isSystemWorkspace }) ?? getOrCreateSystemWorkspace()
         guard activeWorkspaceID != fallback.id else { return }
         await switchWorkspace(to: fallback, saveState: false)

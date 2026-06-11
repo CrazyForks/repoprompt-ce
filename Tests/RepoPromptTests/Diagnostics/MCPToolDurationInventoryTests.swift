@@ -111,7 +111,7 @@ import XCTest
                     ),
                     .init(
                         action: "create",
-                        condition: "switch_to_created omitted or true",
+                        condition: "switch_to_created != false (handler default)",
                         executionDeadlineSeconds: Double(MCPTimeoutPolicy.workspaceSwitchToolExecutionDeadlineSeconds),
                         cleanupGraceSeconds: Double(MCPTimeoutPolicy.boundedToolCancellationCleanupGraceSeconds)
                     ),
@@ -211,7 +211,7 @@ import XCTest
             )
             XCTAssertEqual(
                 conditionalOverrides.map { $0["condition"] as? String },
-                ["always", "switch_to_created omitted or true", "close_window == true"]
+                ["always", "switch_to_created != false (handler default)", "close_window == true"]
             )
 
             for forbiddenKey in [

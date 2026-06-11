@@ -48,11 +48,16 @@ final class WorkspaceSwitchPresentationTests: XCTestCase {
     func testBlockedResultsPublishSharedNoticeAndStaleDismissalCannotClearReplacement() async throws {
         let manager = makeComposition().workspaceManager
         await manager.awaitInitialized()
-        let active = try XCTUnwrap(manager.activeWorkspace)
 
-        let firstResult = await manager.requestWorkspaceSwitch(to: active, reason: "blockedNoticeFirst")
+        manager.isRefreshing = true
+        let firstTarget = manager.createWorkspace(
+            name: "Blocked Notice First Target \(UUID().uuidString.prefix(8))",
+            repoPaths: [],
+            ephemeral: true
+        )
+        let firstResult = await manager.requestWorkspaceSwitch(to: firstTarget, reason: "blockedNoticeFirst")
         guard case let .blocked(firstMessage) = firstResult else {
-            return XCTFail("Expected active-workspace request to be blocked")
+            return XCTFail("Expected refresh-state request to be blocked")
         }
         let firstNotice = try XCTUnwrap(manager.pendingWorkspaceSwitchBlockedNotice)
         XCTAssertEqual(firstNotice.message, firstMessage)
@@ -61,7 +66,6 @@ final class WorkspaceSwitchPresentationTests: XCTestCase {
             noticeID: firstNotice.id
         )
 
-        manager.isRefreshing = true
         let target = manager.createWorkspace(
             name: "Blocked Notice Target \(UUID().uuidString.prefix(8))",
             repoPaths: [],
@@ -87,17 +91,40 @@ final class WorkspaceSwitchPresentationTests: XCTestCase {
         manager.isRefreshing = false
     }
 
-    func testSuccessfulSwitchDoesNotClearUnrelatedBlockedNotice() async throws {
+    func testActiveWorkspaceRequestIsBlockedWithoutPublishingNotice() async throws {
         let manager = makeComposition().workspaceManager
         await manager.awaitInitialized()
         let active = try XCTUnwrap(manager.activeWorkspace)
 
+        let result = await manager.requestWorkspaceSwitch(to: active, reason: "sameWorkspaceNoOp")
+
+        guard case let .blocked(message) = result else {
+            return XCTFail("Expected active-workspace request to be blocked")
+        }
+        XCTAssertEqual(message, "Already on workspace \"\(active.name)\".")
+        XCTAssertNil(
+            manager.pendingWorkspaceSwitchBlockedNotice,
+            "Benign same-workspace requests (launch restore, save-and-exit on the fallback, MCP switch to current) must not raise the blocked alert"
+        )
+    }
+
+    func testSuccessfulSwitchDoesNotClearUnrelatedBlockedNotice() async throws {
+        let manager = makeComposition().workspaceManager
+        await manager.awaitInitialized()
+
+        manager.isRefreshing = true
+        let blockedTarget = manager.createWorkspace(
+            name: "Unrelated Blocked Target \(UUID().uuidString.prefix(8))",
+            repoPaths: [],
+            ephemeral: true
+        )
         guard case .blocked = await manager.requestWorkspaceSwitch(
-            to: active,
+            to: blockedTarget,
             reason: "unrelatedNotice"
         ) else {
-            return XCTFail("Expected active workspace request to publish a blocked notice")
+            return XCTFail("Expected refresh-state request to publish a blocked notice")
         }
+        manager.isRefreshing = false
         let unrelatedNotice = try XCTUnwrap(manager.pendingWorkspaceSwitchBlockedNotice)
         XCTAssertNil(unrelatedNotice.blockingOperationID)
         let target = manager.createWorkspace(

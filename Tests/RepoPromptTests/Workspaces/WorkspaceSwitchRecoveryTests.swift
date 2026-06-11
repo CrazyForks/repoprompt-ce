@@ -264,6 +264,10 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
             return XCTFail("Expected save-and-exit on the fallback workspace to return request blockage")
         }
         XCTAssertEqual(message, "Already on workspace \"\(activeName)\".")
+        XCTAssertNil(
+            manager.pendingWorkspaceSwitchBlockedNotice,
+            "Save-and-exit while already on the fallback workspace is a benign no-op and must stay silent"
+        )
     }
 
     func testCancellationRequestedBySwitchListenerAfterNotificationReturnsSwitched() async {

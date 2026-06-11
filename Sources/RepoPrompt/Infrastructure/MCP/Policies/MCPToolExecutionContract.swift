@@ -121,11 +121,10 @@ enum MCPToolExecutionContractCatalog {
         case "switch":
             true
         case "create":
-            if let switchToCreated = arguments["switch_to_created"] {
-                switchToCreated.boolValue == true
-            } else {
-                true
-            }
+            // Mirror the handler's `args["switch_to_created"]?.boolValue ?? true`: an
+            // omitted or malformed flag still performs the switch, so it must stay
+            // under the workspace-switch deadline.
+            arguments["switch_to_created"]?.boolValue ?? true
         case "delete":
             arguments["close_window"]?.boolValue == true
         default:
