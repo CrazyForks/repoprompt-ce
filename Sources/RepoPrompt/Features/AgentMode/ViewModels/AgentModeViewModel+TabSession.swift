@@ -1031,16 +1031,15 @@ extension AgentModeViewModel {
             activeTurnBoundaryOverride: ToolCorrelationBoundary? = nil
         ) -> ToolCorrelationIndexes {
             var indexes = ToolCorrelationIndexes()
-            let boundary: ToolCorrelationBoundary
-            if let activeTurnBoundaryOverride {
-                boundary = activeTurnBoundaryOverride
+            let boundary: ToolCorrelationBoundary = if let activeTurnBoundaryOverride {
+                activeTurnBoundaryOverride
             } else if let lastUserIndex = items.lastIndex(where: { $0.kind == .user }) {
-                boundary = .after(
+                .after(
                     itemID: items[lastUserIndex].id,
                     sequenceIndex: items[lastUserIndex].sequenceIndex
                 )
             } else {
-                boundary = .start
+                .start
             }
             indexes.activeTurnBoundary = boundary
             indexes.activeTurnStartIndex = resolvedToolCorrelationStartIndex(for: items, boundary: boundary)
