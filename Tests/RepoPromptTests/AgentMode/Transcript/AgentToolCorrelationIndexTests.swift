@@ -92,6 +92,41 @@
             XCTAssertEqual(longAttribution.scannedItemCount, 1)
         }
 
+        func testRunningSteeringUserItemPreservesInFlightToolCorrelation() {
+            let handler = ClaudeAgentToolTrackingHandler()
+            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            let invocationID = UUID()
+            session.setItemsSilently([
+                .user("active", sequenceIndex: 0),
+                .toolCall(
+                    name: "read_file",
+                    invocationID: invocationID,
+                    argsJSON: #"{"path":"Sources/Active.swift"}"#,
+                    sequenceIndex: 1
+                )
+            ], reason: .testOverride)
+            session.runState = .running
+
+            session.appendItem(.user("steering", sequenceIndex: session.nextSequenceIndex))
+
+            XCTAssertEqual(session.indexedToolItemIndices(invocationID: invocationID), [1])
+
+            handler.handleTrackerToolResult(
+                invocationID: invocationID,
+                toolName: "read_file",
+                args: nil,
+                resultJSON: #"{"content":"ok"}"#,
+                isError: false,
+                session: session
+            )
+
+            XCTAssertEqual(session.items.count, 3)
+            XCTAssertEqual(session.items[1].kind, .toolResult)
+            XCTAssertEqual(session.items[1].toolInvocationID, invocationID)
+            XCTAssertEqual(session.items[2].kind, .user)
+            session.testAssertSourceItemDerivedStateIsConsistent()
+        }
+
         private func claudeCompletionAttribution(
             handler: ClaudeAgentToolTrackingHandler,
             session: AgentModeViewModel.TabSession,

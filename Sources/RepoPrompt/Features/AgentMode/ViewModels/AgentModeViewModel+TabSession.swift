@@ -1013,12 +1013,26 @@ extension AgentModeViewModel {
         }
 
         private func rebuildToolCorrelationIndexes() {
-            toolCorrelationIndexes = Self.makeToolCorrelationIndexes(for: items)
+            let activeTurnStartIndexOverride = runState.isActive ? toolCorrelationIndexes.activeTurnStartIndex : nil
+            toolCorrelationIndexes = Self.makeToolCorrelationIndexes(
+                for: items,
+                activeTurnStartIndexOverride: activeTurnStartIndexOverride
+            )
         }
 
-        private static func makeToolCorrelationIndexes(for items: [AgentChatItem]) -> ToolCorrelationIndexes {
+        private static func makeToolCorrelationIndexes(
+            for items: [AgentChatItem],
+            activeTurnStartIndexOverride: Int? = nil
+        ) -> ToolCorrelationIndexes {
             var indexes = ToolCorrelationIndexes()
-            indexes.activeTurnStartIndex = items.lastIndex(where: { $0.kind == .user }).map { $0 + 1 } ?? items.startIndex
+            if let activeTurnStartIndexOverride,
+               activeTurnStartIndexOverride >= items.startIndex,
+               activeTurnStartIndexOverride <= items.endIndex
+            {
+                indexes.activeTurnStartIndex = activeTurnStartIndexOverride
+            } else {
+                indexes.activeTurnStartIndex = items.lastIndex(where: { $0.kind == .user }).map { $0 + 1 } ?? items.startIndex
+            }
             guard indexes.activeTurnStartIndex < items.endIndex else { return indexes }
             for index in indexes.activeTurnStartIndex ..< items.endIndex {
                 addToolCorrelationItem(items[index], at: index, to: &indexes)
@@ -1097,6 +1111,7 @@ extension AgentModeViewModel {
 
         private func appendToolCorrelationIndexes(for item: AgentChatItem, at index: Int) {
             if item.kind == .user {
+                guard !runState.isActive else { return }
                 toolCorrelationIndexes = ToolCorrelationIndexes(activeTurnStartIndex: index + 1)
                 return
             }
@@ -1193,7 +1208,10 @@ extension AgentModeViewModel {
                     line: line
                 )
                 assert(
-                    toolCorrelationIndexes == Self.makeToolCorrelationIndexes(for: items),
+                    toolCorrelationIndexes == Self.makeToolCorrelationIndexes(
+                        for: items,
+                        activeTurnStartIndexOverride: runState.isActive ? toolCorrelationIndexes.activeTurnStartIndex : nil
+                    ),
                     "tool correlation index desynchronized",
                     file: file,
                     line: line

@@ -5,6 +5,9 @@ import Foundation
 /// Async Git helper for fetching repository information
 /// Based on the macOS 14+ Swift Git integration guide
 actor GitService {
+    private static let gitProcessTimeout: Duration = .seconds(120)
+    private static let gitProcessTerminationGrace: Duration = .seconds(5)
+
     // MARK: - Types
 
     struct GitError: LocalizedError {
@@ -2369,6 +2372,7 @@ actor GitService {
         processQueueWaitMicroseconds: Int
     ) async throws -> (String, String, Int32) {
         let process = Process()
+        let timeoutController = GitProcessTimeoutController()
         let commandRecorder = MCPToolWorkCountDiagnostics.gitCommandRecorder()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
         process.arguments = args
@@ -2424,6 +2428,8 @@ actor GitService {
                 }
 
                 process.terminationHandler = { proc in
+                    timeoutController.cancel()
+
                     // Stop handlers to break strong reference cycles
                     outPipe.fileHandleForReading.readabilityHandler = nil
                     errPipe.fileHandleForReading.readabilityHandler = nil
@@ -2454,6 +2460,13 @@ actor GitService {
                 do {
                     let spawnStart = DispatchTime.now().uptimeNanoseconds
                     try process.run()
+                    let processIdentifier = process.processIdentifier
+                    timeoutController.schedule(
+                        process: process,
+                        processIdentifier: processIdentifier,
+                        timeout: Self.gitProcessTimeout,
+                        terminationGrace: Self.gitProcessTerminationGrace
+                    )
                     let spawnEnd = DispatchTime.now().uptimeNanoseconds
                     processMetrics.spawnMicroseconds = Int(
                         clamping: spawnEnd >= spawnStart ? (spawnEnd - spawnStart) / 1000 : 0
@@ -2489,6 +2502,7 @@ actor GitService {
                         0
                     )
                     // Ensure handlers and collectors are released when launch fails.
+                    timeoutController.cancel()
                     outPipe.fileHandleForReading.readabilityHandler = nil
                     errPipe.fileHandleForReading.readabilityHandler = nil
                     outDrain.cancel()
@@ -2497,6 +2511,7 @@ actor GitService {
                 }
             }
         }, onCancel: {
+            timeoutController.cancel()
             // Stop callbacks and terminate before waiting on a drain lock. A callback may be
             // blocked in FileHandle.availableData until the child closes its pipe.
             outPipe.fileHandleForReading.readabilityHandler = nil
@@ -2992,6 +3007,41 @@ private extension GitService.WorkingStatus {
 
     var changedPaths: [String] {
         Array(Set(staged + modified + untracked)).sorted()
+    }
+}
+
+private final class GitProcessTimeoutController: @unchecked Sendable {
+    private let lock = NSLock()
+    private var task: Task<Void, Never>?
+
+    func schedule(
+        process: Process,
+        processIdentifier: pid_t,
+        timeout: Duration,
+        terminationGrace: Duration
+    ) {
+        lock.lock()
+        defer { lock.unlock() }
+        task?.cancel()
+        task = Task {
+            do {
+                try await Task.sleep(for: timeout)
+                guard !Task.isCancelled, process.isRunning else { return }
+                process.terminate()
+                try await Task.sleep(for: terminationGrace)
+                guard !Task.isCancelled, process.isRunning else { return }
+                kill(processIdentifier, SIGKILL)
+            } catch {
+                return
+            }
+        }
+    }
+
+    func cancel() {
+        lock.lock()
+        defer { lock.unlock() }
+        task?.cancel()
+        task = nil
     }
 }
 

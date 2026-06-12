@@ -20,19 +20,10 @@ final class MCPToolAdmissionPolicyTests: XCTestCase {
         ])
         assertClass(.gitRead, tools: [MCPWindowToolName.git])
         assertClass(.fileSearch, tools: [MCPWindowToolName.search])
-        assertClass(.exclusive, tools: [
-            MCPGlobalToolName.appSettings,
-            MCPGlobalToolName.bindContext,
-            MCPGlobalToolName.manageWorkspaces,
-            MCPWindowToolName.manageSelection,
-            MCPWindowToolName.fileActions,
-            MCPWindowToolName.workspaceContext,
-            MCPWindowToolName.prompt,
-            MCPWindowToolName.applyEdits,
+        assertClass(.control, tools: [
             MCPWindowToolName.oracleUtils,
             MCPWindowToolName.askOracle,
             MCPWindowToolName.oracleSend,
-            MCPWindowToolName.manageWorktree,
             MCPWindowToolName.contextBuilder,
             MCPWindowToolName.askUser,
             MCPWindowToolName.agentExplore,
@@ -42,6 +33,17 @@ final class MCPToolAdmissionPolicyTests: XCTestCase {
             MCPWindowToolName.setStatus,
             MCPWindowToolName.waitForNextInstruction
         ])
+        assertClass(.exclusive, tools: [
+            MCPGlobalToolName.appSettings,
+            MCPGlobalToolName.bindContext,
+            MCPGlobalToolName.manageWorkspaces,
+            MCPWindowToolName.manageSelection,
+            MCPWindowToolName.fileActions,
+            MCPWindowToolName.workspaceContext,
+            MCPWindowToolName.prompt,
+            MCPWindowToolName.applyEdits,
+            MCPWindowToolName.manageWorktree
+        ])
 
         let alias = ServerNetworkManager.canonicalToolName(for: "discover_manage_selection")
         XCTAssertEqual(alias, MCPWindowToolName.manageSelection)
@@ -50,12 +52,14 @@ final class MCPToolAdmissionPolicyTests: XCTestCase {
 
     func testGateBCapacitiesRecordConservativeWI3BaselineChoices() {
         XCTAssertEqual(MCPToolAdmissionPolicy.exclusiveConnectionLimit, 1)
+        XCTAssertEqual(MCPToolAdmissionPolicy.controlConnectionLimit, 8)
         XCTAssertEqual(MCPToolAdmissionPolicy.smallReadConnectionLimit, 2)
         XCTAssertEqual(MCPToolAdmissionPolicy.smallReadPerWindowLimit, 2)
         XCTAssertEqual(MCPToolAdmissionPolicy.gitReadConnectionLimit, 2)
         XCTAssertEqual(MCPToolAdmissionPolicy.gitReadPerRepositoryLimit, 1)
         XCTAssertEqual(MCPToolAdmissionPolicy.fileSearchConnectionLimit, 4)
         XCTAssertEqual(ServerNetworkManager.smallReadCallLaneLimit, 2)
+        XCTAssertEqual(ServerNetworkManager.controlCallLaneLimit, 8)
         XCTAssertEqual(ServerNetworkManager.gitReadCallLaneLimit, 2)
         XCTAssertEqual(ServerNetworkManager.fileSearchCallLaneLimit, 4)
     }
@@ -120,6 +124,41 @@ final class MCPToolAdmissionPolicyTests: XCTestCase {
         try await second.value
         let finalExclusiveCount = await gate.startedCount()
         XCTAssertEqual(finalExclusiveCount, 2)
+        await manager.debugRemoveConnection(connectionID)
+    }
+
+    func testSameConnectionControlAndExclusiveLanesOverlap() async throws {
+        let manager = ServerNetworkManager()
+        let connectionID = UUID()
+        _ = await manager.debugInstallConnectionLimiterForTesting(connectionID: connectionID)
+        let gate = AdmissionTestGate()
+
+        let exclusive = Task {
+            try await manager.withConnectionCallPermitForTesting(
+                connectionID: connectionID,
+                lane: .ordinary
+            ) {
+                await gate.enterAndWaitForRelease()
+            }
+        }
+        let didStartExclusive = await waitUntil { await gate.startedCount() == 1 }
+        XCTAssertTrue(didStartExclusive)
+
+        let control = Task {
+            try await manager.withConnectionCallPermitForTesting(
+                connectionID: connectionID,
+                lane: .control
+            ) {
+                await gate.enterAndWaitForRelease()
+            }
+        }
+
+        let didStartControlWhileExclusiveHeld = await waitUntil { await gate.startedCount() == 2 }
+        XCTAssertTrue(didStartControlWhileExclusiveHeld)
+
+        await gate.release()
+        try await exclusive.value
+        try await control.value
         await manager.debugRemoveConnection(connectionID)
     }
 

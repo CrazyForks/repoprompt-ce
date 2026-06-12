@@ -343,6 +343,7 @@ private final class BootstrapTransferredSocketLedger: @unchecked Sendable {
 enum MCPConnectionCallLane: String, CaseIterable {
     /// Legacy diagnostics name for the explicit exclusive class.
     case ordinary
+    case control
     case smallRead = "small_read"
     case gitRead = "git_read"
     case fileSearch = "file_search"
@@ -374,6 +375,7 @@ actor ServerNetworkManager {
     }
 
     nonisolated static let smallReadCallLaneLimit = MCPToolAdmissionPolicy.smallReadConnectionLimit
+    nonisolated static let controlCallLaneLimit = MCPToolAdmissionPolicy.controlConnectionLimit
     nonisolated static let gitReadCallLaneLimit = MCPToolAdmissionPolicy.gitReadConnectionLimit
 
     /// Bounded concurrent `file_search` permits per connection. This remains aligned with
@@ -1047,6 +1049,7 @@ actor ServerNetworkManager {
         }
 
         private let ordinary: AsyncLimiter
+        private let control: AsyncLimiter
         private let smallRead: AsyncLimiter
         private let gitRead: AsyncLimiter
         private let fileSearch: AsyncLimiter
@@ -1057,6 +1060,7 @@ actor ServerNetworkManager {
         #if DEBUG
             init(
                 limit: Int,
+                controlLimit: Int,
                 smallReadLimit: Int,
                 gitReadLimit: Int,
                 fileSearchLimit: Int,
@@ -1065,13 +1069,15 @@ actor ServerNetworkManager {
                 }
             ) {
                 ordinary = AsyncLimiter(limit: limit, idleWaitSleep: idleWaitSleep)
+                control = AsyncLimiter(limit: controlLimit, idleWaitSleep: idleWaitSleep)
                 smallRead = AsyncLimiter(limit: smallReadLimit, idleWaitSleep: idleWaitSleep)
                 gitRead = AsyncLimiter(limit: gitReadLimit, idleWaitSleep: idleWaitSleep)
                 fileSearch = AsyncLimiter(limit: fileSearchLimit, idleWaitSleep: idleWaitSleep)
             }
         #else
-            init(limit: Int, smallReadLimit: Int, gitReadLimit: Int, fileSearchLimit: Int) {
+            init(limit: Int, controlLimit: Int, smallReadLimit: Int, gitReadLimit: Int, fileSearchLimit: Int) {
                 ordinary = AsyncLimiter(limit: limit)
+                control = AsyncLimiter(limit: controlLimit)
                 smallRead = AsyncLimiter(limit: smallReadLimit)
                 gitRead = AsyncLimiter(limit: gitReadLimit)
                 fileSearch = AsyncLimiter(limit: fileSearchLimit)
@@ -1299,11 +1305,13 @@ actor ServerNetworkManager {
 
             func diagnosticsSnapshot() async -> MCPConnectionCallLimiterDebugSnapshot {
                 async let ordinarySnapshot = ordinary.debugSnapshot()
+                async let controlSnapshot = control.debugSnapshot()
                 async let smallReadSnapshot = smallRead.debugSnapshot()
                 async let gitReadSnapshot = gitRead.debugSnapshot()
                 async let fileSearchSnapshot = fileSearch.debugSnapshot()
                 return await MCPConnectionCallLimiterDebugSnapshot(
                     ordinary: ordinarySnapshot,
+                    control: controlSnapshot,
                     smallRead: smallReadSnapshot,
                     gitRead: gitReadSnapshot,
                     fileSearch: fileSearchSnapshot
@@ -1355,16 +1363,19 @@ actor ServerNetworkManager {
 
         private func closeLanes() async {
             async let cancelOrdinary: Void = ordinary.cancelAll()
+            async let cancelControl: Void = control.cancelAll()
             async let cancelSmallRead: Void = smallRead.cancelAll()
             async let cancelGitRead: Void = gitRead.cancelAll()
             async let cancelFileSearch: Void = fileSearch.cancelAll()
-            _ = await (cancelOrdinary, cancelSmallRead, cancelGitRead, cancelFileSearch)
+            _ = await (cancelOrdinary, cancelControl, cancelSmallRead, cancelGitRead, cancelFileSearch)
         }
 
         private func limiter(for lane: MCPConnectionCallLane) -> AsyncLimiter {
             switch lane {
             case .ordinary:
                 ordinary
+            case .control:
+                control
             case .smallRead:
                 smallRead
             case .gitRead:
@@ -1377,6 +1388,7 @@ actor ServerNetworkManager {
         private var lanes: [(MCPConnectionCallLane, AsyncLimiter)] {
             [
                 (.ordinary, ordinary),
+                (.control, control),
                 (.smallRead, smallRead),
                 (.gitRead, gitRead),
                 (.fileSearch, fileSearch)
@@ -4691,6 +4703,7 @@ actor ServerNetworkManager {
         connections[connectionID] = manager
         callLimiters[connectionID] = MCPConnectionCallLimiters(
             limit: limiterLimit(for: connectionID),
+            controlLimit: controlLimiterLimit(for: connectionID),
             smallReadLimit: smallReadLimiterLimit(for: connectionID),
             gitReadLimit: gitReadLimiterLimit(for: connectionID),
             fileSearchLimit: fileSearchLimiterLimit(for: connectionID)
@@ -8085,6 +8098,7 @@ actor ServerNetworkManager {
             ) async -> AsyncLimiter {
                 let limiters = MCPConnectionCallLimiters(
                     limit: limiterLimit(for: connectionID),
+                    controlLimit: controlLimiterLimit(for: connectionID),
                     smallReadLimit: smallReadLimiterLimit(for: connectionID),
                     gitReadLimit: gitReadLimiterLimit(for: connectionID),
                     fileSearchLimit: fileSearchLimiterLimit(for: connectionID),
@@ -8120,6 +8134,7 @@ actor ServerNetworkManager {
                 clientIDByConnection[connectionID] = clientID
                 callLimiters[connectionID] = MCPConnectionCallLimiters(
                     limit: limiterLimit(for: connectionID),
+                    controlLimit: controlLimiterLimit(for: connectionID),
                     smallReadLimit: smallReadLimiterLimit(for: connectionID),
                     gitReadLimit: gitReadLimiterLimit(for: connectionID),
                     fileSearchLimit: fileSearchLimiterLimit(for: connectionID)
@@ -8442,6 +8457,7 @@ actor ServerNetworkManager {
                 if callLimiters[connectionID] == nil {
                     callLimiters[connectionID] = MCPConnectionCallLimiters(
                         limit: limiterLimit(for: connectionID),
+                        controlLimit: controlLimiterLimit(for: connectionID),
                         smallReadLimit: smallReadLimiterLimit(for: connectionID),
                         gitReadLimit: gitReadLimiterLimit(for: connectionID),
                         fileSearchLimit: fileSearchLimiterLimit(for: connectionID)
@@ -12146,6 +12162,11 @@ actor ServerNetworkManager {
         return MCPToolAdmissionPolicy.exclusiveConnectionLimit
     }
 
+    private func controlLimiterLimit(for connectionID: UUID) -> Int {
+        _ = connectionID
+        return Self.controlCallLaneLimit
+    }
+
     private func smallReadLimiterLimit(for connectionID: UUID) -> Int {
         _ = connectionID
         return Self.smallReadCallLaneLimit
@@ -12551,6 +12572,7 @@ actor ServerNetworkManager {
         // observe cancellation, while all subsequent calls resolve these fresh open lanes.
         let replacement = MCPConnectionCallLimiters(
             limit: limiterLimit(for: id),
+            controlLimit: controlLimiterLimit(for: id),
             smallReadLimit: smallReadLimiterLimit(for: id),
             gitReadLimit: gitReadLimiterLimit(for: id),
             fileSearchLimit: fileSearchLimiterLimit(for: id)
@@ -13067,6 +13089,7 @@ actor ServerNetworkManager {
 #if DEBUG
     struct MCPConnectionCallLimiterDebugSnapshot: Equatable {
         let ordinary: AsyncLimiter.DebugSnapshot
+        let control: AsyncLimiter.DebugSnapshot
         let smallRead: AsyncLimiter.DebugSnapshot
         let gitRead: AsyncLimiter.DebugSnapshot
         let fileSearch: AsyncLimiter.DebugSnapshot
@@ -13076,28 +13099,29 @@ actor ServerNetworkManager {
         }
 
         var limit: Int {
-            ordinary.limit + smallRead.limit + gitRead.limit + fileSearch.limit
+            ordinary.limit + control.limit + smallRead.limit + gitRead.limit + fileSearch.limit
         }
 
         var permits: Int {
-            ordinary.permits + smallRead.permits + gitRead.permits + fileSearch.permits
+            ordinary.permits + control.permits + smallRead.permits + gitRead.permits + fileSearch.permits
         }
 
         var activePermitCount: Int {
-            ordinary.activePermitCount + smallRead.activePermitCount + gitRead.activePermitCount + fileSearch.activePermitCount
+            ordinary.activePermitCount + control.activePermitCount + smallRead.activePermitCount + gitRead.activePermitCount + fileSearch.activePermitCount
         }
 
         var waiterCount: Int {
-            ordinary.waiterCount + smallRead.waiterCount + gitRead.waiterCount + fileSearch.waiterCount
+            ordinary.waiterCount + control.waiterCount + smallRead.waiterCount + gitRead.waiterCount + fileSearch.waiterCount
         }
 
         var inFlight: Int {
-            ordinary.inFlight + smallRead.inFlight + gitRead.inFlight + fileSearch.inFlight
+            ordinary.inFlight + control.inFlight + smallRead.inFlight + gitRead.inFlight + fileSearch.inFlight
         }
 
         var oldestWaiterAgeMilliseconds: UInt64? {
             [
                 ordinary.oldestWaiterAgeMilliseconds,
+                control.oldestWaiterAgeMilliseconds,
                 smallRead.oldestWaiterAgeMilliseconds,
                 gitRead.oldestWaiterAgeMilliseconds,
                 fileSearch.oldestWaiterAgeMilliseconds
@@ -13107,15 +13131,15 @@ actor ServerNetworkManager {
         }
 
         var cancelledWaiterCount: Int {
-            ordinary.cancelledWaiterCount + smallRead.cancelledWaiterCount + gitRead.cancelledWaiterCount + fileSearch.cancelledWaiterCount
+            ordinary.cancelledWaiterCount + control.cancelledWaiterCount + smallRead.cancelledWaiterCount + gitRead.cancelledWaiterCount + fileSearch.cancelledWaiterCount
         }
 
         var isClosed: Bool {
-            ordinary.isClosed && smallRead.isClosed && gitRead.isClosed && fileSearch.isClosed
+            ordinary.isClosed && control.isClosed && smallRead.isClosed && gitRead.isClosed && fileSearch.isClosed
         }
 
         var isIdle: Bool {
-            ordinary.isIdle && smallRead.isIdle && gitRead.isIdle && fileSearch.isIdle
+            ordinary.isIdle && control.isIdle && smallRead.isIdle && gitRead.isIdle && fileSearch.isIdle
         }
     }
 #endif

@@ -116,6 +116,9 @@ extension FileSystemService {
 
         // Use parallel scanning for larger sets with BOUNDED CONCURRENCY
         var aggregatedDeltas = [FileSystemDelta]()
+        let originalVisitedPaths = visitedPaths
+        let originalVisitedItems = visitedItems
+        let originalPathCompsCache = pathCompsCache
 
         // Use configured parallelism cap (prevents CPU saturation)
         let maxParallel = min(cappedFolders.count, maxParallelScansPerActor)
@@ -136,86 +139,93 @@ extension FileSystemService {
         // Capture ignoreRules before entering the task group to avoid actor isolation issues
         let fallbackRules = ignoreRules.snapshot()
 
-        try await withThrowingTaskGroup(of: ScanResult.self) { group in
-            /// Helper to schedule tasks up to maxParallel
-            /// Note: captures must be resolved before the closure to avoid actor isolation issues
-            func scheduleMoreTasks() {
-                while inFlight < maxParallel, let folderRel = folderIterator.next() {
-                    // Capture everything we need before going off-actor
-                    let absFolder = fullPath(forRelativePath: folderRel)
-                    let rulesForFolder = perFolderIgnoreCache[folderRel]?.snapshot() ?? fallbackRules
-                    let skipLinks = self.skipSymlinks
-                    let preservedChildren = preservedChildrenByFolder[folderRel] ?? Set<String>()
+        do {
+            try await withThrowingTaskGroup(of: ScanResult.self) { group in
+                /// Helper to schedule tasks up to maxParallel
+                /// Note: captures must be resolved before the closure to avoid actor isolation issues
+                func scheduleMoreTasks() {
+                    while inFlight < maxParallel, let folderRel = folderIterator.next() {
+                        // Capture everything we need before going off-actor
+                        let absFolder = fullPath(forRelativePath: folderRel)
+                        let rulesForFolder = perFolderIgnoreCache[folderRel]?.snapshot() ?? fallbackRules
+                        let skipLinks = self.skipSymlinks
+                        let preservedChildren = preservedChildrenByFolder[folderRel] ?? Set<String>()
 
-                    inFlight += 1
-                    group.addTask(priority: .utility) {
-                        // This runs outside the actor for true parallelism
-                        try Self.enumerateOneLevel(
-                            absFolder: absFolder,
-                            relFolder: folderRel,
-                            skipSymlinks: skipLinks,
-                            rules: rulesForFolder,
-                            preserveChildren: preservedChildren
-                        )
-                    }
-                }
-            }
-
-            // Prime with initial batch
-            scheduleMoreTasks()
-
-            // Process results as they complete
-            for try await scan in group {
-                inFlight -= 1 // Decrement as result arrives
-
-                // Back inside actor context - safe to mutate state
-                let actualSet = Set(scan.children.keys)
-                let oldSet = preservedChildrenByFolder[scan.folderRel] ?? Set<String>()
-
-                let newItems = actualSet.subtracting(oldSet)
-                let removedItems = oldSet.subtracting(actualSet)
-
-                // Generate deltas for new items
-                for newItem in newItems {
-                    // Skip newly discovered ignore files
-                    if isIgnoreFile(newItem) {
-                        continue
-                    }
-                    let isDir = scan.children[newItem] ?? false
-                    visitedPaths.insert(newItem)
-                    visitedItems[newItem] = isDir
-
-                    if isDir {
-                        aggregatedDeltas.append(.folderAdded(newItem))
-                        // If this folder is already queued for its own scan, avoid duplicate subtree walk.
-                        let hasPendingScan = pendingScanTargets[newItem] != nil
-                        if !hasPendingScan {
-                            let deeperDeltas = try await scanSubtreeForNewFolder(newItem)
-                            aggregatedDeltas.append(contentsOf: deeperDeltas)
+                        inFlight += 1
+                        group.addTask(priority: .utility) {
+                            // This runs outside the actor for true parallelism
+                            try Self.enumerateOneLevel(
+                                absFolder: absFolder,
+                                relFolder: folderRel,
+                                skipSymlinks: skipLinks,
+                                rules: rulesForFolder,
+                                preserveChildren: preservedChildren
+                            )
                         }
-                    } else {
-                        aggregatedDeltas.append(.fileAdded(newItem))
                     }
                 }
 
-                // Generate deltas for removed items
-                for removedItem in removedItems {
-                    let wasDir = visitedItems[removedItem] ?? false
-                    visitedPaths.remove(removedItem)
-                    visitedItems.removeValue(forKey: removedItem)
-
-                    if wasDir {
-                        aggregatedDeltas.append(.folderRemoved(removedItem))
-                        let subtreeDeltas = removeSubtree(for: removedItem)
-                        aggregatedDeltas.append(contentsOf: subtreeDeltas)
-                    } else {
-                        aggregatedDeltas.append(.fileRemoved(removedItem))
-                    }
-                }
-
-                // Schedule more tasks to fill the slot (sliding window)
+                // Prime with initial batch
                 scheduleMoreTasks()
+
+                // Process results as they complete
+                for try await scan in group {
+                    inFlight -= 1 // Decrement as result arrives
+
+                    // Back inside actor context - safe to mutate state
+                    let actualSet = Set(scan.children.keys)
+                    let oldSet = preservedChildrenByFolder[scan.folderRel] ?? Set<String>()
+
+                    let newItems = actualSet.subtracting(oldSet)
+                    let removedItems = oldSet.subtracting(actualSet)
+
+                    // Generate deltas for new items
+                    for newItem in newItems {
+                        // Skip newly discovered ignore files
+                        if isIgnoreFile(newItem) {
+                            continue
+                        }
+                        let isDir = scan.children[newItem] ?? false
+                        visitedPaths.insert(newItem)
+                        visitedItems[newItem] = isDir
+
+                        if isDir {
+                            aggregatedDeltas.append(.folderAdded(newItem))
+                            // If this folder is already queued for its own scan, avoid duplicate subtree walk.
+                            let hasPendingScan = pendingScanTargets[newItem] != nil
+                            if !hasPendingScan {
+                                let deeperDeltas = try await scanSubtreeForNewFolder(newItem)
+                                aggregatedDeltas.append(contentsOf: deeperDeltas)
+                            }
+                        } else {
+                            aggregatedDeltas.append(.fileAdded(newItem))
+                        }
+                    }
+
+                    // Generate deltas for removed items
+                    for removedItem in removedItems {
+                        let wasDir = visitedItems[removedItem] ?? false
+                        visitedPaths.remove(removedItem)
+                        visitedItems.removeValue(forKey: removedItem)
+
+                        if wasDir {
+                            aggregatedDeltas.append(.folderRemoved(removedItem))
+                            let subtreeDeltas = removeSubtree(for: removedItem)
+                            aggregatedDeltas.append(contentsOf: subtreeDeltas)
+                        } else {
+                            aggregatedDeltas.append(.fileRemoved(removedItem))
+                        }
+                    }
+
+                    // Schedule more tasks to fill the slot (sliding window)
+                    scheduleMoreTasks()
+                }
             }
+        } catch {
+            visitedPaths = originalVisitedPaths
+            visitedItems = originalVisitedItems
+            pathCompsCache = originalPathCompsCache
+            throw error
         }
 
         return FolderScanBatchResult(deltas: aggregatedDeltas, scannedFolders: scannedFolders)
@@ -981,16 +991,12 @@ extension FileSystemService {
             respectCursorignore: Bool
         ) async throws -> DirectoryChunkResult {
             let scanResult: DirectoryScanResult
-            do {
-                let testMode = await service.isTestMode
-                if testMode {
-                    let fm = await service.fm
-                    scanResult = try Self.listDirectoryWithIgnoreDetection(context.absPath, fm: fm)
-                } else {
-                    scanResult = try Self.listDirectoryWithIgnoreDetection(context.absPath)
-                }
-            } catch {
-                return DirectoryChunkResult(folders: [], files: [], subdirs: [], ignoreCacheDelta: [:])
+            let testMode = await service.isTestMode
+            if testMode {
+                let fm = await service.fm
+                scanResult = try Self.listDirectoryWithIgnoreDetection(context.absPath, fm: fm)
+            } else {
+                scanResult = try Self.listDirectoryWithIgnoreDetection(context.absPath)
             }
 
             let trackCycles = !skipSymlinks && !isVirtualFS
@@ -1016,12 +1022,7 @@ extension FileSystemService {
             respectRepoIgnore: Bool,
             respectCursorignore: Bool
         ) async throws -> DirectoryChunkResult {
-            let scanResult: DirectoryScanResult
-            do {
-                scanResult = try Self.listDirectoryWithIgnoreDetection(context.absPath)
-            } catch {
-                return DirectoryChunkResult(folders: [], files: [], subdirs: [], ignoreCacheDelta: [:])
-            }
+            let scanResult = try Self.listDirectoryWithIgnoreDetection(context.absPath)
 
             let trackCycles = !skipSymlinks
             return try await buildDirectoryChunk(
