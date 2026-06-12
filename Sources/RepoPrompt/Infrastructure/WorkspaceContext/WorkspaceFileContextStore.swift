@@ -388,6 +388,7 @@ actor WorkspaceFileContextStore {
             let liveTopologyGenerations: [UInt64]
             let retainedTopologyGenerations: [UInt64]
             let buildCount: Int
+            let pathIndexBuildCount: Int
             let patchCount: Int
             let authoritativeRebuildCount: Int
             let fallbackReasonCounts: [String: Int]
@@ -689,6 +690,7 @@ actor WorkspaceFileContextStore {
                     liveTopologyGenerations: liveGenerations,
                     retainedTopologyGenerations: retainedGenerations,
                     buildCount: rootCatalogShardBuildCountsByRootID[rootID] ?? 0,
+                    pathIndexBuildCount: rootCatalogShardBuildCountsByRootID[rootID] ?? 0,
                     patchCount: rootCatalogShardPatchCountsByRootID[rootID] ?? 0,
                     authoritativeRebuildCount: rootCatalogShardAuthoritativeRebuildCountsByRootID[rootID] ?? 0,
                     fallbackReasonCounts: rootCatalogShardFallbackReasonCountsByRootID[rootID] ?? [:],
@@ -934,6 +936,7 @@ actor WorkspaceFileContextStore {
         let files: [WorkspaceFileRecord]
         let folders: [WorkspaceFolderRecord]
         let entries: [WorkspaceSearchCatalogEntry]
+        let pathSearchIndex: WorkspaceSearchRootPathIndex
         let appliedIndexGeneration: UInt64
 
         var folderCount: Int {
@@ -953,6 +956,15 @@ actor WorkspaceFileContextStore {
             self.files = files
             self.folders = folders
             self.entries = entries
+            pathSearchIndex = WorkspaceSearchRootPathIndex(
+                identity: WorkspaceSearchRootPathIndexIdentity(
+                    rootID: key.rootID,
+                    lifetimeID: key.lifetimeID,
+                    topologyGeneration: key.topologyGeneration
+                ),
+                rootPath: root.standardizedFullPath,
+                entries: entries
+            )
             self.appliedIndexGeneration = appliedIndexGeneration
         }
     }
@@ -1676,7 +1688,8 @@ actor WorkspaceFileContextStore {
                 let authoritativeSnapshot = buildAuthoritativeSearchCatalogSnapshot(
                     rootScope: rootScope,
                     generation: generation,
-                    roots: roots
+                    roots: roots,
+                    includePathIndexes: false
                 )
                 let composedBytes = catalogShadowBytes(composedSnapshot)
                 let authoritativeBytes = catalogShadowBytes(authoritativeSnapshot)
@@ -1687,7 +1700,11 @@ actor WorkspaceFileContextStore {
                 )
                 if !shadowMatches {
                     assertionFailure("Root catalog shard composition diverged from the authoritative full rebuild")
-                    composedSnapshot = authoritativeSnapshot
+                    composedSnapshot = buildAuthoritativeSearchCatalogSnapshot(
+                        rootScope: rootScope,
+                        generation: generation,
+                        roots: roots
+                    )
                     shouldCacheSnapshot = false
                 }
             #endif
@@ -2269,7 +2286,8 @@ actor WorkspaceFileContextStore {
     private func buildAuthoritativeSearchCatalogSnapshot(
         rootScope: WorkspaceLookupRootScope,
         generation: UInt64,
-        roots: [WorkspaceRootRecord]
+        roots: [WorkspaceRootRecord],
+        includePathIndexes: Bool = true
     ) -> WorkspaceSearchCatalogSnapshot {
         let components = buildAuthoritativeCatalogComponents(roots: roots)
         let diagnostics = WorkspaceCatalogDiagnostics(
@@ -2279,14 +2297,37 @@ actor WorkspaceFileContextStore {
             folderCount: components.folders.count,
             fileCount: components.files.count
         )
+        let rootPathIndexes = includePathIndexes
+            ? buildAuthoritativeRootPathIndexes(roots: roots, entries: components.entries)
+            : []
         return WorkspaceSearchCatalogSnapshot(
             generation: generation,
             rootScope: rootScope,
             roots: roots,
             files: components.files,
             entries: components.entries,
+            rootPathIndexes: rootPathIndexes,
             diagnostics: diagnostics
         )
+    }
+
+    private func buildAuthoritativeRootPathIndexes(
+        roots: [WorkspaceRootRecord],
+        entries: [WorkspaceSearchCatalogEntry]
+    ) -> [WorkspaceSearchRootPathIndex] {
+        let entriesByRootID = Dictionary(grouping: entries, by: \.rootID)
+        return roots.compactMap { root in
+            guard let state = rootStatesByID[root.id] else { return nil }
+            return WorkspaceSearchRootPathIndex(
+                identity: WorkspaceSearchRootPathIndexIdentity(
+                    rootID: root.id,
+                    lifetimeID: state.lifetimeID,
+                    topologyGeneration: catalogGenerationsByRootID[root.id] ?? 0
+                ),
+                rootPath: root.standardizedFullPath,
+                entries: entriesByRootID[root.id] ?? []
+            )
+        }
     }
 
     private func composeSearchCatalogSnapshot(
@@ -2309,6 +2350,7 @@ actor WorkspaceFileContextStore {
             roots: roots,
             files: merged.files,
             entries: merged.entries,
+            rootPathIndexes: shards.map(\.pathSearchIndex),
             diagnostics: diagnostics,
             generationLease: WorkspaceSearchCatalogGenerationLease(
                 retaining: shards.map { $0 as AnyObject }

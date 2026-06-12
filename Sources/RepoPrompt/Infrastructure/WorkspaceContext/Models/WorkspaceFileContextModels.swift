@@ -141,6 +141,7 @@ struct WorkspaceSearchCatalogSnapshot: Equatable {
     let roots: [WorkspaceRootRecord]
     let files: [WorkspaceFileRecord]
     let entries: [WorkspaceSearchCatalogEntry]
+    let rootPathIndexes: [WorkspaceSearchRootPathIndex]
     let diagnostics: WorkspaceCatalogDiagnostics
     private let generationLease: WorkspaceSearchCatalogGenerationLease?
 
@@ -150,6 +151,7 @@ struct WorkspaceSearchCatalogSnapshot: Equatable {
         roots: [WorkspaceRootRecord],
         files: [WorkspaceFileRecord],
         entries: [WorkspaceSearchCatalogEntry],
+        rootPathIndexes: [WorkspaceSearchRootPathIndex] = [],
         diagnostics: WorkspaceCatalogDiagnostics,
         generationLease: WorkspaceSearchCatalogGenerationLease? = nil
     ) {
@@ -158,6 +160,7 @@ struct WorkspaceSearchCatalogSnapshot: Equatable {
         self.roots = roots
         self.files = files
         self.entries = entries
+        self.rootPathIndexes = rootPathIndexes
         self.diagnostics = diagnostics
         self.generationLease = generationLease
     }

@@ -11568,7 +11568,7 @@ extension WorkspaceFilesViewModel {
         }
 
         markdownPathSearchEntries = entries
-        markdownPathSearchIndex = await PathSearchIndex(paths: entries.map(\.queryPath))
+        markdownPathSearchIndex = await PathSearchIndex.build(paths: entries.map(\.queryPath))
         markdownPathSearchGeneration = generation
     }
 

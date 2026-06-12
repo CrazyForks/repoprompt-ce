@@ -68,7 +68,7 @@ Improve MCP throughput across same-connection bursts, parallel agent threads, lo
 - [x] Phase 2 / WI-10 — classified, resource-keyed ordinary-tool admission
 - [x] Phase 3 / WI-11 — immutable per-root catalog shards and scope composition
 - [x] Phase 3 / WI-12 — canonical delta application to shards
-- [ ] Phase 3 / WI-13 — per-root path indexes with global top-k merge
+- [x] Phase 3 / WI-13 — per-root path indexes with global top-k merge
 - [ ] Phase 3 / WI-14 — shared physical-root service across windows
 - [ ] Phase 3 / WI-15 — (conditional) decoupled completion publication with ordered ownership
 
@@ -278,6 +278,8 @@ Consume `WorkspaceAppliedIndexBatchEvent` (exact upserts/removals/modifications,
 ### Work Item 13 — Per-root path indexes with global top-k merge
 
 One C `PathSearchIndex` per immutable root shard; rebuild only changed roots; extend the C boundary to expose comparable scores and deterministic tie-breaks so per-root candidates merge into the current global ordering. Root unload becomes dropping an index reference instead of the current filter/remap/discard/full-rebuild (`WorkspaceSearchService.swift:269-383`; `PathSearchIndex.swift:79-110`). Never mutate a shared C index in place under readers.
+
+**PR boundary (80/20):** this pull request lands through WI-13. WI-14 and WI-15 remain intentionally deferred follow-up work; WI-15 still requires post-WI-6/WI-8 measurement evidence before implementation.
 
 ### Work Item 14 — Shared physical-root service across windows
 
