@@ -2503,6 +2503,12 @@ def is_already_on_workspace(stderr: str, workspace: str) -> bool:
     return expected in lines or f"Error: [-32600] Invalid Request: {expected}." in lines
 
 
+def routed_structured_cli_argv(cli: str, window_id: int, command: str, payload: Dict[str, Any]) -> List[str]:
+    routed_payload = dict(payload)
+    routed_payload["_windowID"] = window_id
+    return [cli, "-w", str(window_id), "-c", command, "-j", json.dumps(routed_payload)]
+
+
 def resolve_debug_cli() -> Optional[str]:
     install_override = os.environ.get("REPOPROMPT_DEBUG_CLI_INSTALL_PATH")
     if install_override:
@@ -2702,7 +2708,7 @@ def operation_smoke(repo_root: Path, args: Dict[str, Any]) -> int:
         )
         return code
 
-    window_id = str(args.get("windowId") or 1)
+    window_id = int(args.get("windowId") or 1)
     workspace = str(args.get("workspace") or "repoprompt-ce")
     operation_timeout = float(args.get("operationTimeout") or MEDIUM_TIMEOUT_SECONDS)
     deadline = now() + operation_timeout
@@ -2738,12 +2744,12 @@ def operation_smoke(repo_root: Path, args: Dict[str, Any]) -> int:
 
     stages = [
         ("windows", [cli, "-e", "windows"]),
-        ("workspace switch", [cli, "-w", window_id, "-e", f"workspace switch {workspace}"]),
-        ("tree roots", [cli, "-w", window_id, "-e", "tree --type roots"]),
-        ("manage_worktree list", [cli, "-w", window_id, "-e", "manage_worktree op=list"]),
+        ("workspace switch", [cli, "-w", str(window_id), "-e", f"workspace switch {workspace}"]),
+        ("tree roots", [cli, "-w", str(window_id), "-e", "tree --type roots"]),
+        ("manage_worktree list", [cli, "-w", str(window_id), "-e", "manage_worktree op=list"]),
         (
             "agent_manage roles",
-            [cli, "-w", window_id, "-c", "agent_manage", "-j", json.dumps({"op": "list_agents", "roles_only": True})],
+            routed_structured_cli_argv(cli, window_id, "agent_manage", {"op": "list_agents", "roles_only": True}),
         ),
     ]
     for name, argv in stages:
@@ -2768,7 +2774,7 @@ def operation_smoke(repo_root: Path, args: Dict[str, Any]) -> int:
         }
         code, stdout, _stderr = run_operation_command(
             "agent_run start",
-            [cli, "-w", window_id, "-c", "agent_run", "-j", json.dumps(start_payload)],
+            routed_structured_cli_argv(cli, window_id, "agent_run", start_payload),
             repo_root,
             env=env,
         )
@@ -2786,7 +2792,7 @@ def operation_smoke(repo_root: Path, args: Dict[str, Any]) -> int:
         wait_payload = {"op": "wait", "session_id": session_id, "timeout": agent_timeout}
         code, _stdout, _stderr = run_operation_command(
             "agent_run wait",
-            [cli, "-w", window_id, "-c", "agent_run", "-j", json.dumps(wait_payload)],
+            routed_structured_cli_argv(cli, window_id, "agent_run", wait_payload),
             repo_root,
             env=env,
             timeout=agent_timeout + 10.0,
@@ -2800,7 +2806,7 @@ def operation_diagnostics_agent_mode_on(repo_root: Path, args: Dict[str, Any]) -
     cli = require_debug_cli()
     if not cli:
         return 1
-    window_id = str(args.get("windowId") or 1)
+    window_id = int(args.get("windowId") or 1)
     log_file = str(args.get("logFile") or "/tmp/repoprompt-ce-claude-raw-events")
     settings = [
         {"op": "list", "group": "agent_mode", "detailed": True},
@@ -2811,7 +2817,7 @@ def operation_diagnostics_agent_mode_on(repo_root: Path, args: Dict[str, Any]) -
     for payload in settings:
         code, _stdout, _stderr = run_operation_command(
             f"app_settings {payload.get('op')} {payload.get('key') or payload.get('group')}",
-            [cli, "-w", window_id, "-c", "app_settings", "-j", json.dumps(payload)],
+            routed_structured_cli_argv(cli, window_id, "app_settings", payload),
             repo_root,
         )
         if code != 0:

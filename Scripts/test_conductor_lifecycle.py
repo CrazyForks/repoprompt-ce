@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import shutil
 import subprocess
@@ -573,11 +574,74 @@ class SmokeOperationTests(unittest.TestCase):
                 ("manage_worktree list", ["/tmp/rpce-cli-debug", "-w", "7", "-e", "manage_worktree op=list"]),
                 (
                     "agent_manage roles",
-                    ["/tmp/rpce-cli-debug", "-w", "7", "-c", "agent_manage", "-j", '{"op": "list_agents", "roles_only": true}'],
+                    [
+                        "/tmp/rpce-cli-debug",
+                        "-w",
+                        "7",
+                        "-c",
+                        "agent_manage",
+                        "-j",
+                        '{"op": "list_agents", "roles_only": true, "_windowID": 7}',
+                    ],
                 ),
             ],
         )
 
+    def test_structured_smoke_calls_route_to_requested_window_with_fake_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log_path = root / "cli-calls.jsonl"
+            fake_cli = root / "rpce-cli-debug"
+            fake_cli.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env python3
+                    import json
+                    import os
+                    import sys
+
+                    args = sys.argv[1:]
+                    with open(os.environ["FAKE_CLI_LOG"], "a", encoding="utf-8") as log:
+                        log.write(json.dumps(args) + "\\n")
+                    if "-c" in args and args[args.index("-c") + 1] == "agent_run":
+                        payload = json.loads(args[args.index("-j") + 1])
+                        if payload["op"] == "start":
+                            print(json.dumps({"session_id": "smoke-session"}))
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_cli.chmod(0o755)
+
+            with mock.patch.dict(os.environ, {"FAKE_CLI_LOG": str(log_path)}), mock.patch.object(
+                conductor, "require_debug_cli", return_value=str(fake_cli)
+            ):
+                code = conductor.operation_smoke(
+                    root,
+                    {"windowId": 7, "workspace": "test-workspace", "agentRun": True, "agentTimeout": 5},
+                )
+
+            calls = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            calls[:4],
+            [
+                ["-e", "windows"],
+                ["-w", "7", "-e", "workspace switch test-workspace"],
+                ["-w", "7", "-e", "tree --type roots"],
+                ["-w", "7", "-e", "manage_worktree op=list"],
+            ],
+        )
+        structured_calls = calls[4:]
+        self.assertEqual(
+            [(call[call.index("-c") + 1], json.loads(call[call.index("-j") + 1])["op"]) for call in structured_calls],
+            [("agent_manage", "list_agents"), ("agent_run", "start"), ("agent_run", "wait")],
+        )
+        for call in structured_calls:
+            self.assertEqual(call[:3], ["-w", "7", "-c"])
+            payload = json.loads(call[call.index("-j") + 1])
+            self.assertEqual(payload["_windowID"], 7)
 
     def test_launch_smoke_uses_exact_embedded_helper_and_ignores_other_resolvers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
