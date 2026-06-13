@@ -1906,7 +1906,7 @@ struct CLIProvidersSettingsView: View {
             } catch {
                 await MainActor.run {
                     isLoadingZAI = false
-                    alertMessage = "Error validating Z.ai API Key: \(error.asFriendlyString())"
+                    alertMessage = "Error validating Z.ai Coding Plan: \(error.asFriendlyString())"
                     showAlert = true
                 }
             }

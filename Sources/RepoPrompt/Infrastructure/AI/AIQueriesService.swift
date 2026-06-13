@@ -608,7 +608,20 @@ public class AIQueriesService {
             try await keyManager.getAPIKey(for: .zAI) ?? ""
         }
         let provider = ZAIProvider(apiKey: key, endpoint: .codingPlan)
-        return try await withTimeout(seconds: 30) { try await provider.testAPIKey(model: .zaiGLM47) }
+        let hasCodingPlanAccess = try await withTimeout(seconds: 30) { try await provider.testAPIKey(model: .zaiGLM47) }
+        if hasCodingPlanAccess {
+            return true
+        }
+
+        let generalProvider = ZAIProvider(apiKey: key, endpoint: .generalAPI)
+        let hasGeneralAccess = try await withTimeout(seconds: 30) { try await generalProvider.testAPIKey() }
+        if hasGeneralAccess {
+            throw AIProviderError.invalidConfiguration(
+                detail: "This Z.ai API key is valid, but it does not have an active GLM Coding Plan. CC Zai in Agent Mode requires a Z.ai GLM Coding Plan subscription."
+            )
+        }
+
+        return false
     }
 
     private func withTimeout<T>(seconds: TimeInterval, operation: @escaping () async throws -> T) async throws -> T {
