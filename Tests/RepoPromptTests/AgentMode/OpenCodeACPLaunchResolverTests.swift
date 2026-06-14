@@ -49,6 +49,44 @@ final class OpenCodeACPLaunchResolverTests: XCTestCase {
         XCTAssertEqual(probedPath, launch.command)
     }
 
+    func testDefaultProfileResolvesOpenCodeFromProviderSpecificHomeBin() async throws {
+        let fakeHome = try makeTemporaryDirectory()
+        let minimalPath = try makeTemporaryDirectory()
+        let openCodeBin = fakeHome.appendingPathComponent(".opencode/bin", isDirectory: true)
+        let nativeFallbackBin = fakeHome.appendingPathComponent(".local/bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: openCodeBin, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: nativeFallbackBin, withIntermediateDirectories: true)
+        let executable = try makeExecutable(in: openCodeBin)
+        _ = try makeExecutable(in: nativeFallbackBin, output: "Native fallback OpenCode ACP support")
+        let environment = [
+            "HOME": fakeHome.path,
+            "PATH": minimalPath.path,
+            "SHELL": "/bin/false"
+        ]
+        let resolver = OpenCodeACPLaunchResolver(environmentProvider: { _ in environment })
+        let config = OpenCodeAgentConfig(
+            includeRepoPromptMCPServer: false,
+            includeManagedConfigOverlay: false
+        )
+
+        let support = try await resolver.probeSupport(for: config)
+        let launch = try resolver.resolvedLaunch(for: config)
+
+        XCTAssertEqual(support, .supported)
+        XCTAssertEqual(launch.command, executable.resolvingSymlinksInPath().standardizedFileURL.path)
+    }
+
+    func testOpenCodeHomeBinHintDoesNotLeakIntoNativeDefaultsOrOtherProviders() {
+        let openCodeHomeBin = "~/.opencode/bin"
+
+        XCTAssertEqual(CLILaunchProfiles.openCodeProviderSpecificPaths, [openCodeHomeBin])
+        XCTAssertEqual(CLILaunchProfiles.openCode.supplementalSearchPaths.first, openCodeHomeBin)
+        XCTAssertFalse(CLINativePathDefaults.defaultAdditionalPaths.contains(openCodeHomeBin))
+        XCTAssertFalse(CLILaunchProfiles.claudeCode.supplementalSearchPaths.contains(openCodeHomeBin))
+        XCTAssertFalse(CLILaunchProfiles.codex.supplementalSearchPaths.contains(openCodeHomeBin))
+        XCTAssertFalse(CLILaunchProfiles.cursor.supplementalSearchPaths.contains(openCodeHomeBin))
+    }
+
     func testRepeatedProbeRefreshesCurrentEnvironmentBeforeSpawn() async throws {
         let firstDirectory = try makeTemporaryDirectory()
         let secondDirectory = try makeTemporaryDirectory()
