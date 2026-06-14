@@ -186,6 +186,7 @@ final class AgentRunWorktreeStartTests: XCTestCase {
     func testManualFirstSendCanCreateAndBindNewWorktree() async throws {
         let fixture = try makeGitFixture()
         let window = try await makeWindow(root: fixture.repo)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let viewModel = window.agentModeViewModel
         window.apiSettingsViewModel.isCodexConnected = true
         let sourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
@@ -253,6 +254,7 @@ final class AgentRunWorktreeStartTests: XCTestCase {
     func testFreshLinkedManualFirstSendCanCreateAndBindNewWorktreeInPlace() async throws {
         let fixture = try makeGitFixture()
         let window = try await makeWindow(root: fixture.repo)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let viewModel = window.agentModeViewModel
         window.apiSettingsViewModel.isCodexConnected = true
         let createdTabID = await viewModel.createAndActivateSessionTab()
@@ -331,6 +333,7 @@ final class AgentRunWorktreeStartTests: XCTestCase {
         let sibling = fixture.sandbox.appendingPathComponent("existing-ui-worktree", isDirectory: true)
         try runGit(["worktree", "add", "-b", "feature/existing-ui-\(fixture.suffix)", sibling.path, "HEAD"], cwd: fixture.repo)
         let window = try await makeWindow(root: fixture.repo)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let viewModel = window.agentModeViewModel
         window.apiSettingsViewModel.isCodexConnected = true
         let sourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
