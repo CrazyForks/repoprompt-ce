@@ -4,21 +4,30 @@ import XCTest
 
 @MainActor
 final class AgentComposerSubmissionAttemptTests: XCTestCase {
-    func testComposerRenderIdentityChangesWhenLiveTabChangesBeforePropsCatchUp() {
+    func testComposerProductionEqualityRejectsLiveTabChangeBeforePropsCatchUp() {
         let sourceTabID = UUID()
         let destinationTabID = UUID()
-        let sourceIdentity = AgentComposerRenderIdentity(
-            props: .empty,
-            placeholderText: "Send a message...",
-            currentTabID: sourceTabID
-        )
-        let destinationIdentity = AgentComposerRenderIdentity(
-            props: .empty,
-            placeholderText: "Send a message...",
-            currentTabID: destinationTabID
-        )
 
-        XCTAssertNotEqual(sourceIdentity, destinationIdentity)
+        XCTAssertTrue(
+            AgentComposerView.hasEquivalentRenderIdentity(
+                lhsProps: .empty,
+                lhsPlaceholderText: "Send a message...",
+                lhsCurrentTabID: sourceTabID,
+                rhsProps: .empty,
+                rhsPlaceholderText: "Send a message...",
+                rhsCurrentTabID: sourceTabID
+            )
+        )
+        XCTAssertFalse(
+            AgentComposerView.hasEquivalentRenderIdentity(
+                lhsProps: .empty,
+                lhsPlaceholderText: "Send a message...",
+                lhsCurrentTabID: sourceTabID,
+                rhsProps: .empty,
+                rhsPlaceholderText: "Send a message...",
+                rhsCurrentTabID: destinationTabID
+            )
+        )
     }
 
     func testLatchSuppressesRapidSameTabCallbacksButAllowsAnotherTab() throws {
