@@ -1001,7 +1001,17 @@ extension FileSystemService {
             return nil
         }
         try Task.checkCancellation()
+        let requestedByteCount = max(0, maximumBytes)
         let validated = try validateContentFileForReading(request)
+        if validated.fileSize <= Int64(requestedByteCount) {
+            let result = try await readAutomaticContent(
+                request,
+                validated: validated,
+                requireStableIdentity: false
+            )
+            return result.content.map { FileContentPrefix(content: $0, truncated: false) }
+        }
+
         let handle = try openValidatedContentHandle(
             request,
             validated: validated,
@@ -1010,7 +1020,6 @@ extension FileSystemService {
         defer { try? handle.close() }
 
         try await runContentReadChunkHook(request)
-        let requestedByteCount = max(0, maximumBytes)
         let data = try handle.read(upToCount: requestedByteCount + 1) ?? Data()
         try Task.checkCancellation()
         guard !data.isEmpty else {
