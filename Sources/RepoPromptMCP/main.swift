@@ -69,12 +69,15 @@ enum MCPCLIExitCode: Int32 {
 struct CLIHostDisconnectProvenance: Equatable, CustomStringConvertible {
     enum Reason: String {
         case stdinClosed = "stdin_closed"
+        case stdinPollFailed = "stdin_poll_failed"
+        case stdinReadFailed = "stdin_read_failed"
         case parentProcessChanged = "parent_process_changed"
         case stdoutBrokenPipe = "stdout_broken_pipe"
         case taskCancelled = "host_task_cancelled"
     }
 
     let reason: Reason
+    let errno: Int32?
     let bytesWritten: Int?
     let totalBytes: Int?
     let initialParentPID: Int?
@@ -82,6 +85,14 @@ struct CLIHostDisconnectProvenance: Equatable, CustomStringConvertible {
 
     static let stdinClosed = CLIHostDisconnectProvenance(reason: .stdinClosed)
     static let taskCancelled = CLIHostDisconnectProvenance(reason: .taskCancelled)
+
+    static func stdinPollFailed(errno: Int32) -> CLIHostDisconnectProvenance {
+        CLIHostDisconnectProvenance(reason: .stdinPollFailed, errno: errno)
+    }
+
+    static func stdinReadFailed(errno: Int32) -> CLIHostDisconnectProvenance {
+        CLIHostDisconnectProvenance(reason: .stdinReadFailed, errno: errno)
+    }
 
     static func stdoutBrokenPipe(bytesWritten: Int, totalBytes: Int) -> CLIHostDisconnectProvenance {
         CLIHostDisconnectProvenance(
@@ -101,12 +112,14 @@ struct CLIHostDisconnectProvenance: Equatable, CustomStringConvertible {
 
     init(
         reason: Reason,
+        errno: Int32? = nil,
         bytesWritten: Int? = nil,
         totalBytes: Int? = nil,
         initialParentPID: Int? = nil,
         currentParentPID: Int? = nil
     ) {
         self.reason = reason
+        self.errno = errno
         self.bytesWritten = bytesWritten
         self.totalBytes = totalBytes
         self.initialParentPID = initialParentPID
@@ -115,6 +128,7 @@ struct CLIHostDisconnectProvenance: Equatable, CustomStringConvertible {
 
     var description: String {
         var fields = ["reason=\(reason.rawValue)"]
+        if let errno { fields.append("errno=\(errno)") }
         if let bytesWritten { fields.append("bytes_written=\(bytesWritten)") }
         if let totalBytes { fields.append("total_bytes=\(totalBytes)") }
         if let initialParentPID { fields.append("initial_parent_pid=\(initialParentPID)") }
@@ -466,6 +480,266 @@ enum SocketProxyError: Swift.Error, LocalizedError {
             return "Protocol version mismatch. Update the CLI or RepoPrompt app."
         case .hostDisconnected:
             return "Host disconnected"
+        }
+    }
+}
+
+func validateCLIHostInputPollResult(
+    _ result: Int32,
+    errno: Int32
+) throws {
+    guard result < 0, errno != EINTR else { return }
+    throw CLIRuntimeError.hostDisconnected(.stdinPollFailed(errno: errno))
+}
+
+func validateCLIHostInputReadResult(
+    _ result: Int,
+    errno: Int32
+) throws {
+    guard result < 0, errno != EAGAIN, errno != EINTR else { return }
+    throw CLIRuntimeError.hostDisconnected(.stdinReadFailed(errno: errno))
+}
+
+enum CLIProxyRuntimePolicy {
+    static func shouldRetry(after error: CLIRuntimeError) -> Bool {
+        switch error {
+        case .approvalDenied,
+             .hostDisconnected,
+             .terminatedByServer:
+            return false
+
+        case let .connectionFailed(underlying):
+            guard let socketError = underlying as? SocketProxyError else {
+                return true
+            }
+            switch socketError {
+            case .approvalDenied,
+                 .handshakeFailed,
+                 .protocolVersionMismatch,
+                 .socketCreationFailed,
+                 .descriptorConfigurationFailed,
+                 .pathTooLong,
+                 .bindFailed,
+                 .listenFailed,
+                 .acceptFailed,
+                 .stdoutWriteTimeout,
+                 .stdoutBrokenPipe,
+                 .hostDisconnected:
+                return false
+
+            case let .handshakeRejected(errorCode, _):
+                return isTransientBootstrapRejection(errorCode)
+
+            case .connectionRefused,
+                 .connectionTimeout,
+                 .bootstrapResponseTimeout,
+                 .connectionReset,
+                 .serverClosed,
+                 .readFailed,
+                 .writeFailed,
+                 .pollFailed,
+                 .notConnected,
+                 .notListening,
+                 .cancelled,
+                 .connectFailed,
+                 .terminatedByServer:
+                return true
+            }
+        }
+    }
+
+    static func failureReason(for error: CLIRuntimeError) -> String {
+        switch error {
+        case .approvalDenied:
+            return "approval_denied"
+        case let .hostDisconnected(provenance):
+            return provenance.reason.rawValue
+        case let .terminatedByServer(provenance):
+            return provenance.stableReason
+        case let .connectionFailed(underlying):
+            if underlying is JSONRPCBridgeLedgerError {
+                return "jsonrpc_bridge_terminal"
+            }
+            if let socketError = underlying as? SocketProxyError {
+                switch socketError {
+                case .socketCreationFailed: return "socket_creation_failed"
+                case .descriptorConfigurationFailed: return "descriptor_configuration_failed"
+                case .pathTooLong: return "socket_path_too_long"
+                case .bindFailed: return "socket_bind_failed"
+                case .listenFailed: return "socket_listen_failed"
+                case .acceptFailed: return "socket_accept_failed"
+                case .connectFailed: return "app_socket_connect_failed"
+                case .notListening: return "socket_not_listening"
+                case .notConnected: return "socket_not_connected"
+                case .connectionTimeout: return "app_socket_write_timeout"
+                case .bootstrapResponseTimeout: return "bootstrap_response_timeout"
+                case .connectionReset: return "app_socket_reset"
+                case .connectionRefused: return "app_socket_connection_refused"
+                case .writeFailed: return "socket_write_failed"
+                case .readFailed: return "socket_read_failed"
+                case .pollFailed: return "socket_poll_failed"
+                case .stdoutWriteTimeout: return "stdout_write_timeout"
+                case .stdoutBrokenPipe: return "stdout_broken_pipe"
+                case .cancelled: return "transport_cancelled"
+                case .serverClosed: return "app_socket_closed"
+                case .approvalDenied: return "approval_denied"
+                case .terminatedByServer: return "terminated_by_server"
+                case .handshakeFailed: return "handshake_failed"
+                case .handshakeRejected: return "handshake_rejected"
+                case .protocolVersionMismatch: return "protocol_version_mismatch"
+                case .hostDisconnected: return "host_disconnected"
+                }
+            }
+            return "transport_failure"
+        }
+    }
+
+    static func makeTerminalRecord(
+        sessionToken: String,
+        localPID: Int,
+        initialParentPID: Int,
+        ledgerSnapshot: JSONRPCBridgeLedgerSnapshot,
+        runtimeError: CLIRuntimeError?,
+        fallbackReason: String,
+        unexpectedError: Swift.Error? = nil
+    ) -> MCPTerminalRecord {
+        let reason = terminalReason(
+            runtimeError: runtimeError,
+            ledgerTerminalReason: ledgerSnapshot.terminalReason,
+            fallbackReason: fallbackReason
+        )
+        let details = terminalDetails(
+            runtimeError: runtimeError,
+            unexpectedError: unexpectedError
+        )
+        return MCPTerminalRecord(
+            layer: .proxy,
+            initiator: details.initiator,
+            reason: reason,
+            sessionToken: sessionToken,
+            localPID: localPID,
+            peerPID: initialParentPID,
+            appConnectionID: nil,
+            connectionGeneration: ledgerSnapshot.connectionGeneration,
+            errno: details.errno,
+            errorDescription: details.errorDescription,
+            bridgeActiveRequestCount: ledgerSnapshot.activeRequestCount,
+            bridgeResponseInDeliveryCount: ledgerSnapshot.responseInDeliveryCount,
+            bridgeCancellationTombstoneCount: ledgerSnapshot.cancellationTombstoneCount,
+            bridgeRecentCompletionCount: ledgerSnapshot.recentCompletionCount,
+            bridgePendingTransactionCount: ledgerSnapshot.pendingTransactionCount,
+            bridgeHasForwardedProtocolFrame: ledgerSnapshot.hasForwardedProtocolFrame
+        )
+    }
+
+    private static func terminalReason(
+        runtimeError: CLIRuntimeError?,
+        ledgerTerminalReason: String?,
+        fallbackReason: String
+    ) -> String {
+        guard let runtimeError else {
+            return ledgerTerminalReason ?? fallbackReason
+        }
+        switch runtimeError {
+        case .approvalDenied:
+            return "approval_denied"
+        case let .terminatedByServer(provenance):
+            return provenance.stableReason
+        case let .hostDisconnected(provenance):
+            return provenance.reason.rawValue
+        case .connectionFailed:
+            return ledgerTerminalReason ?? failureReason(for: runtimeError)
+        }
+    }
+
+    private static func terminalDetails(
+        runtimeError: CLIRuntimeError?,
+        unexpectedError: Swift.Error?
+    ) -> (initiator: MCPTerminalInitiator, errno: Int32?, errorDescription: String?) {
+        guard let runtimeError else {
+            return (
+                .proxy,
+                nil,
+                unexpectedError.map { String(describing: $0) }
+            )
+        }
+        switch runtimeError {
+        case .approvalDenied:
+            return (.app, nil, "Connection approval denied")
+        case let .terminatedByServer(provenance):
+            return (.app, nil, provenance.humanMessage)
+        case let .hostDisconnected(provenance):
+            return (.host, provenance.errno, provenance.description)
+        case let .connectionFailed(underlying):
+            let socketError = underlying as? SocketProxyError
+            return (
+                terminalInitiator(for: socketError, underlying: underlying),
+                terminalErrno(for: socketError),
+                (underlying as? LocalizedError)?.errorDescription
+                    ?? String(describing: underlying)
+            )
+        }
+    }
+
+    private static func terminalInitiator(
+        for error: SocketProxyError?,
+        underlying: Swift.Error
+    ) -> MCPTerminalInitiator {
+        if let ledgerError = underlying as? JSONRPCBridgeLedgerError,
+           case let .terminal(reason) = ledgerError
+        {
+            if reason.hasPrefix("socket_") {
+                return .peer
+            }
+            if reason.hasPrefix("stdin_") {
+                return .host
+            }
+            return .proxy
+        }
+        guard let error else { return .proxy }
+        switch error {
+        case .stdoutBrokenPipe, .stdoutWriteTimeout, .hostDisconnected:
+            return .host
+        case .approvalDenied, .terminatedByServer:
+            return .app
+        case .serverClosed, .connectionReset, .readFailed:
+            return .peer
+        default:
+            return .transport
+        }
+    }
+
+    private static func terminalErrno(for error: SocketProxyError?) -> Int32? {
+        guard let error else { return nil }
+        switch error {
+        case let .socketCreationFailed(errno),
+             let .descriptorConfigurationFailed(errno),
+             let .bindFailed(errno),
+             let .listenFailed(errno),
+             let .acceptFailed(errno),
+             let .connectFailed(errno),
+             let .writeFailed(errno),
+             let .readFailed(errno),
+             let .pollFailed(errno):
+            return errno
+        case .connectionRefused:
+            return ECONNREFUSED
+        default:
+            return nil
+        }
+    }
+
+    private static func isTransientBootstrapRejection(_ code: String?) -> Bool {
+        guard let code else { return false }
+        switch code {
+        case MCPBootstrapErrorCode.serverNotReady.rawValue,
+             MCPBootstrapErrorCode.serverUnavailable.rawValue,
+             MCPBootstrapErrorCode.connectionLimitReached.rawValue,
+             MCPBootstrapErrorCode.capacityExceeded.rawValue,
+             MCPBootstrapErrorCode.clientCooldown.rawValue:
+            return true
+        default:
+            return false
         }
     }
 }
@@ -864,8 +1138,8 @@ extension BootstrapSocketProxy {
             let pollResult = poll(&pfd, 1, 1000)
 
             if pollResult < 0 {
-                if errno == EINTR { continue }
-                throw SocketProxyError.pollFailed(errno: errno)
+                try validateCLIHostInputPollResult(pollResult, errno: errno)
+                continue
             }
             if pollResult == 0 { continue }
 
@@ -894,8 +1168,8 @@ extension BootstrapSocketProxy {
             }
 
             if bytesRead < 0 {
-                if errno == EAGAIN || errno == EINTR { continue }
-                throw SocketProxyError.readFailed(errno: errno)
+                try validateCLIHostInputReadResult(bytesRead, errno: errno)
+                continue
             }
             if bytesRead == 0 {
                 debugLog("BootstrapSocketProxy: stdin EOF after draining input")
@@ -1533,137 +1807,19 @@ actor MCPService: Service {
         unexpectedError: Swift.Error? = nil
     ) async {
         let snapshot = await bridgeLedger.snapshot()
-        let reason = proxyTerminalReason(
-            runtimeError: runtimeError,
-            ledgerTerminalReason: snapshot.terminalReason,
-            fallbackReason: fallbackReason
-        )
-        let details = proxyTerminalDetails(
-            runtimeError: runtimeError,
-            unexpectedError: unexpectedError
-        )
-        let record = MCPTerminalRecord(
-            layer: .proxy,
-            initiator: details.initiator,
-            reason: reason,
+        let record = CLIProxyRuntimePolicy.makeTerminalRecord(
             sessionToken: sessionToken,
             localPID: Int(getpid()),
-            peerPID: Int(initialPPID),
-            appConnectionID: nil,
-            connectionGeneration: snapshot.connectionGeneration,
-            errno: details.errno,
-            errorDescription: details.errorDescription,
-            bridgeActiveRequestCount: snapshot.activeRequestCount,
-            bridgeResponseInDeliveryCount: snapshot.responseInDeliveryCount,
-            bridgeCancellationTombstoneCount: snapshot.cancellationTombstoneCount,
-            bridgeRecentCompletionCount: snapshot.recentCompletionCount,
-            bridgePendingTransactionCount: snapshot.pendingTransactionCount,
-            bridgeHasForwardedProtocolFrame: snapshot.hasForwardedProtocolFrame
+            initialParentPID: Int(initialPPID),
+            ledgerSnapshot: snapshot,
+            runtimeError: runtimeError,
+            fallbackReason: fallbackReason,
+            unexpectedError: unexpectedError
         )
         _ = MCPTerminalRecordStore.writeBestEffort(
             record,
             to: MCPFilesystemConstants.eventsDirectoryURL()
         )
-    }
-
-    private func proxyTerminalReason(
-        runtimeError: CLIRuntimeError?,
-        ledgerTerminalReason: String?,
-        fallbackReason: String
-    ) -> String {
-        guard let runtimeError else {
-            return ledgerTerminalReason ?? fallbackReason
-        }
-        switch runtimeError {
-        case .approvalDenied:
-            return "approval_denied"
-        case let .terminatedByServer(provenance):
-            return provenance.stableReason
-        case let .hostDisconnected(provenance):
-            return provenance.reason.rawValue
-        case .connectionFailed:
-            return ledgerTerminalReason ?? transportFailureReason(for: runtimeError)
-        }
-    }
-
-    private func proxyTerminalDetails(
-        runtimeError: CLIRuntimeError?,
-        unexpectedError: Swift.Error?
-    ) -> (initiator: MCPTerminalInitiator, errno: Int32?, errorDescription: String?) {
-        guard let runtimeError else {
-            return (
-                .proxy,
-                nil,
-                unexpectedError.map { String(describing: $0) }
-            )
-        }
-        switch runtimeError {
-        case .approvalDenied:
-            return (.app, nil, "Connection approval denied")
-        case let .terminatedByServer(provenance):
-            return (.app, nil, provenance.humanMessage)
-        case let .hostDisconnected(provenance):
-            return (.host, nil, provenance.description)
-        case let .connectionFailed(underlying):
-            let socketError = underlying as? SocketProxyError
-            return (
-                proxyTerminalInitiator(
-                    for: socketError,
-                    underlying: underlying
-                ),
-                proxyTerminalErrno(for: socketError),
-                (underlying as? LocalizedError)?.errorDescription
-                    ?? String(describing: underlying)
-            )
-        }
-    }
-
-    private func proxyTerminalInitiator(
-        for error: SocketProxyError?,
-        underlying: Swift.Error
-    ) -> MCPTerminalInitiator {
-        if let ledgerError = underlying as? JSONRPCBridgeLedgerError,
-           case let .terminal(reason) = ledgerError
-        {
-            if reason.hasPrefix("socket_") {
-                return .peer
-            }
-            if reason.hasPrefix("stdin_") {
-                return .host
-            }
-            return .proxy
-        }
-        guard let error else { return .proxy }
-        switch error {
-        case .stdoutBrokenPipe, .stdoutWriteTimeout, .hostDisconnected:
-            return .host
-        case .approvalDenied, .terminatedByServer:
-            return .app
-        case .serverClosed, .connectionReset, .readFailed:
-            return .peer
-        default:
-            return .transport
-        }
-    }
-
-    private func proxyTerminalErrno(for error: SocketProxyError?) -> Int32? {
-        guard let error else { return nil }
-        switch error {
-        case let .socketCreationFailed(errno),
-             let .descriptorConfigurationFailed(errno),
-             let .bindFailed(errno),
-             let .listenFailed(errno),
-             let .acceptFailed(errno),
-             let .connectFailed(errno),
-             let .writeFailed(errno),
-             let .readFailed(errno),
-             let .pollFailed(errno):
-            return errno
-        case .connectionRefused:
-            return ECONNREFUSED
-        default:
-            return nil
-        }
     }
 
     /// Monitors the parent process ID. If it changes (reparented to init/launchd),
@@ -1687,99 +1843,11 @@ actor MCPService: Service {
     /// Determines whether a runtime error is transient and should trigger a retry.
     /// Terminal errors (approval denied, explicit termination, host disconnect) return false.
     private func shouldRetry(after error: CLIRuntimeError) -> Bool {
-        switch error {
-        case .approvalDenied,
-             .hostDisconnected,
-             .terminatedByServer:
-            return false
-
-        case let .connectionFailed(underlying):
-            guard let socketError = underlying as? SocketProxyError else {
-                // Unknown underlying error - be conservative, allow a few retries
-                return true
-            }
-            switch socketError {
-            // Terminal socket errors - don't retry
-            case .approvalDenied,
-                 .handshakeFailed,
-                 .protocolVersionMismatch,
-                 .socketCreationFailed,
-                 .descriptorConfigurationFailed,
-                 .pathTooLong,
-                 .bindFailed,
-                 .listenFailed,
-                 .acceptFailed,
-                 .stdoutWriteTimeout,
-                 .stdoutBrokenPipe,
-                 .hostDisconnected:
-                return false
-
-            case let .handshakeRejected(errorCode, _):
-                return isTransientBootstrapRejection(errorCode)
-
-            // Transient socket errors - retry with backoff
-            case .connectionRefused,
-                 .connectionTimeout,
-                 .bootstrapResponseTimeout,
-                 .connectionReset,
-                 .serverClosed,
-                 .readFailed,
-                 .writeFailed,
-                 .pollFailed,
-                 .notConnected,
-                 .notListening,
-                 .cancelled,
-                 .connectFailed,
-                 .terminatedByServer:
-                return true
-            }
-        }
+        CLIProxyRuntimePolicy.shouldRetry(after: error)
     }
 
     private func transportFailureReason(for error: CLIRuntimeError) -> String {
-        switch error {
-        case .approvalDenied:
-            return "approval_denied"
-        case let .hostDisconnected(provenance):
-            return provenance.reason.rawValue
-        case let .terminatedByServer(provenance):
-            return provenance.stableReason
-        case let .connectionFailed(underlying):
-            if underlying is JSONRPCBridgeLedgerError {
-                return "jsonrpc_bridge_terminal"
-            }
-            if let socketError = underlying as? SocketProxyError {
-                switch socketError {
-                case .socketCreationFailed: return "socket_creation_failed"
-                case .descriptorConfigurationFailed: return "descriptor_configuration_failed"
-                case .pathTooLong: return "socket_path_too_long"
-                case .bindFailed: return "socket_bind_failed"
-                case .listenFailed: return "socket_listen_failed"
-                case .acceptFailed: return "socket_accept_failed"
-                case .connectFailed: return "app_socket_connect_failed"
-                case .notListening: return "socket_not_listening"
-                case .notConnected: return "socket_not_connected"
-                case .connectionTimeout: return "app_socket_write_timeout"
-                case .bootstrapResponseTimeout: return "bootstrap_response_timeout"
-                case .connectionReset: return "app_socket_reset"
-                case .connectionRefused: return "app_socket_connection_refused"
-                case .writeFailed: return "socket_write_failed"
-                case .readFailed: return "socket_read_failed"
-                case .pollFailed: return "socket_poll_failed"
-                case .stdoutWriteTimeout: return "stdout_write_timeout"
-                case .stdoutBrokenPipe: return "stdout_broken_pipe"
-                case .cancelled: return "transport_cancelled"
-                case .serverClosed: return "app_socket_closed"
-                case .approvalDenied: return "approval_denied"
-                case .terminatedByServer: return "terminated_by_server"
-                case .handshakeFailed: return "handshake_failed"
-                case .handshakeRejected: return "handshake_rejected"
-                case .protocolVersionMismatch: return "protocol_version_mismatch"
-                case .hostDisconnected: return "host_disconnected"
-                }
-            }
-            return "transport_failure"
-        }
+        CLIProxyRuntimePolicy.failureReason(for: error)
     }
 
     private static func responseDeliveryFaultRuleFromEnvironment() -> JSONRPCBridgeFaultRule? {
@@ -1814,20 +1882,6 @@ actor MCPService: Service {
         #else
             return nil
         #endif
-    }
-
-    private func isTransientBootstrapRejection(_ code: String?) -> Bool {
-        guard let code else { return false }
-        switch code {
-        case MCPBootstrapErrorCode.serverNotReady.rawValue,
-             MCPBootstrapErrorCode.serverUnavailable.rawValue,
-             MCPBootstrapErrorCode.connectionLimitReached.rawValue,
-             MCPBootstrapErrorCode.capacityExceeded.rawValue,
-             MCPBootstrapErrorCode.clientCooldown.rawValue:
-            return true
-        default:
-            return false
-        }
     }
 
     /// Runs the MCP transport with reconnection on transient failures.

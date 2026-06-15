@@ -5035,15 +5035,13 @@ actor ServerNetworkManager {
             } catch {
                 startupOutcome = error is CancellationError ? "cancelled" : "error"
                 log.error("Bootstrap connection \(connectionID) start failed: \(error)")
+                let transportSnapshot = await manager.startupFailureTransportCloseSnapshot()
                 guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return }
                 await removeConnection(
                     connectionID,
-                    context: MCPConnectionCloseContext(
-                        reason: error is CancellationError
-                            ? "connection_start_cancelled"
-                            : "connection_start_failure",
-                        initiator: .app,
-                        errorDescription: String(describing: error)
+                    context: MCPConnectionCloseContext.startupFailure(
+                        error: error,
+                        transportSnapshot: transportSnapshot
                     )
                 )
             }

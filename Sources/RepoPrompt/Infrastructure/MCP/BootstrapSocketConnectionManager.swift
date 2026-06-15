@@ -74,6 +74,7 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
     private var state: ConnectionStateSnapshot = .connecting
     private var isClosing = false
     private var handshakeComplete = false
+    private var startupFailureTransportSnapshot: MCPTransportCloseSnapshot?
 
     init(
         connectionID: UUID,
@@ -118,6 +119,8 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
     }
 
     func start(approvalHandler: @escaping (MCP.Client.Info) async -> Bool) async throws {
+        startupFailureTransportSnapshot = nil
+
         // Start close-watch task to clean up when socket closes
         closeWatchTask = Task { [weak self] in
             guard let self else { return }
@@ -165,12 +168,23 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
         } catch {
             bootstrapLog.error("BootstrapSocketConnectionManager: start failed: \(error)")
             updateState(.failed(error))
+            startupFailureTransportSnapshot = await transport.closeSnapshot()
             closeWatchTask?.cancel()
             closeWatchTask = nil
             await transport.disconnect()
             throw error
         }
     }
+
+    func startupFailureTransportCloseSnapshot() -> MCPTransportCloseSnapshot? {
+        startupFailureTransportSnapshot
+    }
+
+    #if DEBUG
+        func debugFailNextExistingFDConnectBeforeReaderStart() async {
+            await transport.debugFailNextExistingFDConnectBeforeReaderStart()
+        }
+    #endif
 
     private func registerHandlers() async {
         await parentManager.registerHandlers(for: server, connectionID: connectionID)

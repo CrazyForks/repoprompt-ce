@@ -14,9 +14,7 @@ final class UnixSocketMCPTerminalCleanupTests: XCTestCase {
 
         XCTAssertEqual(Darwin.shutdown(descriptors[1], SHUT_WR), 0)
 
-        var iterator = closeStream.makeAsyncIterator()
-        let closeValue = await iterator.next()
-        let close = try XCTUnwrap(closeValue)
+        let close = try await Self.firstCloseSnapshot(closeStream)
         XCTAssertEqual(close.cause, .peerEOF)
         XCTAssertEqual(close.initiator, .peer)
         XCTAssertNil(close.errno)
@@ -36,9 +34,7 @@ final class UnixSocketMCPTerminalCleanupTests: XCTestCase {
         try Self.writeAll(Data(#"{"jsonrpc":"2.0""#.utf8), to: descriptors[1])
         XCTAssertEqual(Darwin.shutdown(descriptors[1], SHUT_WR), 0)
 
-        var iterator = closeStream.makeAsyncIterator()
-        let closeValue = await iterator.next()
-        let close = try XCTUnwrap(closeValue)
+        let close = try await Self.firstCloseSnapshot(closeStream)
         XCTAssertEqual(close.cause, .incompleteEOF)
         XCTAssertEqual(close.initiator, .peer)
         XCTAssertTrue(close.errorDescription?.contains("incomplete frame data") == true)
@@ -53,32 +49,91 @@ final class UnixSocketMCPTerminalCleanupTests: XCTestCase {
             defer { Self.closeIfOpen(peerFD) }
 
             let transport = try UnixSocketMCPTransport(connectedFD: descriptors[0])
-            await transport.debugHoldReaderTerminalCallback()
-            try await transport.connect()
-            let closeStream = await transport.closed()
+            try await Self.withHeldReaderTerminalCallbacks(on: transport) {
+                try await transport.connect()
+                let closeStream = await transport.closed()
 
-            Self.closeIfOpen(peerFD)
-            peerFD = -1
+                Self.closeIfOpen(peerFD)
+                peerFD = -1
 
-            do {
-                try await transport.send(Data("peer-close-write".utf8))
-                XCTFail("Expected write to fail after the peer closed")
-            } catch {
-                // Expected: the close snapshot is the behavior under test.
+                do {
+                    try await transport.send(Data("peer-close-write".utf8))
+                    XCTFail("Expected write to fail after the peer closed")
+                } catch {
+                    // Expected: the close snapshot is the behavior under test.
+                }
+
+                let close = try await Self.firstCloseSnapshot(closeStream)
+                XCTAssertEqual(close.cause, .writeHangup)
+                XCTAssertEqual(close.initiator, .peer)
+                XCTAssertTrue(close.errno == EPIPE || close.errno == ECONNRESET)
+                let storedClose = await transport.closeSnapshot()
+                XCTAssertEqual(storedClose, close)
             }
-
-            var iterator = closeStream.makeAsyncIterator()
-            let closeValue = await iterator.next()
-            let close = try XCTUnwrap(closeValue)
-            XCTAssertEqual(close.cause, .writeHangup)
-            XCTAssertEqual(close.initiator, .peer)
-            XCTAssertTrue(close.errno == EPIPE || close.errno == ECONNRESET)
-            let storedClose = await transport.closeSnapshot()
-            XCTAssertEqual(storedClose, close)
-
-            await transport.debugReleaseReaderTerminalCallbacks()
         #else
             throw XCTSkip("Deterministic transport callback gates require a DEBUG build")
+        #endif
+    }
+
+    func testBootstrapStartupFailurePrefersCapturedTransportSnapshot() async throws {
+        #if DEBUG
+            let descriptors = try Self.makeSocketPair()
+            defer { Self.closeIfOpen(descriptors[1]) }
+
+            let manager = ServerNetworkManager()
+            let connection = try BootstrapSocketConnectionManager(
+                connectionID: UUID(),
+                sessionToken: "startup-close-snapshot-test",
+                clientPid: Int(getpid()),
+                clientName: "startup-close-snapshot-test",
+                purpose: .unknown,
+                codeMapsDisabled: false,
+                connectedFD: descriptors[0],
+                parentManager: manager
+            )
+            await connection.debugFailNextExistingFDConnectBeforeReaderStart()
+
+            let startTask = Task {
+                try await connection.start { _ in true }
+            }
+            var startupError: Swift.Error?
+            do {
+                try await Self.boundedTaskValue(
+                    startTask,
+                    description: "forced bootstrap startup failure"
+                )
+                XCTFail("Expected the forced existing-FD startup failure")
+                await connection.stop()
+                return
+            } catch let error as AsyncTestTimeoutError {
+                await connection.stop()
+                throw error
+            } catch {
+                startupError = error
+            }
+
+            let error = try XCTUnwrap(startupError)
+            let capturedSnapshot = await connection.startupFailureTransportCloseSnapshot()
+            let snapshot = try XCTUnwrap(capturedSnapshot)
+            XCTAssertEqual(snapshot.cause, .connectFailure)
+            XCTAssertEqual(snapshot.initiator, .transport)
+
+            let context = MCPConnectionCloseContext.startupFailure(
+                error: error,
+                transportSnapshot: snapshot
+            )
+            XCTAssertEqual(context.reason, MCPTransportTerminalCause.connectFailure.rawValue)
+            XCTAssertEqual(context.initiator, .transport)
+            XCTAssertNotEqual(context.reason, "connection_start_failure")
+
+            let generic = MCPConnectionCloseContext.startupFailure(
+                error: error,
+                transportSnapshot: nil
+            )
+            XCTAssertEqual(generic.reason, "connection_start_failure")
+            XCTAssertEqual(generic.initiator, .app)
+        #else
+            throw XCTSkip("Forced bootstrap startup failure requires a DEBUG build")
         #endif
     }
 
@@ -461,7 +516,89 @@ final class UnixSocketMCPTerminalCleanupTests: XCTestCase {
         #endif
     }
 
+    private struct AsyncTestTimeoutError: Error, CustomStringConvertible {
+        let description: String
+    }
+
+    private struct CloseStreamEndedWithoutSnapshotError: Error {}
+
+    private static func firstCloseSnapshot(
+        _ stream: AsyncStream<MCPTransportCloseSnapshot>
+    ) async throws -> MCPTransportCloseSnapshot {
+        let task = Task {
+            var iterator = stream.makeAsyncIterator()
+            return await iterator.next()
+        }
+        let snapshot = try await boundedTaskValue(
+            task,
+            description: "transport close snapshot"
+        )
+        guard let snapshot else {
+            throw CloseStreamEndedWithoutSnapshotError()
+        }
+        return snapshot
+    }
+
+    private static func boundedTaskValue<Success>(
+        _ task: Task<Success, some Error>,
+        timeout: Duration = .seconds(2),
+        description: String
+    ) async throws -> Success {
+        let result = AsyncTestResultBox<Success>()
+        let observer = Task {
+            do {
+                try await result.store(.success(task.value))
+            } catch {
+                result.store(.failure(error))
+            }
+        }
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if let completed = result.load() {
+                observer.cancel()
+                return try completed.get()
+            }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        task.cancel()
+        observer.cancel()
+        throw AsyncTestTimeoutError(description: description)
+    }
+
+    private final class AsyncTestResultBox<Success>: @unchecked Sendable {
+        private let lock = NSLock()
+        private var result: Result<Success, Error>?
+
+        func store(_ result: Result<Success, Error>) {
+            lock.lock()
+            self.result = result
+            lock.unlock()
+        }
+
+        func load() -> Result<Success, Error>? {
+            lock.lock()
+            defer { lock.unlock() }
+            return result
+        }
+    }
+
     #if DEBUG
+        private static func withHeldReaderTerminalCallbacks(
+            on transport: UnixSocketMCPTransport,
+            _ operation: () async throws -> Void
+        ) async throws {
+            await transport.debugHoldReaderTerminalCallback()
+            do {
+                try await operation()
+                await transport.debugReleaseReaderTerminalCallbacks()
+            } catch {
+                await transport.debugReleaseReaderTerminalCallbacks()
+                await transport.disconnect()
+                throw error
+            }
+        }
+
         private static func assertControlledCleanup(
             trigger: (UnixSocketMCPTransport, AsyncThrowingStream<Data, Swift.Error>) async throws -> Void
         ) async throws {

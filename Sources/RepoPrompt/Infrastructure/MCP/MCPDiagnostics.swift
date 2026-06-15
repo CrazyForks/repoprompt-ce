@@ -65,6 +65,22 @@ struct MCPConnectionCloseContext: Equatable {
         )
     }
 
+    static func startupFailure(
+        error: Swift.Error,
+        transportSnapshot: MCPTransportCloseSnapshot?
+    ) -> MCPConnectionCloseContext {
+        if let transportSnapshot {
+            return MCPConnectionCloseContext(transport: transportSnapshot)
+        }
+        return MCPConnectionCloseContext(
+            reason: error is CancellationError
+                ? "connection_start_cancelled"
+                : "connection_start_failure",
+            initiator: .app,
+            errorDescription: String(describing: error)
+        )
+    }
+
     static let cleanupUnspecified = MCPConnectionCloseContext(
         reason: "connection_cleanup_unspecified",
         initiator: .unknown

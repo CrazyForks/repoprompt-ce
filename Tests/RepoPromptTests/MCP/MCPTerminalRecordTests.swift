@@ -122,14 +122,14 @@ final class MCPTerminalRecordTests: XCTestCase {
         let laterRecord = MCPTerminalRecord(
             layer: .appAcceptedSocket,
             initiator: .app,
-            reason: "local_disconnect",
+            reason: "connection_start_failure",
             sessionToken: "first-cause-session",
             localPID: 1,
             peerPID: 2,
             appConnectionID: firstRecord.appConnectionID,
             connectionGeneration: 3,
             errno: nil,
-            errorDescription: "later cleanup"
+            errorDescription: "later generic startup cleanup"
         )
 
         var claim = MCPFirstTerminalRecordClaim()
