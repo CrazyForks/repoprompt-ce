@@ -1681,19 +1681,25 @@ class WorkspaceFilesViewModel: ObservableObject {
                             continue
                         }
                     }
-                    _ = try? await selectionSliceCoordinator.applyPartitionUpdatesIfCurrent(
-                        forRootPath: request.physicalRootPath,
-                        scope: commit.scope,
-                        updates: [
-                            request.relativePath: PartitionStore.SliceUpdate(
-                                ranges: commit.ranges,
-                                fileModificationTime: loadedSnapshot.modificationTime,
-                                anchors: commit.anchors
-                            )
-                        ],
-                        mode: .setPaths,
-                        expectedCurrent: [request.relativePath: commit.expectedStoredSlices]
-                    )
+                    do {
+                        guard try await selectionSliceCoordinator.applyPartitionUpdatesIfCurrent(
+                            forRootPath: request.physicalRootPath,
+                            scope: commit.scope,
+                            updates: [
+                                request.relativePath: PartitionStore.SliceUpdate(
+                                    ranges: commit.ranges,
+                                    fileModificationTime: loadedSnapshot.modificationTime,
+                                    anchors: commit.anchors
+                                )
+                            ],
+                            mode: .setPaths,
+                            expectedCurrent: [request.relativePath: commit.expectedStoredSlices]
+                        ) != nil else {
+                            return
+                        }
+                    } catch {
+                        return
+                    }
                 }
                 var stillCurrentTargets: [HiddenSessionSliceRebaseTarget] = []
                 for target in currentTargets where await isHiddenSessionSliceRebaseTargetCurrent(target) {
@@ -13126,7 +13132,10 @@ extension WorkspaceFilesViewModel {
                     ],
                     mode: .setPaths,
                     expectedCurrent: [relativePath: commit.expectedStoredSlices]
-                ) else { continue }
+                ) else {
+                    persistenceSucceeded = false
+                    break
+                }
                 guard await isSliceRebaseCurrent(
                     workspaceID: workspaceID,
                     rootID: rootID,
@@ -13152,6 +13161,7 @@ extension WorkspaceFilesViewModel {
                 if Self.isLoggingEnabled {
                     print("Failed to rebase slices for \(relativePath) in scope \(String(describing: commit.scope.tabID)) – \(error)")
                 }
+                break
             }
         }
 
@@ -13159,15 +13169,17 @@ extension WorkspaceFilesViewModel {
             requestSelectionSliceSnapshotRebuild(reason: "selection.slicesSnapshot")
         }
 
-        guard await isSliceRebaseCurrent(
-            workspaceID: workspaceID,
-            rootID: rootID,
-            relativePath: relativePath,
-            fullPath: fullPath,
-            fileID: fileID,
-            taskID: taskID,
-            registrationGeneration: registrationGeneration
-        ) else { return }
+        guard persistenceSucceeded,
+              await isSliceRebaseCurrent(
+                  workspaceID: workspaceID,
+                  rootID: rootID,
+                  relativePath: relativePath,
+                  fullPath: fullPath,
+                  fileID: fileID,
+                  taskID: taskID,
+                  registrationGeneration: registrationGeneration
+              )
+        else { return }
 
         let tabOldText = sourceSnapshot?.text ?? loadedSnapshot.text
         await workspaceManager?.rebaseSlicesForFileAcrossTabs(
@@ -13215,24 +13227,16 @@ extension WorkspaceFilesViewModel {
     ) async -> SliceRebaseSourceSnapshot? {
         for _ in 0 ..< 3 {
             guard !Task.isCancelled else { return nil }
-            guard let dateBefore = try? await workspaceFileContextStore.fileModificationDate(
+            guard let loaded = try? await workspaceFileContextStore.readValidatedContentSnapshot(
                 rootID: rootID,
-                relativePath: relativePath
-            ),
-                let content = try? await workspaceFileContextStore.readContent(
-                    rootID: rootID,
-                    relativePath: relativePath
-                ),
-                let dateAfter = try? await workspaceFileContextStore.fileModificationDate(
-                    rootID: rootID,
-                    relativePath: relativePath
-                ),
-                dateBefore == dateAfter
+                relativePath: relativePath,
+                workloadClass: .contentSearch
+            ), let content = loaded.content
             else { continue }
 
             return SliceRebaseSourceSnapshot(
                 text: content,
-                modificationTime: dateAfter.timeIntervalSince1970
+                modificationTime: loaded.modificationDate.timeIntervalSince1970
             )
         }
         return nil

@@ -32,6 +32,10 @@ enum SliceRebaseEngine {
         case end
     }
 
+    /// Caps Myers trace growth for a replaced middle while preserving ordinary sparse edits.
+    /// Larger edit distances fall back to one conservative replacement region.
+    private static let maximumSparseEditDistance = 512
+
     static func rebase(
         oldText: String?,
         newText: String,
@@ -184,7 +188,11 @@ enum SliceRebaseEngine {
         let newMiddle = Array(newLines[prefix ..< (newLines.count - suffix)])
         guard !oldMiddle.isEmpty || !newMiddle.isEmpty else { return [] }
 
-        let edits = DiffEditCreator.myersDiff(oldLines: oldMiddle, newLines: newMiddle)
+        let edits = DiffEditCreator.myersDiff(
+            oldLines: oldMiddle,
+            newLines: newMiddle,
+            maximumEditDistance: maximumSparseEditDistance
+        )
         guard !edits.isEmpty else {
             return [EditRegion(
                 oldStart: prefix,

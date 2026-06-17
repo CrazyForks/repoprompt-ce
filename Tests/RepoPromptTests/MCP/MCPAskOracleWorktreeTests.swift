@@ -43,10 +43,19 @@ import XCTest
                         try await endpoint.callTool(
                             name: MCPWindowToolName.readFile,
                             arguments: ["path": logicalFile.path],
-                            timeoutSeconds: 20
+                            timeoutSeconds: 5
                         )
                     }
-                    await gate.waitUntilStarted()
+                    guard await gate.waitUntilStarted() else {
+                        readTask.cancel()
+                        let diagnostic: String
+                        do {
+                            diagnostic = try await readTask.value.rawJSON
+                        } catch {
+                            diagnostic = String(describing: error)
+                        }
+                        throw OracleWorktreeTestError.autoSelectionDidNotStart(readDiagnostic: diagnostic)
+                    }
                     let readResponse = try await readTask.value
                     XCTAssertTrue(try toolResultText(readResponse).contains(worktreeSentinel))
 
@@ -488,30 +497,37 @@ import XCTest
         }
     }
 
+    private enum OracleWorktreeTestError: LocalizedError {
+        case autoSelectionDidNotStart(readDiagnostic: String)
+
+        var errorDescription: String? {
+            switch self {
+            case let .autoSelectionDidNotStart(readDiagnostic):
+                "read_file auto-selection did not start within 2 seconds. read_file result: \(readDiagnostic)"
+            }
+        }
+    }
+
     private actor OracleWorktreeGate {
         private var started = false
         private var released = false
-        private var startWaiters: [CheckedContinuation<Void, Never>] = []
         private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
 
         func markStartedAndWaitForRelease() async {
             started = true
-            let waiters = startWaiters
-            startWaiters.removeAll()
-            for waiter in waiters {
-                waiter.resume()
-            }
             guard !released else { return }
             await withCheckedContinuation { continuation in
                 releaseWaiters.append(continuation)
             }
         }
 
-        func waitUntilStarted() async {
-            guard !started else { return }
-            await withCheckedContinuation { continuation in
-                startWaiters.append(continuation)
+        func waitUntilStarted(timeout: Duration = .seconds(2)) async -> Bool {
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: timeout)
+            while !started, clock.now < deadline {
+                try? await Task.sleep(for: .milliseconds(1))
             }
+            return started
         }
 
         func release() {

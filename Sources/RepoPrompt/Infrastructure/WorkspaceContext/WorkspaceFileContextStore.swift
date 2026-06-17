@@ -5076,6 +5076,21 @@ actor WorkspaceFileContextStore {
         }
     }
 
+    func readValidatedContentSnapshot(
+        rootID: UUID,
+        relativePath: String,
+        workloadClass: ContentReadWorkloadClass = .unspecified
+    ) async throws -> ValidatedFileContentSnapshot {
+        let state = try state(for: rootID)
+        let standardizedRelativePath = StandardizedPath.relative(relativePath)
+        let fingerprint = try await state.service.contentFingerprint(ofRelativePath: standardizedRelativePath)
+        return try await state.service.loadValidatedContent(
+            ofRelativePath: standardizedRelativePath,
+            expectedFingerprint: fingerprint,
+            workloadClass: workloadClass
+        )
+    }
+
     func readContentWithDate(
         rootID: UUID,
         relativePath: String,

@@ -61,6 +61,231 @@ final class SelectionSlicePersistenceAndRebaseTests: XCTestCase {
         XCTAssertTrue(anotherWorkspace.files.isEmpty)
     }
 
+    func testPartitionStoreCASConflictPreservesNewerPartition() async throws {
+        let baseURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SelectionSlicePartitionCAS-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: baseURL) }
+
+        let rootPath = "/tmp/SelectionSlicePartitionCAS/root"
+        let relativePath = "Sources/A.swift"
+        let scope = PartitionScope(workspaceID: UUID(), tabID: UUID())
+        let initial = PartitionStore.StoredSlices(
+            ranges: [LineRange(start: 2, end: 4)],
+            fileModificationTime: 1
+        )
+        let newer = PartitionStore.StoredSlices(
+            ranges: [LineRange(start: 20, end: 24)],
+            fileModificationTime: 2
+        )
+        let writer = PartitionStore(baseURL: baseURL)
+        _ = try await writer.apply(
+            forRoot: rootPath,
+            scope: scope,
+            updates: [relativePath: .init(
+                ranges: initial.ranges,
+                fileModificationTime: initial.fileModificationTime
+            )],
+            mode: .setPaths
+        )
+        _ = try await writer.apply(
+            forRoot: rootPath,
+            scope: scope,
+            updates: [relativePath: .init(
+                ranges: newer.ranges,
+                fileModificationTime: newer.fileModificationTime
+            )],
+            mode: .setPaths
+        )
+
+        let staleWriter = PartitionStore(baseURL: baseURL)
+        let result = try await staleWriter.applyIfCurrent(
+            forRoot: rootPath,
+            scope: scope,
+            updates: [relativePath: .init(
+                ranges: [LineRange(start: 3, end: 5)],
+                fileModificationTime: 3
+            )],
+            mode: .setPaths,
+            expectedCurrent: [relativePath: initial]
+        )
+
+        XCTAssertNil(result)
+        let persisted = await writer.load(forRoot: rootPath, scope: scope)
+        XCTAssertEqual(persisted.files[relativePath], newer)
+    }
+
+    #if DEBUG
+        func testPartitionStoreCASIsSerializedAcrossStoreInstances() async throws {
+            let baseURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("SelectionSlicePartitionConcurrentCAS-\(UUID().uuidString)", isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: baseURL) }
+
+            let rootPath = "/tmp/SelectionSlicePartitionConcurrentCAS/root"
+            let relativePath = "Sources/A.swift"
+            let scope = PartitionScope(workspaceID: UUID(), tabID: UUID())
+            let initial = PartitionStore.StoredSlices(
+                ranges: [LineRange(start: 2, end: 4)],
+                fileModificationTime: 1
+            )
+            let firstStore = PartitionStore(baseURL: baseURL)
+            let secondStore = PartitionStore(baseURL: baseURL)
+            _ = try await firstStore.apply(
+                forRoot: rootPath,
+                scope: scope,
+                updates: [relativePath: .init(
+                    ranges: initial.ranges,
+                    fileModificationTime: initial.fileModificationTime
+                )],
+                mode: .setPaths
+            )
+
+            let firstValidated = expectation(description: "first writer validated expected state")
+            let releaseFirst = SelectionSliceTestSemaphore()
+            await firstStore.setDidValidateCurrentHandlerForTesting {
+                firstValidated.fulfill()
+                releaseFirst.wait()
+            }
+            defer {
+                Task { await firstStore.setDidValidateCurrentHandlerForTesting(nil) }
+                releaseFirst.signal()
+            }
+
+            let firstRanges = [LineRange(start: 10, end: 14)]
+            let secondRanges = [LineRange(start: 20, end: 24)]
+            let firstTask = Task {
+                try await firstStore.applyIfCurrent(
+                    forRoot: rootPath,
+                    scope: scope,
+                    updates: [relativePath: .init(ranges: firstRanges, fileModificationTime: 2)],
+                    mode: .setPaths,
+                    expectedCurrent: [relativePath: initial]
+                )
+            }
+            await fulfillment(of: [firstValidated], timeout: 2)
+            let secondTask = Task {
+                try await secondStore.applyIfCurrent(
+                    forRoot: rootPath,
+                    scope: scope,
+                    updates: [relativePath: .init(ranges: secondRanges, fileModificationTime: 3)],
+                    mode: .setPaths,
+                    expectedCurrent: [relativePath: initial]
+                )
+            }
+            try await Task.sleep(for: .milliseconds(50))
+            releaseFirst.signal()
+
+            let firstResult = try await firstTask.value
+            let secondResult = try await secondTask.value
+            XCTAssertNotNil(firstResult)
+            XCTAssertNil(secondResult)
+            let persisted = await firstStore.load(forRoot: rootPath, scope: scope)
+            XCTAssertEqual(persisted.files[relativePath]?.ranges, firstRanges)
+        }
+
+        func testPartitionStoreCancellationAfterAtomicWriteStillSucceedsAndNotifies() async throws {
+            let baseURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("SelectionSlicePartitionCancellation-\(UUID().uuidString)", isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: baseURL) }
+
+            let store = PartitionStore(baseURL: baseURL)
+            let rootPath = "/tmp/SelectionSlicePartitionCancellation/root"
+            let relativePath = "Sources/A.swift"
+            let scope = PartitionScope(workspaceID: UUID(), tabID: UUID())
+            let persisted = expectation(description: "atomic replacement completed")
+            let notified = expectation(description: "save notification posted")
+            let release = SelectionSliceTestSemaphore()
+            await store.setDidPersistHandlerForTesting {
+                persisted.fulfill()
+                release.wait()
+            }
+            defer {
+                Task { await store.setDidPersistHandlerForTesting(nil) }
+                release.signal()
+            }
+            let sourceID = store.notificationSourceID
+            let observer = NotificationCenter.default.addObserver(
+                forName: PartitionStore.didSaveNotification,
+                object: nil,
+                queue: nil
+            ) { note in
+                guard note.userInfo?[PartitionStore.notifSourceIDKey] as? UUID == sourceID else { return }
+                notified.fulfill()
+            }
+            defer { NotificationCenter.default.removeObserver(observer) }
+
+            let task = Task {
+                try await store.apply(
+                    forRoot: rootPath,
+                    scope: scope,
+                    updates: [relativePath: .init(
+                        ranges: [LineRange(start: 4, end: 8)],
+                        fileModificationTime: 4
+                    )],
+                    mode: .setPaths
+                )
+            }
+            await fulfillment(of: [persisted], timeout: 2)
+            task.cancel()
+            release.signal()
+
+            let result = try await task.value
+            await fulfillment(of: [notified], timeout: 2)
+            XCTAssertEqual(result[relativePath]?.ranges, [LineRange(start: 4, end: 8)])
+            let reloaded = await store.load(forRoot: rootPath, scope: scope)
+            XCTAssertEqual(reloaded.files[relativePath]?.ranges, [LineRange(start: 4, end: 8)])
+        }
+
+        func testValidatedSliceSnapshotRejectsMidReadReplacement() async throws {
+            let rootURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("SelectionSliceValidatedSnapshot-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: rootURL) }
+            let relativePath = "Large.swift"
+            let fileURL = rootURL.appendingPathComponent(relativePath)
+            try Data(repeating: 0x61, count: 2_000_000).write(to: fileURL)
+
+            let store = WorkspaceFileContextStore()
+            let root = try await store.loadRoot(path: rootURL.path)
+            let loadedService = await store.fileSystemServiceForTesting(rootID: root.id)
+            let service = try XCTUnwrap(loadedService)
+            let mutation = SelectionSliceOneShotMutation()
+            await service.setContentReadChunkHandlerForTesting { path in
+                guard path == relativePath, await mutation.take() else { return }
+                try? Data("replacement\n".utf8).write(to: fileURL, options: .atomic)
+            }
+            defer { Task { await service.setContentReadChunkHandlerForTesting(nil) } }
+
+            do {
+                _ = try await store.readValidatedContentSnapshot(
+                    rootID: root.id,
+                    relativePath: relativePath,
+                    workloadClass: .contentSearch
+                )
+                XCTFail("Expected a changed fingerprint to reject the mixed snapshot")
+            } catch FileContentValidationError.fingerprintChanged {
+                // Expected: content and modification date must describe one exact revision.
+            }
+        }
+    #endif
+
+    func testSliceRebaseWholeFileReplacementUsesConservativeBoundedFallback() {
+        let oldLines = (1 ... 2000).map { "old-\($0)" }
+        let newLines = (1 ... 2000).map { "new-\($0)" }
+        let selected = LineRange(start: 900, end: 1100, description: "selection")
+        let oldText = oldLines.joined(separator: "\n") + "\n"
+
+        let result = SliceRebaseEngine.rebase(
+            oldText: oldText,
+            newText: newLines.joined(separator: "\n") + "\n",
+            oldRanges: [selected],
+            anchors: SliceRebaseEngine.buildAnchors(content: oldText, ranges: [selected])
+        )
+
+        XCTAssertEqual(result.rebased, [LineRange(start: 1, end: 2000, description: "selection")])
+        XCTAssertTrue(result.didChange)
+        XCTAssertFalse(result.isStale)
+    }
+
     func testSliceRebaseDropsOnlyWhenPostEditContentHasNoValidLine() {
         let originalRange = LineRange(start: 2, end: 2, description: "selected")
         let oldText = "before\nselected\nafter\n"
@@ -822,3 +1047,27 @@ final class SelectionSlicePersistenceAndRebaseTests: XCTestCase {
         }
     #endif
 }
+
+#if DEBUG
+    private final class SelectionSliceTestSemaphore: @unchecked Sendable {
+        private let semaphore = DispatchSemaphore(value: 0)
+
+        func signal() {
+            semaphore.signal()
+        }
+
+        func wait() {
+            semaphore.wait()
+        }
+    }
+
+    private actor SelectionSliceOneShotMutation {
+        private var available = true
+
+        func take() -> Bool {
+            guard available else { return false }
+            available = false
+            return true
+        }
+    }
+#endif

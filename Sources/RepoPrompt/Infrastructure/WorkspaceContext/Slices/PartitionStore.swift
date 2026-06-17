@@ -42,6 +42,13 @@ actor PartitionStore {
     static let notifTabIDKey = "tabID"
     static let notifSourceIDKey = "sourceID"
     nonisolated let notificationSourceID = UUID()
+    private static let partitionFileLock = NSLock()
+
+    private static func withPartitionFileLock<T>(_ body: () throws -> T) rethrows -> T {
+        partitionFileLock.lock()
+        defer { partitionFileLock.unlock() }
+        return try body()
+    }
 
     /// <AppSupport>/RepoPrompt CE/Partitions
     private static func partitionsBaseURL() -> URL {
@@ -137,6 +144,19 @@ actor PartitionStore {
     private let decoder: JSONDecoder
     private let dateFormatter = ISO8601DateFormatter()
 
+    #if DEBUG
+        private var didPersistHandlerForTesting: (@Sendable () -> Void)?
+        private var didValidateCurrentHandlerForTesting: (@Sendable () -> Void)?
+
+        func setDidPersistHandlerForTesting(_ handler: (@Sendable () -> Void)?) {
+            didPersistHandlerForTesting = handler
+        }
+
+        func setDidValidateCurrentHandlerForTesting(_ handler: (@Sendable () -> Void)?) {
+            didValidateCurrentHandlerForTesting = handler
+        }
+    #endif
+
     init(baseURL: URL? = nil) {
         self.baseURL = baseURL ?? Self.partitionsBaseURL()
         let encoder = JSONEncoder()
@@ -146,7 +166,9 @@ actor PartitionStore {
     }
 
     func load(forRoot rootPath: String, scope: PartitionScope) async -> PartitionData {
-        loadData(forRoot: rootPath, scope: scope)
+        Self.withPartitionFileLock {
+            loadData(forRoot: rootPath, scope: scope)
+        }
     }
 
     private func loadData(forRoot rootPath: String, scope: PartitionScope) -> PartitionData {
@@ -159,7 +181,9 @@ actor PartitionStore {
         scope: PartitionScope,
         data: PartitionData
     ) async throws {
-        try saveData(forRoot: rootPath, scope: scope, data: data)
+        try Self.withPartitionFileLock {
+            try saveData(forRoot: rootPath, scope: scope, data: data)
+        }
     }
 
     private func saveData(
@@ -180,9 +204,13 @@ actor PartitionStore {
         let encoded = try encoder.encode(dataToPersist)
         try Task.checkCancellation()
         try encoded.write(to: url, options: [.atomic])
-        try Task.checkCancellation()
+        #if DEBUG
+            didPersistHandlerForTesting?()
+        #endif
 
-        // Inform other windows/tabs within the process to reload slices for this scope
+        // The atomic replacement is the commit point. Once it succeeds, always publish
+        // the matching notification even if the caller is cancelled concurrently.
+        // Inform other windows/tabs within the process to reload slices for this scope.
         postSaveNotification(rootPath: rootPath, scope: scope)
     }
 
@@ -229,6 +257,9 @@ actor PartitionStore {
         mode: SliceMutationMode,
         expectedCurrent: [String: StoredSlices]?
     ) throws -> [String: StoredSlices]? {
+        Self.partitionFileLock.lock()
+        defer { Self.partitionFileLock.unlock() }
+
         try Task.checkCancellation()
         var data = loadData(forRoot: rootPath, scope: scope)
         try Task.checkCancellation()
@@ -237,6 +268,11 @@ actor PartitionStore {
         {
             return nil
         }
+        #if DEBUG
+            if expectedCurrent != nil {
+                didValidateCurrentHandlerForTesting?()
+            }
+        #endif
         switch mode {
         case .set:
             var next: [String: StoredSlices] = [:]
@@ -325,7 +361,6 @@ actor PartitionStore {
 
         try Task.checkCancellation()
         try saveData(forRoot: rootPath, scope: scope, data: data)
-        try Task.checkCancellation()
         return data.files
     }
 

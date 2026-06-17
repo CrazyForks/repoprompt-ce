@@ -1762,6 +1762,7 @@ extension MCPServerViewModel {
         )
         if var snapshot = resolved?.snapshot,
            let sessionID = snapshot.activeAgentSessionID,
+           snapshot.worktreeBindingState == .unhydrated,
            let agentWorktreeBindingStateResolver
         {
             snapshot.worktreeBindingState = await agentWorktreeBindingStateResolver(sessionID, snapshot.tabID)

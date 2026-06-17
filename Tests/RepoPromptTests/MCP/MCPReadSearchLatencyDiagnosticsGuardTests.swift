@@ -2252,7 +2252,7 @@
             for case let fileURL as URL in enumerator where fileURL.pathExtension == "swift" {
                 let contents = try String(contentsOf: fileURL, encoding: .utf8)
                 guard contents.contains(needle) else { continue }
-                matches.append(fileURL.path.replacingOccurrences(of: root.path + "/", with: ""))
+                matches.append(RepoRoot.relativePath(for: fileURL, relativeTo: root))
             }
             return matches.sorted()
         }
