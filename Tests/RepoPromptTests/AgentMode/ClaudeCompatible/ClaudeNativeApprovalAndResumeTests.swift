@@ -3,6 +3,54 @@ import Foundation
 import XCTest
 
 final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
+    enum ResolverError: Error {
+        case unsupportedModel
+    }
+
+    actor RecordingLaunchEnvironmentResolver: ClaudeCodeLaunchEnvironmentResolving {
+        private(set) var requestedModels: [String?] = []
+
+        func resolve(
+            variant _: ClaudeCodeRuntimeVariant,
+            requestedModel: String?
+        ) async throws -> ClaudeCodeLaunchEnvironment {
+            requestedModels.append(requestedModel)
+            guard requestedModel != "glm-5-turbo:xhigh" else {
+                throw ResolverError.unsupportedModel
+            }
+            return ClaudeCodeLaunchEnvironment(
+                effectiveModel: "sonnet",
+                environmentOverrides: [:],
+                backend: .compatible(.glmZAI)
+            )
+        }
+    }
+
+    func testNativeFlagResolutionPassesEncodedGLMModelToResolver() async throws {
+        let resolver = RecordingLaunchEnvironmentResolver()
+        let controller = ClaudeNativeProcessSessionController(
+            runID: UUID(),
+            tabID: UUID(),
+            windowID: 1,
+            workspacePath: nil,
+            config: .discovery(
+                commandName: "/usr/bin/false",
+                runtimeVariant: .glm
+            ),
+            environmentResolver: resolver
+        )
+
+        do {
+            _ = try await controller.test_resolveApplyFlagSettingsRequest(model: "glm-5-turbo:xhigh")
+            XCTFail("Expected encoded unsupported GLM XHigh model to be rejected by the resolver")
+        } catch ResolverError.unsupportedModel {
+            // Expected.
+        }
+
+        let requestedModels = await resolver.requestedModels
+        XCTAssertEqual(requestedModels, ["glm-5-turbo:xhigh"])
+    }
+
     func testRepoPromptPermissionAutoApprovalAndAllowPayloadPreserveToolUseID() throws {
         let repoPromptPayload: [String: Any] = [
             "tool_name": "mcp__RepoPromptCE__read_file",

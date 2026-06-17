@@ -125,11 +125,27 @@ final class ClaudeCodeCompatibleBackendStore: @unchecked Sendable {
     ) -> ClaudeCodeCompatibleBackendConfig? {
         guard id == .glmZAI,
               case let .claudeSlotMapping(mapping) = config.modelBehavior,
-              mapping == Self.legacyGLMDefaultSlotMapping
+              case let .claudeSlotMapping(defaultMapping) = ClaudeCodeCompatibleBackendID.glmZAI.defaultPreset.modelBehavior
         else { return nil }
 
+        var migratedMapping = mapping
+        var didMigrate = false
+        if migratedMapping.haiku == Self.legacyGLMDefaultSlotMapping.haiku {
+            migratedMapping.haiku = defaultMapping.haiku
+            didMigrate = true
+        }
+        if migratedMapping.sonnet == Self.legacyGLMDefaultSlotMapping.sonnet {
+            migratedMapping.sonnet = defaultMapping.sonnet
+            didMigrate = true
+        }
+        if migratedMapping.opus == Self.legacyGLMDefaultSlotMapping.opus {
+            migratedMapping.opus = defaultMapping.opus
+            didMigrate = true
+        }
+        guard didMigrate else { return nil }
+
         var migrated = config
-        migrated.modelBehavior = ClaudeCodeCompatibleBackendID.glmZAI.defaultPreset.modelBehavior
+        migrated.modelBehavior = .claudeSlotMapping(migratedMapping)
         return migrated
     }
 

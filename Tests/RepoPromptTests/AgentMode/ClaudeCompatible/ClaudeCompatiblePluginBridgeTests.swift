@@ -257,13 +257,35 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
         XCTAssertEqual(secondRead.updatedAt, updatedAt)
     }
 
-    func testGLMCustomizedSlotMappingDoesNotMigrate() throws {
+    func testGLMPartialLegacySlotMappingMigratesUntouchedSlotsOnly() throws {
+        let defaults = try makeIsolatedDefaults()
+        let store = ClaudeCodeCompatibleBackendStore(defaults: defaults)
+        var partiallyCustomized = oldGLMDefaultConfig()
+        partiallyCustomized.modelBehavior = .claudeSlotMapping(.init(
+            haiku: "glm-4.7",
+            sonnet: "glm-5-turbo",
+            opus: "custom-opus"
+        ))
+        try persistConfigs([.glmZAI: partiallyCustomized], defaults: defaults)
+
+        var expected = partiallyCustomized
+        expected.modelBehavior = .claudeSlotMapping(.init(
+            haiku: "glm-4.5-air",
+            sonnet: "glm-5.2[1m]",
+            opus: "custom-opus"
+        ))
+
+        XCTAssertEqual(store.config(for: .glmZAI), expected)
+        XCTAssertEqual(try loadPersistedConfig(for: .glmZAI, defaults: defaults), expected)
+    }
+
+    func testGLMFullyCustomSlotMappingDoesNotMigrate() throws {
         let defaults = try makeIsolatedDefaults()
         let store = ClaudeCodeCompatibleBackendStore(defaults: defaults)
         var customized = oldGLMDefaultConfig()
         customized.modelBehavior = .claudeSlotMapping(.init(
-            haiku: "glm-4.7",
-            sonnet: "glm-5-turbo",
+            haiku: "custom-haiku",
+            sonnet: "custom-sonnet",
             opus: "custom-opus"
         ))
         try persistConfigs([.glmZAI: customized], defaults: defaults)

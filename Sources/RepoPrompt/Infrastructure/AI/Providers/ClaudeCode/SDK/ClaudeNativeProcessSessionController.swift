@@ -584,7 +584,7 @@ final actor ClaudeNativeProcessSessionController {
     ) async throws -> (launchEnvironment: ClaudeCodeLaunchEnvironment, request: [String: Any]?) {
         let modelSpecifier = model.map { ClaudeModelSpecifier(raw: $0) }
         let requestedModel = modelSpecifier != nil
-            ? modelSpecifier?.runtimeModelParam
+            ? model
             : config.modelString
         let effectiveEffortLevel = modelSpecifier?.explicitEffortLevel
             ?? suppliedEffortLevel
