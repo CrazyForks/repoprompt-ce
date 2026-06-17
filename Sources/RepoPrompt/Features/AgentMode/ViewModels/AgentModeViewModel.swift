@@ -7942,6 +7942,7 @@ final class AgentModeViewModel: ObservableObject {
             precomputedEphemeralPayloadRevisionByItemID: session.ephemeralToolResultPayloadRevisionByItemID,
             selectedAgent: session.selectedAgent,
             previousPerformanceSnapshot: previousPerformanceSnapshotForBuild,
+            previousAnalyticsSnapshot: session.transcriptAnalyticsSnapshot,
             previousSanitizedTranscript: existingTranscript,
             previousBaseProjection: session.baseTranscriptProjection,
             previousTurnProjectionCaches: session.turnProjectionCaches,
@@ -8332,6 +8333,7 @@ final class AgentModeViewModel: ObservableObject {
         precomputedEphemeralPayloadRevisionByItemID: [UUID: Int]? = nil,
         selectedAgent: AgentProviderKind,
         previousPerformanceSnapshot: AgentTranscriptPerformanceSnapshot,
+        previousAnalyticsSnapshot: AgentTranscriptAnalyticsSnapshot? = nil,
         previousSanitizedTranscript: AgentTranscript? = nil,
         previousBaseProjection: AgentTranscriptProjection? = nil,
         previousTurnProjectionCaches: [UUID: AgentTranscriptTurnProjectionCache] = [:],
@@ -8605,6 +8607,27 @@ final class AgentModeViewModel: ObservableObject {
                 performanceSnapshot.lastColdLoadProjectionBuildDurationMS = buildDurationMS
             }
         #endif
+        let canReuseAnalyticsSnapshot: Bool = if let previousSanitizedTranscript {
+            previousSanitizedTranscript.version == sanitizedTranscript.version
+                && previousSanitizedTranscript.nextSequenceIndex == sanitizedTranscript.nextSequenceIndex
+                && previousSanitizedTranscript.compactionFrontier == sanitizedTranscript.compactionFrontier
+                && previousSanitizedTranscript.turns.count == sanitizedTranscript.turns.count
+                && sanitizeMetrics.reusedTurnCount == sanitizedTranscript.turns.count
+        } else {
+            sanitizedTranscript.turns.isEmpty
+        }
+        let analyticsSnapshot: AgentTranscriptAnalyticsSnapshot = if let previousAnalyticsSnapshot,
+                                                                     previousAnalyticsSnapshot.selectedAgent == selectedAgent,
+                                                                     canReuseAnalyticsSnapshot
+        {
+            previousAnalyticsSnapshot
+        } else {
+            AgentTranscriptAnalyticsBuilder.build(
+                from: sanitizedTranscript,
+                selectedAgent: selectedAgent
+            )
+        }
+
         return BuiltTranscriptPresentation(
             transcript: sanitizedTranscript,
             baseProjection: baseProjection,
@@ -8616,10 +8639,7 @@ final class AgentModeViewModel: ObservableObject {
             projectionProtection: projectionProtection,
             canonicalVisibleRowCount: canonicalVisibleRowCount,
             projectionCounts: projectionCounts,
-            analyticsSnapshot: AgentTranscriptAnalyticsBuilder.build(
-                from: sanitizedTranscript,
-                selectedAgent: selectedAgent
-            ),
+            analyticsSnapshot: analyticsSnapshot,
             sanitizedActivityCount: sanitizeMetrics.sanitizedActivityCount,
             performanceSnapshot: performanceSnapshot,
             rawToolResultPayloadRenderRevision: rawToolResultPayloadRenderRevision
@@ -8793,6 +8813,7 @@ final class AgentModeViewModel: ObservableObject {
             precomputedEphemeralPayloadRevisionByItemID: canonicalSourceItems == session.items ? session.ephemeralToolResultPayloadRevisionByItemID : nil,
             selectedAgent: session.selectedAgent,
             previousPerformanceSnapshot: session.transcriptPerformanceSnapshot,
+            previousAnalyticsSnapshot: session.transcriptAnalyticsSnapshot,
             previousSanitizedTranscript: session.transcript,
             previousBaseProjection: session.baseTranscriptProjection,
             previousTurnProjectionCaches: session.turnProjectionCaches,
