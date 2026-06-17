@@ -155,9 +155,7 @@ final class WorkspaceFileDecodeCache: @unchecked Sendable {
     }
 
     private func insertLocked(_ workspace: WorkspaceModel, for key: WorkspaceFileDecodeCacheKey, estimatedCost: Int) {
-        if let existing = cachedWorkspacesByKey[key] {
-            totalEstimatedCost -= existing.estimatedCost
-        }
+        removeCachedWorkspacesLocked { $0.standardizedPath == key.standardizedPath }
         let boundedEstimatedCost = max(1, estimatedCost)
         cachedWorkspacesByKey[key] = CacheEntry(
             workspace: workspace,

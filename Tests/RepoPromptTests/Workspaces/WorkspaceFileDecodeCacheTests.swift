@@ -65,6 +65,29 @@ final class WorkspaceFileDecodeCacheTests: XCTestCase {
         XCTAssertFalse(try WorkspaceManagerViewModel.loadWorkspaceFromFileResult(at: nonStandardURL).cacheHit)
     }
 
+    func testCacheReplacesOlderMetadataEntriesForSameStandardizedPath() throws {
+        WorkspaceFileDecodeCache.shared.setBudgetForTesting(maxEntryCount: 8, maxEstimatedCost: .max)
+        let directory = try makeTemporaryDirectory()
+        let workspaceDirectory = directory.appendingPathComponent("SamePath", isDirectory: true)
+        let fileURL = workspaceDirectory.appendingPathComponent("workspace.json")
+
+        try writeWorkspace(
+            named: "Same Path First",
+            to: fileURL,
+            modificationDate: Date(timeIntervalSince1970: 1000)
+        )
+        XCTAssertFalse(try WorkspaceManagerViewModel.loadWorkspaceFromFileResult(at: fileURL).cacheHit)
+        XCTAssertEqual(WorkspaceFileDecodeCache.shared.cachedEntryCountForTesting, 1)
+
+        try writeWorkspace(
+            named: "Same Path Second With Different Metadata",
+            to: fileURL,
+            modificationDate: Date(timeIntervalSince1970: 2000)
+        )
+        XCTAssertFalse(try WorkspaceManagerViewModel.loadWorkspaceFromFileResult(at: fileURL).cacheHit)
+        XCTAssertEqual(WorkspaceFileDecodeCache.shared.cachedEntryCountForTesting, 1)
+    }
+
     private func makeTemporaryDirectory() throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("WorkspaceFileDecodeCacheTests-\(UUID().uuidString)", isDirectory: true)
@@ -74,10 +97,22 @@ final class WorkspaceFileDecodeCacheTests: XCTestCase {
 
     private func writeWorkspace(named name: String, in directory: URL) throws -> URL {
         let workspaceDirectory = directory.appendingPathComponent(name, isDirectory: true)
-        try FileManager.default.createDirectory(at: workspaceDirectory, withIntermediateDirectories: true)
         let fileURL = workspaceDirectory.appendingPathComponent("workspace.json")
+        try writeWorkspace(named: name, to: fileURL)
+        return fileURL
+    }
+
+    private func writeWorkspace(
+        named name: String,
+        to fileURL: URL,
+        modificationDate: Date = Date()
+    ) throws {
+        try FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
         let workspace = WorkspaceModel(name: name, repoPaths: [])
         try JSONEncoder().encode(workspace).write(to: fileURL, options: .atomic)
-        return fileURL
+        try FileManager.default.setAttributes([.modificationDate: modificationDate], ofItemAtPath: fileURL.path)
     }
 }
