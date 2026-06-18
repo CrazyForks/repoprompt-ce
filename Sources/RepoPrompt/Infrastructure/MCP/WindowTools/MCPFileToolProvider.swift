@@ -371,7 +371,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             EditFlowPerf.Dimensions(outcome: readResult.shouldAutoSelect ? "attempted" : "skipped")
         ) {
             if readResult.shouldAutoSelect {
-                await dependencies.enqueueReadFileAutoSelection(readResult.reply, path, metadata)
+                await dependencies.enqueueReadFileAutoSelection(readResult.reply, path, resolvedPath, metadata)
             }
         }
         try Task.checkCancellation()
@@ -760,6 +760,19 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             )
         }
         endDTOBuildIfNeeded()
+        var physicalPathsByLogicalPath: [String: Set<String>] = [:]
+        for (logicalMatch, physicalMatch) in zip(
+            includedContentMatches,
+            (results.matches ?? []).prefix(includedContentMatches.count)
+        ) {
+            physicalPathsByLogicalPath[logicalMatch.filePath, default: []].insert(physicalMatch.filePath)
+        }
+        let autoSelectionResolvedPhysicalPaths = reply.contentMatchGroups.compactMap { group -> String? in
+            guard let candidates = physicalPathsByLogicalPath[group.path], candidates.count == 1 else {
+                return nil
+            }
+            return candidates.first
+        }
         EditFlowPerf.lifecycleEvent(
             EditFlowPerf.Lifecycle.Search.providerDTOReady,
             EditFlowPerf.Dimensions(outcome: dtoBuildOutcome, searchMode: mode.rawValue, countOnly: false)
@@ -769,7 +782,13 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             EditFlowPerf.Stage.Search.providerAutoSelection,
             EditFlowPerf.Dimensions(searchMode: mode.rawValue, contextLines: contextLines)
         ) {
-            await dependencies.enqueueFileSearchAutoSelection(mode, contextLines, reply, metadata)
+            await dependencies.enqueueFileSearchAutoSelection(
+                mode,
+                contextLines,
+                reply,
+                autoSelectionResolvedPhysicalPaths,
+                metadata
+            )
         }
         EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerAutoSelectionReturned)
         return reply

@@ -115,7 +115,8 @@ enum AgentWorkspaceLookupContextResolver {
             sessionID: sessionID,
             bindings: bindings
         ),
-            !projection.isEmpty
+            !projection.isEmpty,
+            projection.isFullyMaterialized
         else {
             throw AgentWorkspaceLookupContextResolutionError.unavailableProjection
         }

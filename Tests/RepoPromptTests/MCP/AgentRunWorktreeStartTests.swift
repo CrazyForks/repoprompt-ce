@@ -1026,6 +1026,32 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             snapshot = try XCTUnwrap(immediateSnapshot)
         }
         XCTAssertTrue(snapshot.fileAPI?.apiDescription.contains("TransitionWorktreeType") == true)
+
+        let activeDiagnostics = await window.workspaceFileContextStore.readSearchRootDiagnosticsSnapshot()
+        let activeRoot = try XCTUnwrap(activeDiagnostics.first { $0.rootID == physicalRoot.id })
+        XCTAssertTrue(activeRoot.watcherActive)
+        XCTAssertEqual(activeRoot.sessionWorktreeOwnerCount, 1)
+        XCTAssertEqual(activeRoot.crawlCount, 1)
+
+        _ = await window.mcpServer.materializeWorkspaceBindingProjection(
+            sessionID: sessionID,
+            bindings: [binding]
+        )
+        let repeatedDiagnostics = await window.workspaceFileContextStore.readSearchRootDiagnosticsSnapshot()
+        XCTAssertEqual(repeatedDiagnostics.first { $0.rootID == physicalRoot.id }?.crawlCount, 1)
+        XCTAssertEqual(repeatedDiagnostics.first { $0.rootID == physicalRoot.id }?.sessionWorktreeOwnerCount, 1)
+
+        _ = try await viewModel.transitionWorktreeBindings(
+            [],
+            forSessionID: sessionID,
+            intent: .externalManagement
+        )
+        XCTAssertTrue(session.worktreeBindings.isEmpty)
+        let rootsAfterUnbind = await window.workspaceFileContextStore.roots()
+        XCTAssertFalse(rootsAfterUnbind.contains { $0.id == physicalRoot.id })
+        let releasedOwnership = await window.workspaceFileContextStore.sessionWorktreeOwnershipDebugSnapshotForTesting()
+        XCTAssertEqual(releasedOwnership.installedOwnerCount, 0)
+        XCTAssertEqual(releasedOwnership.rootClaimCount, 0)
     }
 
     func testBindingTransitionValidatesAndMaterializesChangedSecondaryBindingWithoutRestartingPrimaryIdentity() async throws {

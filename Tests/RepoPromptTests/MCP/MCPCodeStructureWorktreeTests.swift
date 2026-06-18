@@ -311,6 +311,24 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
             )]
         )
         let projectionA = try XCTUnwrap(materializedA)
+        let fileA = try await fileRecord(
+            at: worktreeAURL.appendingPathComponent("Sources/App.swift"),
+            store: store,
+            rootScope: projectionA.lookupRootScope
+        )
+        // Materialization starts codemap scans asynchronously. Prime A before switching ownership
+        // so this test retains a stale A record and isolates B-scope filtering.
+        let snapshotA = try await waitForCodemapSnapshot(store: store, fileID: fileA.id, timeout: .seconds(12))
+        XCTAssertTrue(snapshotA.fileAPI?.apiDescription.contains("WorktreeAType") == true)
+
+        let dtoA = try await window.mcpServer.buildCodeStructureDTO(
+            fromRecords: [fileA],
+            maxResults: 10,
+            includeUnmappedPaths: true,
+            lookupContext: WorkspaceLookupContext(rootScope: projectionA.lookupRootScope, bindingProjection: projectionA)
+        )
+        XCTAssertTrue(dtoA.content.contains("WorktreeAType"), dtoA.content)
+
         let materializedB = await WorkspaceRootBindingProjectionMaterializer(store: store).materialize(
             sessionID: sessionID,
             bindings: [makeBinding(
@@ -320,30 +338,13 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
             )]
         )
         let projectionB = try XCTUnwrap(materializedB)
-        let fileA = try await fileRecord(
-            at: worktreeAURL.appendingPathComponent("Sources/App.swift"),
-            store: store,
-            rootScope: projectionA.lookupRootScope
-        )
         let fileB = try await fileRecord(
             at: worktreeBURL.appendingPathComponent("Sources/App.swift"),
             store: store,
             rootScope: projectionB.lookupRootScope
         )
-        // Materialization starts codemap scans asynchronously. Prime both snapshots so this test isolates scope filtering;
-        // active-scan pending behavior is covered separately.
-        let snapshotA = try await waitForCodemapSnapshot(store: store, fileID: fileA.id, timeout: .seconds(12))
         let snapshotB = try await waitForCodemapSnapshot(store: store, fileID: fileB.id, timeout: .seconds(12))
-        XCTAssertTrue(snapshotA.fileAPI?.apiDescription.contains("WorktreeAType") == true)
         XCTAssertTrue(snapshotB.fileAPI?.apiDescription.contains("WorktreeBType") == true)
-
-        let dtoA = try await window.mcpServer.buildCodeStructureDTO(
-            fromRecords: [fileA],
-            maxResults: 10,
-            includeUnmappedPaths: true,
-            lookupContext: WorkspaceLookupContext(rootScope: projectionA.lookupRootScope, bindingProjection: projectionA)
-        )
-        XCTAssertTrue(dtoA.content.contains("WorktreeAType"), dtoA.content)
 
         let dtoB = try await window.mcpServer.buildCodeStructureDTO(
             fromRecords: [fileA, fileB],

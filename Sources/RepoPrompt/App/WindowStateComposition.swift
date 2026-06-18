@@ -146,6 +146,9 @@ enum WindowStateCompositionFactory {
             oracleViewModel: oracleViewModel,
             applyEditsApprovalStore: applyEditsApprovalStore
         )
+        workspaceFilesViewModel.setSessionWorktreeBindingsProvider { [weak agentModeViewModel] sessionID in
+            agentModeViewModel?.worktreeBindings(forAgentSessionID: sessionID) ?? []
+        }
         if deferredInitialAgentSystemWorkspaceRefresh {
             agentModeViewModel.deferInitialSystemWorkspaceSessionListRefresh(reason: "programmaticNewWindowWorkspaceSwitch")
         }

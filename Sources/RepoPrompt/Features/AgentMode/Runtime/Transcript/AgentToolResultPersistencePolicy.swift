@@ -145,6 +145,7 @@ enum AgentToolResultPersistencePolicy {
             || normalizedToolName == "agent_manage"
             || normalizedToolName == "ask_oracle"
             || normalizedToolName == "oracle_send"
+            || normalizedToolName == "context_builder"
         let looksLikeCursorACPPayload = rawResultJSON?.contains("\"acp_status\"") == true
         let needsRawObjectFallbacks =
             requiresStructuredSummaryDetails
@@ -298,7 +299,8 @@ enum AgentToolResultPersistencePolicy {
             let allowedTools: Set = [
                 "apply_edits",
                 "ask_oracle",
-                "oracle_send"
+                "oracle_send",
+                "context_builder"
             ]
             guard let normalizedToolName,
                   let resultJSON = sanitized?.resultJSON,
@@ -1421,6 +1423,14 @@ enum AgentToolResultPersistencePolicy {
                 renderSummary: renderSummary
             )
         }
+        if normalizedToolName == "context_builder",
+           let rawOutput = rawObject?["rawOutput"] as? [String: Any]
+        {
+            return contextBuilderSummaryJSON(
+                statusWord: statusWord,
+                rawObject: rawOutput
+            )
+        }
         if let cursorSummaryJSON = cursorACPSummaryJSON(
             normalizedToolName: normalizedToolName,
             statusWord: statusWord,
@@ -1456,6 +1466,11 @@ enum AgentToolResultPersistencePolicy {
         case "ask_oracle", "oracle_send":
             return oracleChatSummaryJSON(
                 normalizedToolName: normalizedToolName,
+                statusWord: statusWord,
+                rawObject: rawObject
+            )
+        case "context_builder":
+            return contextBuilderSummaryJSON(
                 statusWord: statusWord,
                 rawObject: rawObject
             )
@@ -1674,6 +1689,11 @@ enum AgentToolResultPersistencePolicy {
         }
         if let title = smallStringValue(rawObject, keys: ["title"]) {
             object["title"] = title
+        }
+        if normalizedToolName == "ask_oracle" || normalizedToolName == "oracle_send",
+           let chatID = smallStringValue(rawObject, keys: ["chat_id", "chatID"])
+        {
+            object["chat_id"] = chatID
         }
         return object
     }
@@ -2068,6 +2088,54 @@ enum AgentToolResultPersistencePolicy {
             object["summary_text"] = "\(skippedCount) skipped"
         }
         return jsonString(from: object)
+    }
+
+    private static func contextBuilderSummaryJSON(
+        statusWord: String,
+        rawObject: [String: Any]?
+    ) -> String? {
+        var object = genericSummaryObject(
+            normalizedToolName: "context_builder",
+            statusWord: statusWord,
+            processID: nil,
+            exitCode: nil
+        )
+        guard let rawObject else { return jsonString(from: object) }
+
+        if let contextID = smallStringValue(rawObject, keys: ["context_id", "tab_id", "tabID"]) {
+            object["context_id"] = contextID
+        }
+        let responseType = smallStringValue(rawObject, keys: ["response_type", "responseType"])
+        if let responseType {
+            object["response_type"] = responseType
+        }
+
+        let selectedKey: String? = switch responseType?.lowercased() {
+        case "review": "review"
+        case "plan", "question": "plan"
+        default: nil
+        }
+        if let selectedKey,
+           let reply = boundedContextBuilderReply(rawObject[selectedKey] as? [String: Any])
+        {
+            object[selectedKey] = reply
+        }
+
+        guard let json = jsonString(from: object), !exceedsPersistedToolSummaryBudget(json) else {
+            return minimalResultJSON(statusWord: statusWord, normalizedToolName: "context_builder")
+        }
+        return json
+    }
+
+    private static func boundedContextBuilderReply(_ rawReply: [String: Any]?) -> [String: Any]? {
+        guard let rawReply,
+              let chatID = smallStringValue(rawReply, keys: ["chat_id", "chatID"])
+        else { return nil }
+        var reply: [String: Any] = ["chat_id": chatID]
+        if let mode = smallStringValue(rawReply, keys: ["mode"]) {
+            reply["mode"] = mode
+        }
+        return reply
     }
 
     private static func oracleChatSummaryJSON(

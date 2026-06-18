@@ -25,6 +25,38 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
         try await waitUntil { await provider.isDisposeFinished() }
     }
 
+    func testWorkspaceSwitchReleasesSessionWorktreeOwnershipBeforeDiscardingSessions() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgentModeWorkspaceSwitchOwnership-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try "seed".write(to: root.appendingPathComponent("Seed.swift"), atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let store = WorkspaceFileContextStore()
+        let sessionID = UUID()
+        let preparation = try await store.prepareSessionWorktreeOwnership(
+            ownerID: sessionID,
+            bindingFingerprint: "workspace-switch-release",
+            physicalRootPaths: [root.path]
+        )
+        let ownedRoots = try await store.commitSessionWorktreeOwnership(preparation)
+        XCTAssertEqual(ownedRoots.count, 1)
+
+        let viewModel = makeViewModel(workspaceFileContextStore: store)
+        let session = viewModel.session(for: UUID())
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+
+        await viewModel.handleWorkspaceSwitch(nil)
+
+        XCTAssertTrue(viewModel.sessions.isEmpty)
+        let loadedRoots = await store.roots()
+        XCTAssertTrue(loadedRoots.isEmpty)
+        let ownership = await store.sessionWorktreeOwnershipDebugSnapshotForTesting()
+        XCTAssertEqual(ownership.installedOwnerCount, 0)
+        XCTAssertEqual(ownership.provisionalOwnerCount, 0)
+        XCTAssertEqual(ownership.rootClaimCount, 0)
+    }
+
     func testWorkspaceSwitchBackgroundCleanupUsesCapturedRunIDAfterForegroundSessionsAreCleared() async throws {
         let routing = RoutingRecorder()
         let cancelled = RoutingRecorder()
@@ -123,13 +155,15 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
     }
 
     private func makeViewModel(
+        workspaceFileContextStore: WorkspaceFileContextStore? = nil,
         mcpRunRoutingCleaner: @escaping AgentModeViewModel.MCPRunRoutingCleaner = { _, _, _ in },
         mcpRunToolCanceller: AgentModeViewModel.MCPRunToolCanceller? = nil
     ) -> AgentModeViewModel {
         AgentModeViewModel(
             codexControllerFactory: { _, _, _, _, _, _ in FakeCodexSessionController() },
             mcpRunRoutingCleaner: mcpRunRoutingCleaner,
-            mcpRunToolCanceller: mcpRunToolCanceller
+            mcpRunToolCanceller: mcpRunToolCanceller,
+            testWorkspaceFileContextStore: workspaceFileContextStore
         )
     }
 

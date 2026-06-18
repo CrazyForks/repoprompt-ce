@@ -105,6 +105,7 @@ extension AgentModeViewModel {
 
         var isPreparingInitialWorktree: Bool = false
         var isChangingExecutionLocation: Bool = false
+        var worktreeBindingTransitionInProgress: Bool = false
 
         // Wait/question state
         @Published var waitingPrompt: String? = nil
