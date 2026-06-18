@@ -462,9 +462,23 @@ extension MCPServerViewModel {
 
     @MainActor
     private func invalidateReadFileAutoSelection(connectionID: UUID, context: TabScopedContext) {
-        readFileAutoSelectionCoordinator.invalidate(
-            context: readFileAutoSelectionContextKey(connectionID: connectionID, context: context)
-        )
+        let key = readFileAutoSelectionContextKey(connectionID: connectionID, context: context)
+        evictReadFileAutoSelectionCoverageCertificate(for: key)
+        #if DEBUG
+            readFileAutoSelectionForcedAuthoritativeProbeIDsByContext.removeValue(forKey: key)
+            let serverIdentity = ObjectIdentifier(self)
+            Task {
+                await MCPReadFileAutoSelectionProbeRegistry.shared.cancel(
+                    serverIdentity: serverIdentity,
+                    contextKey: key
+                )
+                await MCPApplyEditsRebaseProbeRegistry.shared.cancel(
+                    serverIdentity: serverIdentity,
+                    contextKey: key
+                )
+            }
+        #endif
+        readFileAutoSelectionCoordinator.invalidate(context: key)
     }
 
     @MainActor
@@ -1447,7 +1461,8 @@ extension MCPServerViewModel {
         for tabID: UUID,
         workspaceID: UUID?,
         selectionCoordinator: WorkspaceSelectionCoordinator?,
-        mirrorToUIIfActive: Bool = true
+        mirrorToUIIfActive: Bool = true,
+        expectedCurrentSelection: StoredSelection? = nil
     ) async -> MCPSelectionCoordinatorPersistenceResult {
         guard let workspaceID, let selectionCoordinator else { return .unavailable }
         let identity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: tabID)
@@ -1460,7 +1475,8 @@ extension MCPServerViewModel {
             selection,
             for: identity,
             source: .mcpTabContext,
-            mirrorToUIIfActive: mirrorToUIIfActive
+            mirrorToUIIfActive: mirrorToUIIfActive,
+            expectedCurrentSelection: expectedCurrentSelection
         )
         return outcome
     }
@@ -1471,14 +1487,16 @@ extension MCPServerViewModel {
         for tabID: UUID,
         workspaceID: UUID?,
         selectionCoordinator: WorkspaceSelectionCoordinator?,
-        mirrorToUIIfActive: Bool = true
+        mirrorToUIIfActive: Bool = true,
+        expectedCurrentSelection: StoredSelection? = nil
     ) async -> MCPSelectionPersistenceVerification {
         let outcome = await persistMCPSelectionThroughCoordinator(
             selection,
             for: tabID,
             workspaceID: workspaceID,
             selectionCoordinator: selectionCoordinator,
-            mirrorToUIIfActive: mirrorToUIIfActive
+            mirrorToUIIfActive: mirrorToUIIfActive,
+            expectedCurrentSelection: expectedCurrentSelection
         )
         let canonicalSelection = workspaceID.flatMap { workspaceID in
             selectionCoordinator?
@@ -1574,34 +1592,11 @@ extension MCPServerViewModel {
         return verification
     }
 
-    @MainActor
-    private func readFileAutoSelectionPersistenceContext(
-        selection: StoredSelection,
-        contextKey: MCPReadFileAutoSelectionCoordinator.ContextKey
-    ) async -> TabContextSnapshot? {
-        guard var context = readFileAutoSelectionContext(for: contextKey),
-              context.tabID == contextKey.tabID
-        else { return nil }
-        context.selection = selection
-        return context
-    }
-
-    @MainActor
-    private func persistedSelectionForReadFileAutoSelection(
-        selection: StoredSelection,
-        contextKey: MCPReadFileAutoSelectionCoordinator.ContextKey
-    ) async -> StoredSelection {
-        guard let persistenceContext = await readFileAutoSelectionPersistenceContext(
-            selection: selection,
-            contextKey: contextKey
-        ) else { return selection }
-        #if DEBUG
-            if let handler = readFileAutoSelectionPersistenceWillResolveHandlerForTesting {
-                await handler()
-            }
-        #endif
-        let persistedContext = await persistenceSafeTabContext(persistenceContext)
-        return persistedContext.selection
+    struct ReadFileAutoSelectionAuthoritativeResult: Equatable {
+        let persistedSelection: StoredSelection
+        let canonicalUnchanged: Bool
+        let coordinatorVerified: Bool
+        let selectionRevision: UInt64
     }
 
     @MainActor
@@ -1624,46 +1619,111 @@ extension MCPServerViewModel {
     @MainActor
     func acceptReadFileAutoSelection(
         selection: StoredSelection,
-        contextKey: MCPReadFileAutoSelectionCoordinator.ContextKey
-    ) async -> Bool {
-        guard isReadFileAutoSelectionContextCurrent(contextKey) else { return false }
+        lookupContext: WorkspaceLookupContext,
+        contextKey: MCPReadFileAutoSelectionCoordinator.ContextKey,
+        expectedBaseSelection: StoredSelection
+    ) async -> ReadFileAutoSelectionAuthoritativeResult? {
+        guard isReadFileAutoSelectionContextCurrent(contextKey) else { return nil }
 
-        let persistedSelection = await persistedSelectionForReadFileAutoSelection(
-            selection: selection,
-            contextKey: contextKey
+        #if DEBUG
+            if let handler = readFileAutoSelectionPersistenceWillResolveHandlerForTesting {
+                await handler()
+            }
+        #endif
+        guard isReadFileAutoSelectionContextCurrent(contextKey),
+              let currentTarget = currentReadFileAutoSelectionTab(for: contextKey),
+              currentTarget.tab.selection == expectedBaseSelection
+        else { return nil }
+
+        let logicalSelection = lookupContext.logicalizeSelection(selection)
+        let logicalExpectedBaseSelection = lookupContext.logicalizeSelection(expectedBaseSelection)
+        let expectedBaseForPreservation = StoredSelection(
+            selectedPaths: StoredSelectionPathNormalization.standardizedPaths(logicalExpectedBaseSelection.selectedPaths),
+            autoCodemapPaths: StoredSelectionPathNormalization.standardizedPaths(logicalExpectedBaseSelection.autoCodemapPaths),
+            slices: StoredSelectionPathNormalization.standardizedSlices(logicalExpectedBaseSelection.slices).mapValues {
+                SliceRangeMath.normalize($0)
+            },
+            codemapAutoEnabled: logicalExpectedBaseSelection.codemapAutoEnabled
         )
-        guard let target = currentReadFileAutoSelectionTab(for: contextKey) else { return false }
+        let persistedSelection = StoredSelection(
+            selectedPaths: StoredSelectionPathNormalization.standardizedPaths(logicalSelection.selectedPaths),
+            autoCodemapPaths: StoredSelectionPathNormalization.standardizedPaths(logicalSelection.autoCodemapPaths),
+            slices: StoredSelectionPathNormalization.standardizedSlices(logicalSelection.slices).mapValues {
+                SliceRangeMath.normalize($0)
+            },
+            codemapAutoEnabled: logicalSelection.codemapAutoEnabled
+        )
+        guard MCPReadFileAutoSelectionCoordinator.authoritativeSelection(
+            expectedBaseForPreservation,
+            isPreservedBy: persistedSelection
+        ),
+            let target = currentReadFileAutoSelectionTab(for: contextKey)
+        else { return nil }
+        let canonicalUnchanged = target.tab.selection == persistedSelection
+        var coordinatorVerified = canonicalUnchanged
+
+        if !canonicalUnchanged {
+            var verification = await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.AutoSelect.canonicalStoredCommit) {
+                await Self.persistMCPSelectionAndVerifyThroughCoordinator(
+                    persistedSelection,
+                    for: contextKey.tabID,
+                    workspaceID: contextKey.workspaceID,
+                    selectionCoordinator: selectionCoordinator,
+                    mirrorToUIIfActive: false,
+                    expectedCurrentSelection: expectedBaseSelection
+                )
+            }
+            guard let refreshedTarget = currentReadFileAutoSelectionTab(for: contextKey) else { return nil }
+            if verification.outcome == .unavailable {
+                guard refreshedTarget.tab.selection == expectedBaseSelection else { return nil }
+                var updatedTab = refreshedTarget.tab
+                updatedTab.selection = persistedSelection
+                updatedTab.lastModified = Date()
+                await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.AutoSelect.canonicalStoredCommit) {
+                    _ = refreshedTarget.manager.updateComposeTabStoredOnly(
+                        updatedTab,
+                        inWorkspaceID: refreshedTarget.identity.workspaceID
+                    )
+                }
+                verification = MCPSelectionPersistenceVerification(
+                    outcome: .unavailable,
+                    expectedSelection: persistedSelection,
+                    canonicalSelection: currentReadFileAutoSelectionTab(for: contextKey)?.tab.selection
+                )
+            }
+            coordinatorVerified = verification.isVerified
+        }
+
+        guard coordinatorVerified,
+              let finalTarget = currentReadFileAutoSelectionTab(for: contextKey),
+              finalTarget.tab.selection == persistedSelection
+        else { return nil }
+        if canonicalUnchanged {
+            finalTarget.manager.updateComposeTabSelectionPresentation(
+                persistedSelection,
+                for: finalTarget.identity
+            )
+        }
+        let selectionRevision = finalTarget.manager.selectionRevisionForMCP(
+            workspaceID: finalTarget.identity.workspaceID,
+            tabID: finalTarget.identity.tabID
+        )
 
         if case let .bound(connectionID, _) = contextKey.route,
-           var latest = tabContextByConnectionID[connectionID]
+           var latest = tabContextByConnectionID[connectionID],
+           latest.readFileAutoSelectionGeneration == contextKey.bindingGeneration
         {
             latest.selection = persistedSelection
+            latest.selectionRevision = selectionRevision
             tabContextByConnectionID[connectionID] = latest
         }
 
-        guard target.tab.selection != persistedSelection else { return false }
-        let persistenceResult = await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.AutoSelect.canonicalStoredCommit) {
-            await Self.persistMCPSelectionThroughCoordinator(
-                persistedSelection,
-                for: contextKey.tabID,
-                workspaceID: contextKey.workspaceID,
-                selectionCoordinator: selectionCoordinator,
-                mirrorToUIIfActive: false
-            )
-        }
-        guard let refreshedTarget = currentReadFileAutoSelectionTab(for: contextKey) else { return false }
-        if persistenceResult == .unavailable {
-            var updatedTab = refreshedTarget.tab
-            updatedTab.selection = persistedSelection
-            updatedTab.lastModified = Date()
-            await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.AutoSelect.canonicalStoredCommit) {
-                _ = refreshedTarget.manager.updateComposeTabStoredOnly(
-                    updatedTab,
-                    inWorkspaceID: refreshedTarget.identity.workspaceID
-                )
-            }
-        }
-        return true
+        return ReadFileAutoSelectionAuthoritativeResult(
+            persistedSelection: persistedSelection,
+            canonicalUnchanged: canonicalUnchanged,
+            coordinatorVerified: coordinatorVerified,
+            selectionRevision: selectionRevision
+        )
     }
 
     @MainActor
@@ -1695,13 +1755,38 @@ extension MCPServerViewModel {
         from metadata: RequestMetadata
     ) async -> WorkspaceLookupContext {
         let purpose = metadata.runPurpose ?? .unknown
-        let resolved = try? resolveTabContextSnapshot(
+        var resolved = try? resolveTabContextSnapshot(
             from: metadata,
             toolName: "file_tool_lookup_scope",
             policy: .allowLegacyImplicitRouting
         )
+        if var snapshot = resolved?.snapshot,
+           let sessionID = snapshot.activeAgentSessionID,
+           snapshot.worktreeBindingState == .unhydrated,
+           let agentWorktreeBindingStateResolver
+        {
+            snapshot.worktreeBindingState = await agentWorktreeBindingStateResolver(sessionID, snapshot.tabID)
+            resolved?.snapshot = snapshot
+            if let connectionID = metadata.connectionID,
+               var bound = tabContextByConnectionID[connectionID],
+               bound.tabID == snapshot.tabID,
+               bound.windowID == snapshot.windowID,
+               bound.workspaceID == snapshot.workspaceID,
+               bound.runID == snapshot.runID,
+               bound.activeAgentSessionID == snapshot.activeAgentSessionID,
+               bound.readFileAutoSelectionGeneration == snapshot.readFileAutoSelectionGeneration
+            {
+                bound.worktreeBindingState = snapshot.worktreeBindingState
+                tabContextByConnectionID[connectionID] = bound
+            }
+        }
         let baseScope = Self.resolveFileToolLookupRootScope(purpose: purpose, resolvedContext: resolved)
         guard let resolved else {
+            return WorkspaceLookupContext(rootScope: baseScope, bindingProjection: nil)
+        }
+        if resolved.usesActiveTabCompatibility,
+           resolved.snapshot.activeAgentSessionID == nil
+        {
             return WorkspaceLookupContext(rootScope: baseScope, bindingProjection: nil)
         }
         if let frozenLookupContext = resolved.snapshot.frozenLookupContext {
@@ -2614,31 +2699,32 @@ extension MCPServerViewModel {
         // Capture the authoritative snapshot on the main actor before the first suspension.
         // Connection cleanup may remove the dictionary entry while draining auto-selection,
         // but it cannot invalidate this locally owned snapshot.
-        guard var context = tabContextByConnectionID[connectionID] else { return false }
+        guard let commitOwnedContext = tabContextByConnectionID[connectionID] else { return false }
 
         // Decide whether we will commit stored UI state for this context.
         // Mismatch or logical cancellation => clear binding only.
         var shouldCommit = isStillCurrent()
-        if let expected = expectedRunID, context.runID != expected {
-            tabContextLog("commitAndClearTabContext run mismatch connectionID=\(connectionID) expectedRunID=\(expected.uuidString) actualRunID=\(context.runID?.uuidString ?? "nil") tab=\(context.tabID) — clearing binding without commit")
+        if let expected = expectedRunID, commitOwnedContext.runID != expected {
+            tabContextLog("commitAndClearTabContext run mismatch connectionID=\(connectionID) expectedRunID=\(expected.uuidString) actualRunID=\(commitOwnedContext.runID?.uuidString ?? "nil") tab=\(commitOwnedContext.tabID) — clearing binding without commit")
             shouldCommit = false
         }
 
         if shouldCommit {
-            let key = readFileAutoSelectionContextKey(connectionID: connectionID, context: context)
+            let key = readFileAutoSelectionContextKey(connectionID: connectionID, context: commitOwnedContext)
             await progressReporter?(.readFileAutoSelectionFinish)
             let finishResult = await readFileAutoSelectionCoordinator.finish(context: key)
+            evictReadFileAutoSelectionCoverageCertificate(for: key)
+            #if DEBUG
+                readFileAutoSelectionForcedAuthoritativeProbeIDsByContext.removeValue(forKey: key)
+            #endif
             if finishResult == .cancelled {
                 shouldCommit = false
-            }
-            if let latest = tabContextByConnectionID[connectionID], latest.runID == context.runID {
-                context = latest
             }
             if !isStillCurrent() || Task.isCancelled {
                 shouldCommit = false
             }
         } else {
-            invalidateReadFileAutoSelection(connectionID: connectionID, context: context)
+            invalidateReadFileAutoSelection(connectionID: connectionID, context: commitOwnedContext)
         }
 
         // Clear the mutable tab snapshot regardless of mismatch so future calls cannot
@@ -2649,7 +2735,7 @@ extension MCPServerViewModel {
         tabContextByConnectionID.removeValue(forKey: connectionID)
         if !deferRunMappingCleanupUntilCaller {
             windowIDByConnection.removeValue(forKey: connectionID)
-            if let runID = context.runID {
+            if let runID = commitOwnedContext.runID {
                 connectionIDByRunID.removeValue(forKey: runID)
             }
             connectionIDToRunID.removeValue(forKey: connectionID)
@@ -2657,20 +2743,20 @@ extension MCPServerViewModel {
 
         guard shouldCommit, isStillCurrent(), !Task.isCancelled else { return false }
 
-        tabContextLog("commitAndClearTabContext committing tab=\(context.tabID) connectionID=\(connectionID) runID=\(context.runID?.uuidString ?? "nil")")
+        tabContextLog("commitAndClearTabContext committing tab=\(commitOwnedContext.tabID) connectionID=\(connectionID) runID=\(commitOwnedContext.runID?.uuidString ?? "nil")")
 
         // IMPORTANT: Await the commit to ensure tab state is written before caller reads it.
-        // This fixes a race condition where context_builder would read stale tab state.
+        // The immutable payload remains owned by this run even if transport cleanup proceeds.
         await progressReporter?(.tabContextCommit)
-        let didCommit = await commitTabContext(context, isStillCurrent: isStillCurrent)
+        let didCommit = await commitTabContext(commitOwnedContext, isStillCurrent: isStillCurrent)
         guard didCommit, isStillCurrent(), !Task.isCancelled else { return false }
 
         var discoveredTabName: String?
         if let manager = workspaceManager,
-           let tab = manager.composeTab(with: context.tabID)
+           let tab = manager.composeTab(with: commitOwnedContext.tabID)
         {
             discoveredTabName = tab.name
-        } else if let tab = promptVM.currentComposeTabs.first(where: { $0.id == context.tabID }) {
+        } else if let tab = promptVM.currentComposeTabs.first(where: { $0.id == commitOwnedContext.tabID }) {
             discoveredTabName = tab.name
         }
         if let tabName = discoveredTabName, !tabName.isEmpty {
@@ -2714,6 +2800,18 @@ extension MCPServerViewModel {
         guard let context = tabContextByConnectionID[connectionID] else { return }
         let key = readFileAutoSelectionContextKey(connectionID: connectionID, context: context)
         _ = await readFileAutoSelectionCoordinator.finish(context: key)
+        evictReadFileAutoSelectionCoverageCertificate(for: key)
+        #if DEBUG
+            readFileAutoSelectionForcedAuthoritativeProbeIDsByContext.removeValue(forKey: key)
+            await MCPReadFileAutoSelectionProbeRegistry.shared.cancel(
+                serverIdentity: ObjectIdentifier(self),
+                contextKey: key
+            )
+            await MCPApplyEditsRebaseProbeRegistry.shared.cancel(
+                serverIdentity: ObjectIdentifier(self),
+                contextKey: key
+            )
+        #endif
     }
 
     @MainActor

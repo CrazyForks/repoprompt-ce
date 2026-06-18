@@ -176,7 +176,11 @@ extension MCPServerViewModel {
             stored: selection,
             codeMapUsage: effectiveMCPCodeMapUsage(promptVM.codeMapUsage)
         )
-        let collections = await SelectionReplyAssembler.collect(from: source, owner: self)
+        let collections = await SelectionReplyAssembler.collect(
+            from: source,
+            owner: self,
+            contentPolicy: includeBlocks ? .loadContent : .cachedOnly
+        )
         let formatter = PathFormatter(format: display, owner: self)
         let tokens = TokenServices(owner: self)
         var out = await SelectionReplyAssembler.buildSelectionReply(
@@ -209,7 +213,8 @@ extension MCPServerViewModel {
                     userCopyTokens: out.userCopyTokens,
                     userChatTokens: out.userChatTokens,
                     normalizedCodeMapUsage: out.normalizedCodeMapUsage,
-                    tokenStats: out.tokenStats
+                    tokenStats: out.tokenStats,
+                    tokenAccounting: out.tokenAccounting
                 )
             }
         }

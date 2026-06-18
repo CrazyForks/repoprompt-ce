@@ -297,12 +297,18 @@ final class WorkspaceSelectionCoordinator {
         for identity: WorkspaceSelectionIdentity,
         source: Source = .runtimeMutation,
         mirrorToUIIfActive: Bool = true,
+        expectedCurrentSelection: StoredSelection? = nil,
         peerSourceRevision: UInt64? = nil,
         peerMutationFence: MCPSelectionPeerMutationFence? = nil
     ) async -> StoredSelection {
         guard let workspaceManager,
               let currentSelection = workspaceManager.composeTab(for: identity)?.selection
         else { return selection }
+        if let expectedCurrentSelection,
+           currentSelection != expectedCurrentSelection
+        {
+            return currentSelection
+        }
         if source == .mcpPeerContext {
             guard let peerSourceRevision,
                   let peerMutationFence,

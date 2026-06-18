@@ -177,6 +177,7 @@ struct AgentMessageBubble: View {
     let item: AgentChatItem
     let isMostRecentEditBubble: Bool
     let windowID: Int
+    let currentWorkspaceID: UUID?
     let currentTabID: UUID?
     let suppressAskUserTranscriptUI: Bool
     let contextBuilderContext: ContextBuilderCardContext?
@@ -202,6 +203,7 @@ struct AgentMessageBubble: View {
         item: AgentChatItem,
         isMostRecentEditBubble: Bool = false,
         windowID: Int,
+        currentWorkspaceID: UUID? = nil,
         currentTabID: UUID? = nil,
         suppressAskUserTranscriptUI: Bool = false,
         contextBuilderContext: ContextBuilderCardContext? = nil,
@@ -216,6 +218,7 @@ struct AgentMessageBubble: View {
         self.item = item
         self.isMostRecentEditBubble = isMostRecentEditBubble
         self.windowID = windowID
+        self.currentWorkspaceID = currentWorkspaceID
         self.currentTabID = currentTabID
         self.suppressAskUserTranscriptUI = suppressAskUserTranscriptUI
         self.contextBuilderContext = contextBuilderContext
@@ -272,7 +275,11 @@ struct AgentMessageBubble: View {
             } else {
                 ToolCardRouter.callView(
                     for: item,
-                    oracleOpenContext: .init(windowID: windowID, tabID: currentTabID),
+                    oracleOpenContext: .init(
+                        windowID: windowID,
+                        workspaceID: currentWorkspaceID,
+                        tabID: currentTabID
+                    ),
                     contextBuilder: contextBuilderContext,
                     showRunScopedToolCancel: showRunScopedToolCancel,
                     cancelActiveToolsAction: cancelActiveToolsAction
@@ -290,7 +297,11 @@ struct AgentMessageBubble: View {
                 ToolCardRouter.resultView(
                     for: renderItem,
                     isMostRecentEditBubble: isMostRecentEditBubble,
-                    oracleOpenContext: .init(windowID: windowID, tabID: currentTabID),
+                    oracleOpenContext: .init(
+                        windowID: windowID,
+                        workspaceID: currentWorkspaceID,
+                        tabID: currentTabID
+                    ),
                     contextBuilder: contextBuilderContext,
                     promptManager: promptManager
                 )

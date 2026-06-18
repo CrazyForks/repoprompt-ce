@@ -248,6 +248,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     /// Per-tab suspension of snapshot commits during UI apply to prevent transient overwrites
     @Published private var suspendedSnapshotCommitTabIDs: Set<UUID> = []
+    private var activationSnapshotSuspendedTabIDs: Set<UUID> = []
 
     // Guard to suppress cross-tab snapshot emissions during MCP tab-context apply
     @Published private var applyingTabContextID: UUID? = nil
@@ -338,8 +339,35 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     #if DEBUG
+        struct ApplyEditsRebaseProbeSelectionSnapshot: Equatable {
+            let workspaceID: UUID
+            let tabID: UUID
+            let selectionRevision: UInt64
+            let ranges: [LineRange]
+        }
+
         func debugStateVersionForWorkspace(_ workspaceID: UUID) -> Int {
             stateVersionByWorkspaceID[workspaceID, default: 0]
+        }
+
+        @MainActor
+        func debugApplyEditsRebaseProbeSelectionSnapshot(
+            workspaceID: UUID?,
+            tabID: UUID,
+            candidatePaths: [String]
+        ) -> ApplyEditsRebaseProbeSelectionSnapshot? {
+            guard let workspaceID,
+                  let tab = composeTab(for: WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: tabID))
+            else { return nil }
+            let slices = StoredSelectionPathNormalization.standardizedSlices(tab.selection.slices)
+            let candidates = candidatePaths.compactMap(StoredSelectionPathNormalization.standardizedPath)
+            let ranges = candidates.lazy.compactMap { slices[$0] }.first ?? []
+            return ApplyEditsRebaseProbeSelectionSnapshot(
+                workspaceID: workspaceID,
+                tabID: tabID,
+                selectionRevision: selectionRevisionForMCP(workspaceID: workspaceID, tabID: tabID),
+                ranges: ranges
+            )
         }
     #endif
 
@@ -2777,6 +2805,15 @@ class WorkspaceManagerViewModel: ObservableObject {
         let loadSignpost = WorkspaceExitPerf.begin("switchWorkspace.loadWorkspace")
         defer { WorkspaceExitPerf.end("switchWorkspace.loadWorkspace", loadSignpost) }
         let hydrationGeneration = beginWorkspaceHydration(for: activeWS)
+        let restoredHeavyFileState = activeComposeTabHeavyFileStateSnapshot(in: activeWS)
+        if let restoredTabID = restoredHeavyFileState?.tabID {
+            activationSnapshotSuspendedTabIDs.insert(restoredTabID)
+        }
+        defer {
+            if let restoredTabID = restoredHeavyFileState?.tabID {
+                activationSnapshotSuspendedTabIDs.remove(restoredTabID)
+            }
+        }
         runGitDataMaintenanceOnWorkspaceOpen(activeWS)
 
         // Restore path-based state before catalog/search hydration. This activation phase
@@ -2864,6 +2901,18 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
         guard isHydrationGenerationCurrent(hydrationGeneration, workspaceID: activeWS.id) else {
             return .cancelled("Workspace switch to \"\(newWorkspace.name)\" was superseded during root hydration.")
+        }
+
+        await replayActiveComposeTabHeavyFileStateAfterHydration(restoredHeavyFileState, workspaceID: activeWS.id)
+        if let cancellation = cancellationResult(
+            operationID: operationID,
+            targetWorkspace: newWorkspace,
+            boundary: "replaying hydrated selection"
+        ) {
+            return cancellation
+        }
+        guard isHydrationGenerationCurrent(hydrationGeneration, workspaceID: activeWS.id) else {
+            return .cancelled("Workspace switch to \"\(newWorkspace.name)\" was superseded while replaying hydrated selection.")
         }
 
         // Another yield after state restoration
@@ -3348,12 +3397,17 @@ class WorkspaceManagerViewModel: ObservableObject {
         if selectionCoordinator?.isApplyingSelectionMirror == true {
             return
         }
+        if let activeBase = base,
+           activationSnapshotSuspendedTabIDs.contains(activeBase.id)
+        {
+            return
+        }
 
         let snapshot = collectComposeTabSnapshot(name: name, base: base)
 
         // Respect per-tab suspension: avoid mutating composeTabs during UI apply,
         // so mirroring can treat these as transient snapshots.
-        let shouldCommit: Bool = commitToMemory && !suspendedSnapshotCommitTabIDs.contains(snapshot.id)
+        let shouldCommit: Bool = commitToMemory && !isSnapshotCommitSuspended(forTabID: snapshot.id)
         let didChange = Self.composeTabSnapshotHasMeaningfulChanges(snapshot, comparedTo: base, touchModified: touchModified)
         guard didChange else { return }
         if shouldCommit {
@@ -3382,6 +3436,14 @@ class WorkspaceManagerViewModel: ObservableObject {
         } else {
             suspendedSnapshotCommitTabIDs.remove(id)
         }
+    }
+
+    @MainActor
+    private func isSnapshotCommitSuspended(forTabID id: UUID) -> Bool {
+        suspendedSnapshotCommitTabIDs.contains(id)
+            || activationSnapshotSuspendedTabIDs.contains(id)
+            || applyingTabContextID == id
+            || applyingTabContextDepthByTabID[id, default: 0] > 0
     }
 
     @MainActor
@@ -3489,6 +3551,39 @@ class WorkspaceManagerViewModel: ObservableObject {
         selectionCoordinator?.refreshDeferredUISelectionFence(forTabID: tab.id)
     }
 
+    private struct ComposeTabHeavyFileStateSnapshot {
+        let tabID: UUID
+    }
+
+    private func activeComposeTabHeavyFileStateSnapshot(
+        in workspace: WorkspaceModel
+    ) -> ComposeTabHeavyFileStateSnapshot? {
+        guard let activeTabID = workspace.activeComposeTabID,
+              workspace.composeTabs.contains(where: { $0.id == activeTabID })
+        else { return nil }
+        return ComposeTabHeavyFileStateSnapshot(tabID: activeTabID)
+    }
+
+    @MainActor
+    private func replayActiveComposeTabHeavyFileStateAfterHydration(
+        _ snapshot: ComposeTabHeavyFileStateSnapshot?,
+        workspaceID: UUID
+    ) async {
+        guard let snapshot,
+              let workspace = activeWorkspace, workspace.id == workspaceID,
+              workspace.activeComposeTabID == snapshot.tabID,
+              let currentTab = workspace.composeTabs.first(where: { $0.id == snapshot.tabID })
+        else { return }
+
+        beginApplyingTabContext(forTabID: snapshot.tabID)
+        defer { endApplyingTabContext(forTabID: snapshot.tabID) }
+        await fileManager.withDeferredSelectionSliceSnapshotRebuild(reason: "workspaceRestore.postHydrationReplay") {
+            await fileManager.restoreExpansionState(from: currentTab.expandedFolders)
+            await fileManager.onActiveTabChangedHeavy(for: currentTab.id, selection: currentTab.selection)
+            selectionCoordinator?.refreshDeferredUISelectionFence(forTabID: currentTab.id)
+        }
+    }
+
     @MainActor
     private func markWorkspaceDirtyIfTabStillActive(tabID: UUID) -> Bool {
         guard
@@ -3507,23 +3602,30 @@ class WorkspaceManagerViewModel: ObservableObject {
         workspaces: [WorkspaceModel],
         activeWorkspaceID: UUID?,
         activeComposeTabID: UUID?,
+        captureActiveUIState: Bool,
         liveSnapshotProvider: (ComposeTabState) -> ComposeTabState
     ) -> (workspaceID: UUID, snapshot: ComposeTabState, usesLiveUIState: Bool)? {
         for workspace in workspaces {
             guard let tab = workspace.composeTabs.first(where: { $0.id == tabID }) else { continue }
-            let usesLiveUIState = workspace.id == activeWorkspaceID && tab.id == activeComposeTabID
+            let usesLiveUIState = captureActiveUIState
+                && workspace.id == activeWorkspaceID
+                && tab.id == activeComposeTabID
             let snapshot = usesLiveUIState ? liveSnapshotProvider(tab) : tab
             return (workspace.id, snapshot, usesLiveUIState)
         }
         return nil
     }
 
-    func resolveComposeTabRoutingSnapshot(for tabID: UUID) -> (workspaceID: UUID, snapshot: ComposeTabState, usesLiveUIState: Bool)? {
+    func resolveComposeTabRoutingSnapshot(
+        for tabID: UUID,
+        captureActiveUIState: Bool = true
+    ) -> (workspaceID: UUID, snapshot: ComposeTabState, usesLiveUIState: Bool)? {
         Self.resolveComposeTabRoutingSnapshot(
             tabID: tabID,
             workspaces: workspaces,
             activeWorkspaceID: activeWorkspaceID,
-            activeComposeTabID: promptViewModel.activeComposeTabID
+            activeComposeTabID: promptViewModel.activeComposeTabID,
+            captureActiveUIState: captureActiveUIState
         ) { [weak self] base in
             guard let self else { return base }
             return collectComposeTabSnapshot(name: base.name, base: base)
@@ -3535,6 +3637,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         workspaces: [WorkspaceModel],
         activeWorkspaceID: UUID?,
         activeComposeTabID: UUID?,
+        captureActiveUIState: Bool = true,
         liveSnapshotProvider: (ComposeTabState) -> ComposeTabState = { $0 }
     ) -> (workspaceID: UUID, snapshot: ComposeTabState, usesLiveUIState: Bool)? {
         resolveComposeTabRoutingSnapshot(
@@ -3542,6 +3645,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             workspaces: workspaces,
             activeWorkspaceID: activeWorkspaceID,
             activeComposeTabID: activeComposeTabID,
+            captureActiveUIState: captureActiveUIState,
             liveSnapshotProvider: liveSnapshotProvider
         )
     }
@@ -3942,7 +4046,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         beginApplyingTabContext(forTabID: tabID)
         defer { endApplyingTabContext(forTabID: tabID) }
         await fileManager.applyStoredSelection(selection)
-        await promptViewModel.tokenCountingViewModel.forceImmediateRecount()
+        promptViewModel.tokenCountingViewModel.markDirty(.selection)
     }
 
     /// Applies the newest stored selection after deferred `read_file` auto-selection.
@@ -4158,12 +4262,18 @@ class WorkspaceManagerViewModel: ObservableObject {
         guard !tabs.isEmpty else { return }
 
         for var tab in tabs {
+            #if DEBUG
+                MCPApplyEditsRebaseProbeRecorder.recordTabInspection(fullPath: fullPath)
+            #endif
             guard !tab.selection.slices.isEmpty,
                   let nextSelection = Self.rebasedStoredSelectionSlices(tab.selection, for: fullPath, transform: transform)
             else { continue }
 
             tab.selection = nextSelection
             tab.lastModified = Date()
+            #if DEBUG
+                MCPApplyEditsRebaseProbeRecorder.recordTabWrite(fullPath: fullPath)
+            #endif
             updateComposeTabStoredOnly(tab)
         }
     }
@@ -4171,37 +4281,87 @@ class WorkspaceManagerViewModel: ObservableObject {
     @MainActor
     func rebaseSlicesForFileAcrossTabs(
         fullPath: String,
-        asyncTransform: @Sendable ([LineRange]) async -> [LineRange]
+        asyncTransform: @Sendable (UUID, [LineRange]) async -> [LineRange]
     ) async {
         guard let standardizedFullPath = StoredSelectionPathNormalization.standardizedPath(fullPath),
               let workspaceID = activeWorkspaceID,
-              let wi = workspaces.firstIndex(where: { $0.id == workspaceID }) else { return }
+              let workspace = workspaces.first(where: { $0.id == workspaceID }) else { return }
+        let targets = workspace.composeTabs.map {
+            (identity: WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: $0.id), fullPath: standardizedFullPath)
+        }
+        await rebaseSlicesForFilesAcrossTabs(targets: targets) { identity, _, ranges in
+            await asyncTransform(identity.tabID, ranges)
+        }
+    }
 
-        let tabs = workspaces[wi].composeTabs
-        guard !tabs.isEmpty else { return }
-
-        for var tab in tabs {
-            guard !tab.selection.slices.isEmpty else { continue }
-            let normalizedSlices = StoredSelectionPathNormalization.standardizedSlices(tab.selection.slices)
-            guard let existingRanges = normalizedSlices[standardizedFullPath] else { continue }
-
-            let nextRanges = await SliceRangeMath.normalize(asyncTransform(existingRanges))
-            var nextSlices = normalizedSlices
-            if nextRanges.isEmpty {
-                nextSlices.removeValue(forKey: standardizedFullPath)
-            } else {
-                nextSlices[standardizedFullPath] = nextRanges
+    @MainActor
+    func rebaseSlicesForFilesAcrossTabs(
+        targets: [(identity: WorkspaceSelectionIdentity, fullPath: String)],
+        asyncTransform: @Sendable (WorkspaceSelectionIdentity, String, [LineRange]) async -> [LineRange]
+    ) async {
+        var seen = Set<String>()
+        for target in targets {
+            guard let standardizedFullPath = StoredSelectionPathNormalization.standardizedPath(target.fullPath) else {
+                continue
             }
-            guard nextSlices != tab.selection.slices else { continue }
+            let dedupeKey = "\(target.identity.workspaceID.uuidString):\(target.identity.tabID.uuidString):\(standardizedFullPath)"
+            guard seen.insert(dedupeKey).inserted else { continue }
+            #if DEBUG
+                MCPApplyEditsRebaseProbeRecorder.recordTabInspection(fullPath: standardizedFullPath)
+            #endif
+            for _ in 0 ..< 3 {
+                guard let currentTab = composeTab(for: target.identity),
+                      !currentTab.selection.slices.isEmpty
+                else { break }
+                let currentSlices = StoredSelectionPathNormalization.standardizedSlices(currentTab.selection.slices)
+                guard let currentRanges = currentSlices[standardizedFullPath] else { break }
 
-            tab.selection = StoredSelection(
-                selectedPaths: tab.selection.selectedPaths,
-                autoCodemapPaths: tab.selection.autoCodemapPaths,
-                slices: nextSlices,
-                codemapAutoEnabled: tab.selection.codemapAutoEnabled
-            )
-            tab.lastModified = Date()
-            updateComposeTabStoredOnly(tab)
+                let nextRanges = await SliceRangeMath.normalize(
+                    asyncTransform(target.identity, standardizedFullPath, currentRanges)
+                )
+                guard var latestTab = composeTab(for: target.identity) else { break }
+                let latestSlices = StoredSelectionPathNormalization.standardizedSlices(latestTab.selection.slices)
+                guard let latestRanges = latestSlices[standardizedFullPath] else { break }
+                guard latestRanges == currentRanges else { continue }
+
+                var nextSlices = latestSlices
+                if nextRanges.isEmpty {
+                    nextSlices.removeValue(forKey: standardizedFullPath)
+                } else {
+                    nextSlices[standardizedFullPath] = nextRanges
+                }
+                guard nextSlices != latestTab.selection.slices else { break }
+
+                let expectedSelection = latestTab.selection
+                let nextSelection = StoredSelection(
+                    selectedPaths: expectedSelection.selectedPaths,
+                    autoCodemapPaths: expectedSelection.autoCodemapPaths,
+                    slices: nextSlices,
+                    codemapAutoEnabled: expectedSelection.codemapAutoEnabled
+                )
+                let persistedSelection: StoredSelection
+                if let selectionCoordinator {
+                    persistedSelection = await selectionCoordinator.persistSelection(
+                        nextSelection,
+                        for: target.identity,
+                        source: .mcpTabContext,
+                        mirrorToUIIfActive: true,
+                        expectedCurrentSelection: expectedSelection
+                    )
+                } else {
+                    latestTab.selection = nextSelection
+                    latestTab.lastModified = Date()
+                    persistedSelection = updateComposeTabStoredOnly(
+                        latestTab,
+                        inWorkspaceID: target.identity.workspaceID
+                    ) ? nextSelection : expectedSelection
+                }
+                guard persistedSelection == nextSelection else { continue }
+                #if DEBUG
+                    MCPApplyEditsRebaseProbeRecorder.recordTabWrite(fullPath: standardizedFullPath)
+                #endif
+                break
+            }
         }
     }
 
@@ -4237,6 +4397,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         if let activeTabID = workspaces[index].activeComposeTabID,
            let tabIndex = workspaces[index].composeTabs.firstIndex(where: { $0.id == activeTabID })
         {
+            guard !isSnapshotCommitSuspended(forTabID: activeTabID) else { return nil }
             #if DEBUG
                 debugSelectionOwnerTraceEvent("save.capture.before", workspace: workspaces[index])
             #endif

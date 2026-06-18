@@ -4,41 +4,45 @@ import XCTest
 
 @MainActor
 final class ToolOutputFormatterWorktreeTests: XCTestCase {
-    func testGitWorktreeWarningRecommendsMainSelectorsOnlyWhenMainRootIsKnown() {
-        let warning = MCPGitToolProvider.worktreeWarning(from: .init(
-            isWorktree: true,
-            worktreeName: "feature",
-            worktreeRoot: "/tmp/repo-feature",
-            commonGitDir: "/tmp/repo/.git",
-            mainWorktreeRoot: "/tmp/repo",
-            worktreeBranch: "feature/demo",
-            mainBranch: "main",
-            worktreeHead: "abcdef1",
-            mainHead: "1234567"
-        ))
+    func testGitWorktreeWarningsChooseMainSelectorsOrFullPathGuidance() {
+        do {
+            let caseLabel = "testGitWorktreeWarningRecommendsMainSelectorsOnlyWhenMainRootIsKnown"
+            let warning = MCPGitToolProvider.worktreeWarning(from: .init(
+                isWorktree: true,
+                worktreeName: "feature",
+                worktreeRoot: "/tmp/repo-feature",
+                commonGitDir: "/tmp/repo/.git",
+                mainWorktreeRoot: "/tmp/repo",
+                worktreeBranch: "feature/demo",
+                mainBranch: "main",
+                worktreeHead: "abcdef1",
+                mainHead: "1234567"
+            ))
 
-        XCTAssertTrue(warning?.contains("repo_root=\"@main\"") == true)
-        XCTAssertTrue(warning?.contains("repo_root=\"@main:<branch>\"") == true)
-        XCTAssertFalse(warning?.contains("could not be resolved") == true)
-    }
+            XCTAssertTrue(warning?.contains("repo_root=\"@main\"") == true, caseLabel)
+            XCTAssertTrue(warning?.contains("repo_root=\"@main:<branch>\"") == true, caseLabel)
+            XCTAssertFalse(warning?.contains("could not be resolved") == true, caseLabel)
+        }
 
-    func testGitWorktreeWarningUsesFullPathGuidanceWhenMainRootIsUnknown() {
-        let warning = MCPGitToolProvider.worktreeWarning(from: .init(
-            isWorktree: true,
-            worktreeName: "feature",
-            worktreeRoot: "/tmp/repo-feature",
-            commonGitDir: "/tmp/external-git-dir",
-            mainWorktreeRoot: nil,
-            worktreeBranch: "feature/demo",
-            mainBranch: nil,
-            worktreeHead: "abcdef1",
-            mainHead: nil
-        ))
+        do {
+            let caseLabel = "testGitWorktreeWarningUsesFullPathGuidanceWhenMainRootIsUnknown"
+            let warning = MCPGitToolProvider.worktreeWarning(from: .init(
+                isWorktree: true,
+                worktreeName: "feature",
+                worktreeRoot: "/tmp/repo-feature",
+                commonGitDir: "/tmp/external-git-dir",
+                mainWorktreeRoot: nil,
+                worktreeBranch: "feature/demo",
+                mainBranch: nil,
+                worktreeHead: "abcdef1",
+                mainHead: nil
+            ))
 
-        XCTAssertTrue(warning?.contains("primary checkout path could not be resolved") == true)
-        XCTAssertTrue(warning?.contains("full path as repo_root") == true)
-        XCTAssertFalse(warning?.contains("repo_root=\"@main\"") == true)
-        XCTAssertFalse(warning?.contains("repo_root=\"@main:<branch>\"") == true)
+            XCTAssertTrue(warning?.contains("primary checkout path could not be resolved") == true, caseLabel)
+            XCTAssertTrue(warning?.contains("full path as repo_root") == true, caseLabel)
+            XCTAssertFalse(warning?.contains("repo_root=\"@main\"") == true, caseLabel)
+            XCTAssertFalse(warning?.contains("repo_root=\"@main:<branch>\"") == true, caseLabel)
+        }
     }
 
     func testCreateOutputIncludesUsefulNextStepCommands() throws {

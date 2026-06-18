@@ -83,7 +83,9 @@ import XCTest
                         )
                     }
                     fixture.contextA.window.mcpServer.setContextBuilderFollowUpOverrideForTesting {
-                        _, tabID, mode, prompt, selection, lookupContext, _, _ in
+                        _, tabID, agentModeSessionID, agentModeRunID, mode, prompt, selection, lookupContext, _, _ in
+                        XCTAssertEqual(agentModeSessionID, sessionID)
+                        XCTAssertEqual(agentModeRunID, parentRunID)
                         let message = await fixture.contextA.window.promptManager.buildHeadlessAIMessage(
                             from: HeadlessContextSnapshot(
                                 tabID: tabID,
@@ -319,14 +321,25 @@ import XCTest
                 )
                 do {
                     try await activateWorkspace(fixture.contextA)
+                    let store = fixture.contextA.window.workspaceFileContextStore
+                    let loadedService = await store.fileSystemServiceForTesting(rootID: fixture.contextA.rootID)
+                    let service = try XCTUnwrap(loadedService)
+                    await service.stopWatchingForChanges()
                     let canonicalSentinel = "CanonicalNonAgentContextBuilderType"
                     try write(
                         "struct \(canonicalSentinel) { func canonicalMethod() {} }\n",
                         to: fixture.contextA.fileURL
                     )
-                    await fixture.contextA.window.workspaceFileContextStore.replayObservedFileSystemDeltas(
+                    let relativePath = "Sources/\(fixture.contextA.fileURL.lastPathComponent)"
+                    await store.replayObservedFileSystemDeltas(
                         rootID: fixture.contextA.rootID,
-                        deltas: [.fileModified("Sources/\(fixture.contextA.fileURL.lastPathComponent)", Date())]
+                        deltas: [.fileModified(relativePath, Date())]
+                    )
+                    try await waitForCodemap(
+                        in: store,
+                        rootID: fixture.contextA.rootID,
+                        relativePath: relativePath,
+                        containing: canonicalSentinel
                     )
                     factory.configure(
                         networkManager: fixture.networkManager,
@@ -358,6 +371,28 @@ import XCTest
                     throw error
                 }
             }
+        }
+
+        private func waitForCodemap(
+            in store: WorkspaceFileContextStore,
+            rootID: UUID,
+            relativePath: String,
+            containing expectedText: String,
+            timeout: Duration = .seconds(6)
+        ) async throws {
+            try await store.requestCodemapScan(rootID: rootID, relativePath: relativePath)
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: timeout)
+            while clock.now < deadline {
+                if let snapshot = await store.codemapSnapshot(rootID: rootID, relativePath: relativePath),
+                   snapshot.fileAPI?.apiDescription.contains(expectedText) == true
+                {
+                    return
+                }
+                try await Task.sleep(for: .milliseconds(25))
+            }
+            XCTFail("Timed out waiting for codemap containing \(expectedText)")
+            throw NSError(domain: "ContextBuilderWorktreeInheritanceTests", code: 1)
         }
 
         private func activateWorkspace(_ context: PersistentMCPTestContext) async throws {

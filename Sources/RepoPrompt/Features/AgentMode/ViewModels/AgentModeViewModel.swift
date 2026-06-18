@@ -526,6 +526,7 @@ final class AgentModeViewModel: ObservableObject {
 
     private let windowID: Int
     weak var promptManager: PromptViewModel?
+    private let workspaceFileContextStore: WorkspaceFileContextStore?
     weak var workspaceManager: WorkspaceManagerViewModel?
     private weak var mcpServer: MCPServerViewModel?
     private let dataService = AgentSessionDataService.shared
@@ -1281,6 +1282,7 @@ final class AgentModeViewModel: ObservableObject {
     ) {
         self.windowID = windowID
         self.promptManager = promptManager
+        workspaceFileContextStore = promptManager.workspaceFileContextStore
         self.workspaceManager = workspaceManager
         self.mcpServer = mcpServer
         self.oracleViewModel = oracleViewModel
@@ -1431,6 +1433,10 @@ final class AgentModeViewModel: ObservableObject {
             guard let self else { return .unavailable }
             return worktreeBindingState(forAgentSessionID: sessionID, tabID: tabID)
         }
+        mcpServer.registerAgentWorktreeBindingsResolver { [weak self] sessionID, tabID in
+            guard let self else { return .unavailable }
+            return await resolveWorktreeBindingStateEnsuringOwnership(sessionID: sessionID, tabID: tabID)
+        }
 
         refreshAvailableAgents()
 
@@ -1501,6 +1507,7 @@ final class AgentModeViewModel: ObservableObject {
             mcpRunToolCanceller: MCPRunToolCanceller? = nil,
             mcpServerEnabler: @escaping MCPServerEnabler = {},
             testMCPServer: MCPServerViewModel? = nil,
+            testWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
             testCodexActiveToolQuery: CodexActiveToolQuery? = nil,
             testCodexActiveAgentRunWaitQuery: CodexAgentRunWaitQuery? = nil,
             testCodexActiveAgentRunWaitDrain: CodexAgentRunWaitDrain? = nil,
@@ -1515,6 +1522,7 @@ final class AgentModeViewModel: ObservableObject {
         ) {
             windowID = testWindowID
             promptManager = nil
+            workspaceFileContextStore = testWorkspaceFileContextStore
             workspaceManager = nil
             mcpServer = testMCPServer
             self.applyEditsApprovalStore = applyEditsApprovalStore
@@ -1614,6 +1622,10 @@ final class AgentModeViewModel: ObservableObject {
             testMCPServer?.registerAgentWorktreeBindingsProvider { [weak self] sessionID, tabID in
                 guard let self else { return .unavailable }
                 return worktreeBindingState(forAgentSessionID: sessionID, tabID: tabID)
+            }
+            testMCPServer?.registerAgentWorktreeBindingsResolver { [weak self] sessionID, tabID in
+                guard let self else { return .unavailable }
+                return await resolveWorktreeBindingStateEnsuringOwnership(sessionID: sessionID, tabID: tabID)
             }
             refreshAvailableAgents()
             if usesProductionAgentDefaultsAndModelPolling {
@@ -2572,11 +2584,13 @@ final class AgentModeViewModel: ObservableObject {
         }
         await codexCoordinator.shutdownCodexSession(session)
         await claudeCoordinator.shutdownClaudeSession(session)
+        let sessionID = boundSessionID(for: session.tabID)
         await cleanupMCPRunRoutingIfPresent(
-            boundSessionID: boundSessionID(for: session.tabID),
+            boundSessionID: sessionID,
             liveSession: session,
             reason: "window_close"
         )
+        await releaseSessionWorktreeOwnership(sessionID: sessionID)
     }
 
     // MARK: - Tab Management
@@ -2719,6 +2733,9 @@ final class AgentModeViewModel: ObservableObject {
     func agentWorkspaceLookupContext(tabID: UUID, session: TabSession? = nil) async -> WorkspaceLookupContext {
         guard let store = promptManager?.workspaceFileContextStore else { return .visibleWorkspace }
         let resolvedSession = session ?? sessions[tabID]
+        guard resolvedSession?.worktreeBindingTransitionInProgress != true else {
+            return .visibleWorkspace
+        }
         let source = AgentWorkspaceLookupContextSource(
             activeAgentSessionID: composerSourceAgentSessionID(tabID: tabID, session: resolvedSession),
             worktreeBindings: resolvedSession?.worktreeBindings ?? []
@@ -3378,6 +3395,9 @@ final class AgentModeViewModel: ObservableObject {
             }
         }
 
+        if let targetCurrentSessionID, targetCurrentSessionID != requestedSessionID {
+            await releaseSessionWorktreeOwnership(sessionID: targetCurrentSessionID)
+        }
         if requiresHydration {
             targetSession.hasLoadedPersistedState = false
         }
@@ -5062,38 +5082,47 @@ final class AgentModeViewModel: ObservableObject {
         worktreeBindingState(forAgentSessionID: sessionID, tabID: tabID).bindings ?? []
     }
 
-    @discardableResult
-    func applyWorktreeBinding(_ binding: AgentSessionWorktreeBinding, toSessionID sessionID: UUID) throws -> AgentSessionWorktreeBinding? {
-        guard let session = try authoritativeLiveSession(for: sessionID) else {
+    private func releaseSessionWorktreeOwnership(sessionID: UUID?) async {
+        guard let sessionID, let workspaceFileContextStore else { return }
+        await WorkspaceRootBindingProjectionMaterializer(store: workspaceFileContextStore).release(sessionID: sessionID)
+    }
+
+    private func resolveWorktreeBindingStateEnsuringOwnership(
+        sessionID: UUID,
+        tabID: UUID?
+    ) async -> AgentSessionWorktreeBindingState {
+        guard let tabID else { return .unavailable }
+        let session = await ensureSessionReady(tabID: tabID)
+        guard session.activeAgentSessionID == sessionID,
+              !session.worktreeBindingTransitionInProgress
+        else { return .unavailable }
+        let state = worktreeBindingState(forAgentSessionID: sessionID, tabID: tabID)
+        guard case let .hydrated(bindings) = state else { return state }
+        guard let store = promptManager?.workspaceFileContextStore else { return .unavailable }
+        let materializer = WorkspaceRootBindingProjectionMaterializer(store: store)
+        if bindings.isEmpty {
+            await materializer.release(sessionID: sessionID)
+            return state
+        }
+        guard let projection = await materializer.materialize(sessionID: sessionID, bindings: bindings),
+              projection.isFullyMaterialized
+        else {
+            return .unavailable
+        }
+        return state
+    }
+
+    func requireLiveAgentSession(_ sessionID: UUID) throws {
+        guard try authoritativeLiveSession(for: sessionID) != nil else {
             throw MCPError.invalidParams("The requested agent session is not currently available.")
         }
-        let normalizedRoot = Self.standardizedWorkspacePath(binding.logicalRootPath) ?? binding.logicalRootPath
-        let previousIndex = session.worktreeBindings.firstIndex { existing in
-            (Self.standardizedWorkspacePath(existing.logicalRootPath) ?? existing.logicalRootPath) == normalizedRoot
-        }
-        let previous = previousIndex.map { session.worktreeBindings[$0] }
-        if let previousIndex {
-            if session.worktreeBindings[previousIndex] == binding {
-                return previous
-            }
-            session.worktreeBindings[previousIndex] = binding
-        } else {
-            session.worktreeBindings.append(binding)
-        }
-        session.isDirty = true
-        updateWorktreeBindingSummariesInIndex(for: session)
-        syncComposerUIState(tabID: session.tabID)
-        syncSidebarUIState(refresh: true, reason: .metadataUpdated)
-        syncStatusPillsUIState()
-        scheduleSave(for: session.tabID)
-        return previous
     }
 
     @discardableResult
-    func replaceWorktreeBindings(_ bindings: [AgentSessionWorktreeBinding], forSessionID sessionID: UUID) throws -> [AgentSessionWorktreeBinding] {
-        guard let session = try authoritativeLiveSession(for: sessionID) else {
-            throw MCPError.invalidParams("The requested agent session is not currently available.")
-        }
+    private func commitWorktreeBindings(
+        _ bindings: [AgentSessionWorktreeBinding],
+        to session: TabSession
+    ) -> [AgentSessionWorktreeBinding] {
         let previous = session.worktreeBindings
         guard previous != bindings else { return previous }
         session.worktreeBindings = bindings
@@ -5226,8 +5255,12 @@ final class AgentModeViewModel: ObservableObject {
         guard let session = try authoritativeLiveSession(for: sessionID) else {
             throw MCPError.invalidParams("The requested agent session is not currently available.")
         }
+        guard !session.worktreeBindingTransitionInProgress else {
+            throw ExecutionLocationTransitionError.stale
+        }
+        session.worktreeBindingTransitionInProgress = true
+        defer { session.worktreeBindingTransitionInProgress = false }
         let previousBindings = session.worktreeBindings
-        guard previousBindings != desiredBindings else { return previousBindings }
         let previousDestination = executionDestinationIdentity(in: previousBindings)
         let nextDestination = executionDestinationIdentity(in: desiredBindings)
         let changedDuringActiveRun = session.runState.isActive
@@ -5247,54 +5280,87 @@ final class AgentModeViewModel: ObservableObject {
             }
         }
 
-        try await materializeWorktreeBindingsForTransition(desiredBindings, sessionID: sessionID)
-        guard sessions[session.tabID] === session,
-              session.activeAgentSessionID == sessionID,
-              session.worktreeBindings == previousBindings,
-              session.runState.isActive == changedDuringActiveRun
-        else {
-            throw ExecutionLocationTransitionError.stale
+        let materializer = promptManager.map {
+            WorkspaceRootBindingProjectionMaterializer(store: $0.workspaceFileContextStore)
+        }
+        let preparation: WorkspaceRootBindingProjectionPreparation?
+        if let materializer {
+            do {
+                preparation = try await materializer.prepare(sessionID: sessionID, bindings: desiredBindings)
+            } catch {
+                throw ExecutionLocationTransitionError.unavailable(error.localizedDescription)
+            }
+        } else if desiredBindings.isEmpty {
+            preparation = nil
+        } else {
+            throw ExecutionLocationTransitionError.unavailable("The selected worktree roots could not be prepared for this thread.")
         }
 
-        if previousDestination == nextDestination {
-            return try replaceWorktreeBindings(desiredBindings, forSessionID: sessionID)
-        }
-
-        if changedDuringActiveRun {
-            switch intent {
-            case .userExecutionLocationChange(confirmation: .activeRunStop):
-                cancelPendingInstruction(for: session)
-                // Terminal publication synchronously detaches the old provider/controller,
-                // so rebinding does not wait on potentially non-cooperative teardown.
-                await runService.cancelRun(
-                    tabID: session.tabID,
-                    session: session,
-                    intent: .executionLocationChange,
-                    completion: .terminalPublished
-                )
-            case .userExecutionLocationChange, .externalManagement, .initialSend:
+        var ownershipCommitted = preparation == nil
+        do {
+            guard sessions[session.tabID] === session,
+                  session.activeAgentSessionID == sessionID,
+                  session.worktreeBindings == previousBindings,
+                  session.runState.isActive == changedDuringActiveRun
+            else {
                 throw ExecutionLocationTransitionError.stale
             }
+
+            if previousDestination != nextDestination {
+                if changedDuringActiveRun {
+                    switch intent {
+                    case .userExecutionLocationChange(confirmation: .activeRunStop):
+                        cancelPendingInstruction(for: session)
+                        // Terminal publication synchronously detaches the old provider/controller,
+                        // so rebinding does not wait on potentially non-cooperative teardown.
+                        await runService.cancelRun(
+                            tabID: session.tabID,
+                            session: session,
+                            intent: .executionLocationChange,
+                            completion: .terminalPublished
+                        )
+                    case .userExecutionLocationChange, .externalManagement, .initialSend:
+                        throw ExecutionLocationTransitionError.stale
+                    }
+                }
+                guard sessions[session.tabID] === session,
+                      session.activeAgentSessionID == sessionID,
+                      session.worktreeBindings == previousBindings,
+                      !session.runState.isActive
+                else {
+                    throw ExecutionLocationTransitionError.stale
+                }
+                if !changedDuringActiveRun {
+                    await stageResumeRecoveryHandoffIfNeeded(for: session)
+                }
+                await invalidateProviderContextForExecutionLocationChange(session)
+                guard sessions[session.tabID] === session,
+                      session.activeAgentSessionID == sessionID,
+                      session.worktreeBindings == previousBindings,
+                      !session.runState.isActive
+                else {
+                    throw ExecutionLocationTransitionError.stale
+                }
+            }
+
+            let projection: WorkspaceRootBindingProjection?
+            if let materializer, let preparation {
+                projection = try await materializer.commit(preparation)
+                ownershipCommitted = true
+            } else {
+                projection = nil
+            }
+            _ = commitWorktreeBindings(desiredBindings, to: session)
+            if let materializer {
+                await materializer.initializeCodemaps(for: projection)
+            }
+            return session.worktreeBindings
+        } catch {
+            if !ownershipCommitted, let materializer, let preparation {
+                await materializer.abort(preparation)
+            }
+            throw error
         }
-        guard sessions[session.tabID] === session,
-              session.activeAgentSessionID == sessionID,
-              session.worktreeBindings == previousBindings,
-              !session.runState.isActive
-        else {
-            throw ExecutionLocationTransitionError.stale
-        }
-        if !changedDuringActiveRun {
-            await stageResumeRecoveryHandoffIfNeeded(for: session)
-        }
-        await invalidateProviderContextForExecutionLocationChange(session)
-        guard sessions[session.tabID] === session,
-              session.activeAgentSessionID == sessionID,
-              session.worktreeBindings == previousBindings,
-              !session.runState.isActive
-        else {
-            throw ExecutionLocationTransitionError.stale
-        }
-        return try replaceWorktreeBindings(desiredBindings, forSessionID: sessionID)
     }
 
     private struct ExecutionDestinationIdentity: Equatable {
@@ -5311,35 +5377,6 @@ final class AgentModeViewModel: ObservableObject {
             path: Self.standardizedWorkspacePath(binding?.worktreeRootPath)
                 ?? Self.standardizedWorkspacePath(workspacePathProvider())
         )
-    }
-
-    private func materializeWorktreeBindingsForTransition(
-        _ bindings: [AgentSessionWorktreeBinding],
-        sessionID: UUID
-    ) async throws {
-        guard !bindings.isEmpty else { return }
-        guard let promptManager else {
-            throw ExecutionLocationTransitionError.unavailable("The selected worktree roots could not be prepared for this thread.")
-        }
-        guard let projection = await WorkspaceRootBindingProjectionMaterializer(
-            store: promptManager.workspaceFileContextStore
-        ).materialize(sessionID: sessionID, bindings: bindings), !projection.isEmpty else {
-            throw ExecutionLocationTransitionError.unavailable("The selected worktree roots could not be prepared for this thread.")
-        }
-
-        let availability = await promptManager.workspaceFileContextStore.rootScopeAvailability(projection.lookupRootScope)
-        guard case .available = availability else {
-            let missingPaths: [String] = switch availability {
-            case .available:
-                []
-            case let .sessionWorktreeUnavailable(paths):
-                paths
-            }
-            let suffix = missingPaths.isEmpty ? "" : ": \(missingPaths.joined(separator: ", "))"
-            throw ExecutionLocationTransitionError.unavailable(
-                "The selected worktree roots are unavailable\(suffix). The thread was not switched to the canonical checkout."
-            )
-        }
     }
 
     private func executionLocationContext() async throws -> ExecutionLocationContext {
@@ -5370,10 +5407,7 @@ final class AgentModeViewModel: ObservableObject {
         session: TabSession,
         source: String
     ) async throws -> [AgentSessionWorktreeBinding] {
-        guard let sessionID = session.activeAgentSessionID,
-              let mcpServer,
-              let promptManager
-        else {
+        guard let sessionID = session.activeAgentSessionID else {
             throw ExecutionLocationTransitionError.unavailable("This thread is not ready to change execution location.")
         }
         let previousBindings = session.worktreeBindings
@@ -5435,16 +5469,8 @@ final class AgentModeViewModel: ObservableObject {
                 Self.standardizedWorkspacePath($0.logicalRootPath) != Self.standardizedWorkspacePath(binding.logicalRootPath)
             }
             desiredBindings.append(binding)
-            let projection = await mcpServer.materializeWorkspaceBindingProjection(sessionID: sessionID, bindings: desiredBindings)
-            guard sessions[session.tabID] === session, session.worktreeBindings == previousBindings,
-                  let projection, !projection.isEmpty
-            else {
+            guard sessions[session.tabID] === session, session.worktreeBindings == previousBindings else {
                 throw ExecutionLocationTransitionError.stale
-            }
-            let roots = await promptManager.workspaceFileContextStore.rootRefs(scope: projection.lookupRootScope)
-            let loadedPaths = Set(roots.map { Self.standardizedWorkspacePath($0.standardizedFullPath) ?? $0.standardizedFullPath })
-            guard projection.physicalRootRefs.allSatisfy({ loadedPaths.contains(Self.standardizedWorkspacePath($0.standardizedFullPath) ?? $0.standardizedFullPath) }) else {
-                throw ExecutionLocationTransitionError.unavailable("Failed to load the selected worktree root for this thread.")
             }
             return desiredBindings
         } catch {
@@ -7790,6 +7816,7 @@ final class AgentModeViewModel: ObservableObject {
             EditFlowPerf.Dimensions(status: reason.rawValue, sourceItemCount: workingItemsSnapshot.count)
         )
         let importedTranscript: AgentTranscript
+        var trustedIncrementalFinalTurnStartSequenceIndex: Int?
         if reason == .liveMutation,
            session.pendingAskUser == nil,
            let mutationSummary = pendingMutationSummary,
@@ -7820,6 +7847,10 @@ final class AgentModeViewModel: ObservableObject {
                 protection: projectionProtection
             ) {
                 importedTranscript = incrementallyUpdatedTranscript
+                if workingItemsSnapshot.indices.contains(mutationSummary.earliestChangedIndex) {
+                    trustedIncrementalFinalTurnStartSequenceIndex =
+                        workingItemsSnapshot[mutationSummary.earliestChangedIndex].sequenceIndex
+                }
                 #if DEBUG
                     debugIncrementalPath = usesDurableFrontier ? "incremental-success:frontier" : "incremental-success:no-frontier"
                 #endif
@@ -7931,7 +7962,8 @@ final class AgentModeViewModel: ObservableObject {
             previousProjectionProtection: session.transcriptProjectionProtection,
             projectionProtection: projectionProtection,
             isCompressedHistoryRevealed: session.isCompressedHistoryRevealed,
-            isColdLoad: reason == .coldLoad
+            isColdLoad: reason == .coldLoad,
+            trustedIncrementalFinalTurnStartSequenceIndex: trustedIncrementalFinalTurnStartSequenceIndex
         )
         applyBuiltTranscriptPresentation(
             builtPresentation,
@@ -7941,17 +7973,22 @@ final class AgentModeViewModel: ObservableObject {
         let hasCompactedTranscriptPrefix = builtPresentation.transcript.turns.contains { $0.retentionTier != .full }
         let canReconcileForStandardRetention = (!session.runState.isActive || hasCompactedTranscriptPrefix)
             && (session.runState != .completed || hasCompactedTranscriptPrefix)
+        let containsExcludedLegacyItems = AgentTranscriptIO.containsExcludedLegacyItems(
+            workingItemsSnapshot,
+            policy: importPolicy
+        )
+        let fullDetailTurnEnvelopeChanged = AgentTranscriptIO.fullDetailTurnEnvelopeChanged(
+            from: existingTranscript,
+            to: builtPresentation.transcript
+        )
         let shouldReconcileWorkingItems: Bool = {
             guard session.items == workingItemsSnapshot,
                   canReconcileForStandardRetention
             else {
                 return false
             }
-            return AgentTranscriptIO.containsExcludedLegacyItems(workingItemsSnapshot, policy: importPolicy)
-                || AgentTranscriptIO.fullDetailTurnEnvelopeChanged(
-                    from: existingTranscript,
-                    to: builtPresentation.transcript
-                )
+            return containsExcludedLegacyItems
+                || fullDetailTurnEnvelopeChanged
                 || builtPresentation.sanitizedActivityCount > 0
         }()
         let mayCompactActiveSummaryOnlyToolResults = !shouldReconcileWorkingItems
@@ -7959,7 +7996,45 @@ final class AgentModeViewModel: ObservableObject {
             && session.runState.isActive
             && !hasCompactedTranscriptPrefix
             && builtPresentation.sanitizedActivityCount > 0
-        if shouldReconcileWorkingItems || mayCompactActiveSummaryOnlyToolResults {
+        let didApplyIncrementalSummaryOnlyCompaction: Bool = {
+            guard builtPresentation.sanitizedActivityCount > 0,
+                  !containsExcludedLegacyItems,
+                  !fullDetailTurnEnvelopeChanged,
+                  let mutationSummary = pendingMutationSummary,
+                  mutationSummary.earliestChangedIndex == mutationSummary.latestChangedIndex,
+                  workingItemsSnapshot.indices.contains(mutationSummary.earliestChangedIndex)
+            else {
+                return false
+            }
+            let changedIndex = mutationSummary.earliestChangedIndex
+            let sourceItem = workingItemsSnapshot[changedIndex]
+            guard let compactedItem = Self.transcriptItem(
+                in: builtPresentation.transcript,
+                matching: sourceItem
+            ),
+                let retainedRawPayload = session.ephemeralToolResultPayloadByItemID[sourceItem.id],
+                Self.canApplyActiveSummaryOnlyToolResultCompaction(
+                    from: sourceItem,
+                    to: compactedItem,
+                    retainedPayload: retainedRawPayload
+                ),
+                session.replaceItemSilentlyForRetentionCompaction(
+                    at: changedIndex,
+                    with: compactedItem,
+                    retainedRawPayload: retainedRawPayload
+                )
+            else {
+                return false
+            }
+            markDerivedTranscriptSynchronized(
+                for: session,
+                projectionProtection: builtPresentation.projectionProtection
+            )
+            return true
+        }()
+        if !didApplyIncrementalSummaryOnlyCompaction,
+           shouldReconcileWorkingItems || mayCompactActiveSummaryOnlyToolResults
+        {
             let trimmedWorkingItems = AgentTranscriptIO.workingSourceItems(from: builtPresentation.transcript)
             let canApplyWorkingItems = shouldReconcileWorkingItems
                 || Self.canApplyActiveSummaryOnlyToolResultCompaction(
@@ -8277,7 +8352,8 @@ final class AgentModeViewModel: ObservableObject {
         previousProjectionProtection: AgentTranscriptProjectionProtection = .none,
         projectionProtection: AgentTranscriptProjectionProtection = .none,
         isCompressedHistoryRevealed: Bool = false,
-        isColdLoad: Bool = false
+        isColdLoad: Bool = false,
+        trustedIncrementalFinalTurnStartSequenceIndex: Int? = nil
     ) -> BuiltTranscriptPresentation {
         let processingContext = AgentToolResultProcessingContext()
         #if DEBUG || EDIT_FLOW_PERF
@@ -8352,11 +8428,13 @@ final class AgentModeViewModel: ObservableObject {
             transcript,
             previousSanitizedTranscript: previousSanitizedTranscript,
             reusablePrefixTurnCount: sanitizeReusableTurnCount > 0 ? sanitizeReusableTurnCount : nil,
+            trustedIncrementalFinalTurnStartSequenceIndex: trustedIncrementalFinalTurnStartSequenceIndex,
             context: processingContext,
             purpose: .runtimePresentation
         )
         let sanitizedTranscript = AgentTranscriptProjectionBuilder.refreshCompletedFullTurnGroupedHistoryCaches(
-            in: sanitizeMetrics.transcript
+            in: sanitizeMetrics.transcript,
+            reusablePrefixTurnCount: sanitizeMetrics.reusedTurnCount
         )
         #if DEBUG || EDIT_FLOW_PERF
             if sanitizeReusableTurnCount > 0 {
@@ -8586,47 +8664,90 @@ final class AgentModeViewModel: ObservableObject {
         guard sourceItems.count == compactedItems.count else { return false }
         var foundSummaryOnlyToolResultCompaction = false
         for (sourceItem, compactedItem) in zip(sourceItems, compactedItems) {
-            guard sourceItem.id == compactedItem.id,
-                  sourceItem.timestamp == compactedItem.timestamp,
-                  sourceItem.kind == compactedItem.kind,
-                  sourceItem.attachments == compactedItem.attachments,
-                  sourceItem.taggedFileAttachments == compactedItem.taggedFileAttachments,
-                  sourceItem.toolName == compactedItem.toolName,
-                  sourceItem.toolInvocationID == compactedItem.toolInvocationID,
-                  sourceItem.toolArgsJSON == compactedItem.toolArgsJSON,
-                  sourceItem.reasoning == compactedItem.reasoning,
-                  sourceItem.sequenceIndex == compactedItem.sequenceIndex,
-                  sourceItem.isStreaming == compactedItem.isStreaming,
-                  sourceItem.workflow == compactedItem.workflow,
-                  sourceItem.codexGoalMode == compactedItem.codexGoalMode,
-                  sourceItem.isLocalControlPlaneEcho == compactedItem.isLocalControlPlaneEcho
-            else {
-                return false
-            }
             guard sourceItem != compactedItem else { continue }
-            guard sourceItem.kind == .toolResult,
-                  !sourceItem.isStreaming
-            else {
-                return false
-            }
-            let sourceResultJSON = sourceItem.toolResultJSON?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let compactedResultJSON = compactedItem.toolResultJSON?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let retainedPayload = retainedPayloadByItemID[sourceItem.id]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            guard !sourceResultJSON.isEmpty,
-                  sourceResultJSON != compactedResultJSON,
-                  retainedPayload == sourceResultJSON,
-                  AgentTranscriptToolNormalizer.isSummaryOnly(raw: compactedResultJSON)
-            else {
-                return false
-            }
-            var expectedCompactedItem = sourceItem
-            expectedCompactedItem.text = compactedItem.text
-            expectedCompactedItem.toolResultJSON = compactedItem.toolResultJSON
-            expectedCompactedItem.toolIsError = compactedItem.toolIsError
-            guard expectedCompactedItem == compactedItem else { return false }
+            guard canApplyActiveSummaryOnlyToolResultCompaction(
+                from: sourceItem,
+                to: compactedItem,
+                retainedPayload: retainedPayload
+            ) else { return false }
             foundSummaryOnlyToolResultCompaction = true
         }
         return foundSummaryOnlyToolResultCompaction
+    }
+
+    private nonisolated static func canApplyActiveSummaryOnlyToolResultCompaction(
+        from sourceItem: AgentChatItem,
+        to compactedItem: AgentChatItem,
+        retainedPayload: String
+    ) -> Bool {
+        guard sourceItem.id == compactedItem.id,
+              sourceItem.timestamp == compactedItem.timestamp,
+              sourceItem.kind == compactedItem.kind,
+              sourceItem.attachments == compactedItem.attachments,
+              sourceItem.taggedFileAttachments == compactedItem.taggedFileAttachments,
+              sourceItem.toolName == compactedItem.toolName,
+              sourceItem.toolInvocationID == compactedItem.toolInvocationID,
+              sourceItem.toolArgsJSON == compactedItem.toolArgsJSON,
+              sourceItem.reasoning == compactedItem.reasoning,
+              sourceItem.sequenceIndex == compactedItem.sequenceIndex,
+              sourceItem.isStreaming == compactedItem.isStreaming,
+              sourceItem.workflow == compactedItem.workflow,
+              sourceItem.codexGoalMode == compactedItem.codexGoalMode,
+              sourceItem.isLocalControlPlaneEcho == compactedItem.isLocalControlPlaneEcho,
+              sourceItem.kind == .toolResult,
+              !sourceItem.isStreaming
+        else {
+            return false
+        }
+        let sourceResultJSON = sourceItem.toolResultJSON?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let compactedResultJSON = compactedItem.toolResultJSON?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !sourceResultJSON.isEmpty,
+              sourceResultJSON != compactedResultJSON,
+              retainedPayload.trimmingCharacters(in: .whitespacesAndNewlines) == sourceResultJSON,
+              AgentTranscriptToolNormalizer.isSummaryOnly(raw: compactedResultJSON)
+        else {
+            return false
+        }
+        var expectedCompactedItem = sourceItem
+        expectedCompactedItem.text = compactedItem.text
+        expectedCompactedItem.toolResultJSON = compactedItem.toolResultJSON
+        expectedCompactedItem.toolIsError = compactedItem.toolIsError
+        return expectedCompactedItem == compactedItem
+    }
+
+    private nonisolated static func transcriptItem(
+        in transcript: AgentTranscript,
+        matching sourceItem: AgentChatItem
+    ) -> AgentChatItem? {
+        guard let finalTurn = transcript.turns.last else { return nil }
+        for span in finalTurn.responseSpans.reversed() {
+            guard let firstSequenceIndex = span.activities.first?.sequenceIndex,
+                  let lastSequenceIndex = span.activities.last?.sequenceIndex,
+                  sourceItem.sequenceIndex >= firstSequenceIndex,
+                  sourceItem.sequenceIndex <= lastSequenceIndex
+            else {
+                continue
+            }
+            var lowerBound = span.activities.startIndex
+            var upperBound = span.activities.endIndex
+            while lowerBound < upperBound {
+                let midpoint = lowerBound + (upperBound - lowerBound) / 2
+                if span.activities[midpoint].sequenceIndex < sourceItem.sequenceIndex {
+                    lowerBound = midpoint + 1
+                } else {
+                    upperBound = midpoint
+                }
+            }
+            guard lowerBound < span.activities.endIndex,
+                  span.activities[lowerBound].sequenceIndex == sourceItem.sequenceIndex,
+                  span.activities[lowerBound].id == sourceItem.id
+            else {
+                continue
+            }
+            return span.activities[lowerBound].toItem()
+        }
+        return nil
     }
 
     private func applyBuiltTranscriptPresentation(
@@ -9061,6 +9182,9 @@ final class AgentModeViewModel: ObservableObject {
                 $0,
                 reason: "Cancelled due to workspace switch"
             )
+        }
+        for sessionID in Set(cleanupTargets.compactMap(\.boundSessionID)) {
+            await releaseSessionWorktreeOwnership(sessionID: sessionID)
         }
         #if DEBUG
             WorkspaceRestorePerfLog.event(
@@ -9592,6 +9716,7 @@ final class AgentModeViewModel: ObservableObject {
                 liveSession: sessions[tabID],
                 reason: "compose_tab_close"
             )
+            await releaseSessionWorktreeOwnership(sessionID: boundID)
 
             switch reason {
             case .stash:
@@ -10514,8 +10639,7 @@ final class AgentModeViewModel: ObservableObject {
               let workspace = workspaceManager.activeWorkspace,
               !workspace.isSystemWorkspace,
               let primaryRoot = workspace.repoPaths.first,
-              let promptManager,
-              let mcpServer
+              let promptManager
         else {
             throw InitialNewWorktreePreparationError.unavailable(
                 "Execution location requires an active Git-backed project workspace. Select Work locally or open a Git workspace."
@@ -10618,23 +10742,23 @@ final class AgentModeViewModel: ObservableObject {
                 visualColorHex: identity.colorHex,
                 source: bindingSource
             )
-            let projection = await mcpServer.materializeWorkspaceBindingProjection(sessionID: sessionID, bindings: [binding])
-            guard !Task.isCancelled, operationIsCurrent() else {
-                throw locationBindingFailure(Self.staleComposerSubmitTargetMessage)
-            }
-            guard let projection, !projection.isEmpty else {
-                throw locationBindingFailure("Failed to prepare the worktree root for this thread.")
-            }
-            let loadedRoots = await promptManager.workspaceFileContextStore.rootRefs(scope: projection.lookupRootScope)
-            let loadedPaths = Set(loadedRoots.map { Self.standardizedWorkspacePath($0.standardizedFullPath) ?? $0.standardizedFullPath })
             guard !Task.isCancelled,
                   operationIsCurrent(),
-                  projection.physicalRootRefs.allSatisfy({ loadedPaths.contains(Self.standardizedWorkspacePath($0.standardizedFullPath) ?? $0.standardizedFullPath) }),
                   isReadyForInitialNewWorktreeCommit(session)
             else {
-                throw locationBindingFailure("Failed to load the worktree root for this thread.")
+                throw locationBindingFailure(Self.staleComposerSubmitTargetMessage)
             }
-            _ = try applyWorktreeBinding(binding, toSessionID: sessionID)
+            do {
+                _ = try await transitionWorktreeBindings(
+                    [binding],
+                    forSessionID: sessionID,
+                    intent: .initialSend
+                )
+            } catch {
+                throw locationBindingFailure(
+                    (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                )
+            }
         } catch let error as InitialNewWorktreePreparationError {
             throw error
         } catch {
@@ -11866,6 +11990,7 @@ final class AgentModeViewModel: ObservableObject {
         let workspaceBlocks = PromptPackagingService.generateFileBlocksDetailed(
             files: workspaceEntries,
             filePathDisplay: .relative,
+            codemapSnapshotBundle: .empty,
             displayPathResolver: { entry in
                 lookupContext.bindingProjection?.projectedLogicalDisplayPath(
                     forPhysicalPath: entry.file.standardizedFullPath,
@@ -14567,6 +14692,7 @@ final class AgentModeViewModel: ObservableObject {
             sessions.removeValue(forKey: tabID)
         }
 
+        await releaseSessionWorktreeOwnership(sessionID: sessionID)
         removeSessionIndex(sessionID: sessionID)
         if let cleanupRegistration {
             await AgentRunSessionStore.cleanup(registration: cleanupRegistration)
@@ -15078,13 +15204,14 @@ final class AgentModeViewModel: ObservableObject {
             tokenCap: tokenCap,
             store: promptManager.workspaceFileContextStore,
             lookupContext: lookupContext,
-            overTokenCapSummaryProvider: { [weak self] selection, lookupContext in
+            overTokenCapSummaryProvider: { [weak self] selection, lookupContext, codemapSnapshotBundle in
                 guard let self, let mcp = mcpServer else { return nil }
                 let reply = await mcp.buildTabSelectionReply(
                     from: selection,
                     includeBlocks: false,
                     display: .relative,
-                    lookupContextOverride: lookupContext
+                    lookupContextOverride: lookupContext,
+                    codemapSnapshotBundle: codemapSnapshotBundle
                 )
                 let summary = ToolOutputFormatter.formatSelectionReplyToString(reply)
                 return """

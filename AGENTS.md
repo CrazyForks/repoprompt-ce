@@ -129,7 +129,9 @@ make dev-swift-build PRODUCT=repoprompt-mcp         # focused product build (PRO
 make dev-run
 make dev-test                                       # full coordinated test suite
 make dev-test FILTER=WorkspaceFileContextStoreTests # focused coordinated test run
+make dev-test-list                                  # coordinated authoritative root XCTest method list
 make dev-provider-test                              # RepoPromptAgentProviders package tests (FILTER= also supported)
+make dev-provider-test-list                         # coordinated authoritative provider XCTest method list
 make dev-smoke          # non-disruptive: requires an already-running CE debug app and installed debug CLI
 make dev-smoke-launch   # builds/launches the debug app, then runs the smoke flow
 make dev-format-check   # non-mutating coordinated SwiftFormat check
@@ -255,6 +257,12 @@ Run the smallest relevant daemon build/test command above to validate a change. 
 Direct `swift test --filter <name>` and `swift build --product <name>` still work and produce the same result, but they are uncoordinated — use them only when the daemon is unavailable (for example, no `python3`), and avoid them when other agents may be building.
 
 Use `make dev-run` (or `make run`) only when it is safe to stop any existing RepoPrompt instance and launch the local debug app.
+
+### XCTest optimization inventory and timing
+
+See [`docs/testing.md`](docs/testing.md) for the contributor workflow, exact XCTest IDs, surgical contract-ledger maintenance, scenario accounting, and handoff checklist. Routine executable adds, renames, consolidations, and removals require the affected focused test, authoritative list, and `verify-ledger`; never regenerate or overwrite the curated ledger.
+
+Optimization/performance campaigns additionally require append-only inventory, baseline, focused, and full-root artifacts plus updates to `prompt-exports/optimize-test-suite-runs.md`. The primary metric is warm local root conductor execution time, provider timing remains separate, and diagnostic/wake-probe runs are invalid timing samples retained only as lifecycle evidence.
 
 ## Cleanup
 

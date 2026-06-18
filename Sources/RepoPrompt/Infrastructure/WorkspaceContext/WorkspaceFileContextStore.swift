@@ -136,6 +136,29 @@ actor WorkspaceFileContextStore {
         let enableHierarchicalIgnores: Bool
     }
 
+    private struct SessionWorktreeRootLifetimeKey: Hashable {
+        let rootID: UUID
+        let lifetimeID: UUID
+    }
+
+    private struct SessionWorktreeOwnershipRecord {
+        let bindingFingerprint: String
+        let roots: [WorkspaceSessionWorktreeOwnedRoot]
+    }
+
+    private struct SliceRebaseSourceCacheKey: Hashable {
+        let rootID: UUID
+        let rootLifetimeID: UUID
+        let fileID: UUID
+        let relativePath: String
+    }
+
+    private struct SliceRebaseSourceCacheEntry {
+        let snapshot: WorkspaceSliceRebaseSourceSnapshot
+        let byteCost: Int
+        var accessOrdinal: UInt64
+    }
+
     private enum CatalogInvalidationReason: String, Hashable {
         case fileSystemPublication = "file_system_publication"
         case rootLoad = "root_load"
@@ -423,10 +446,24 @@ actor WorkspaceFileContextStore {
             let rootKind: String
             let crawlCount: Int
             let watcherActive: Bool
+            let explicitWatcherDemand: Bool
+            let sessionWorktreeOwnerCount: Int
             let ingress: WorkspaceFileSystemIngressCoordinator.DebugSnapshot
             let barrier: ScopedIngressBarrierDebugSnapshot
             let freshness: FileSystemService.FreshnessWorkDiagnosticsSnapshot
             let invalidation: PublicationInvalidationHistoryDebugSnapshot
+            let producedAppliedIndexGeneration: UInt64
+        }
+
+        struct ApplyEditsRebaseProbePathSnapshot: Equatable {
+            let rootID: UUID
+            let rootLifetimeID: UUID
+            let rootToken: UUID
+            let rootPath: String
+            let fileID: UUID
+            let fullPath: String
+            let relativePath: String
+            let isSessionWorktree: Bool
             let producedAppliedIndexGeneration: UInt64
         }
 
@@ -462,6 +499,7 @@ actor WorkspaceFileContextStore {
         private var rootUnloadDidDetachHandler: (@Sendable ([String]) async -> Void)?
         private var ensureIndexedFilesEligibilityDidResolveHandler: (@Sendable (UUID, String) async -> Void)?
         private var watcherSinkWillApplyHandler: (@Sendable (UUID) async -> Void)?
+        private var storeEditDeferredPublicationDidRegisterHandler: (@Sendable (UUID, String) async -> Void)?
         private var publisherIngressWillWaitHandler: (@Sendable (Set<UUID>) async -> Void)?
         private var watcherServiceStateWillReconcileHandler: (@Sendable (UUID, Bool) async -> Void)?
         private var watcherStopWillBeginHandler: (@Sendable (UUID) async -> Void)?
@@ -571,6 +609,34 @@ actor WorkspaceFileContextStore {
             rootStatesByID[rootID]?.service
         }
 
+        func debugApplyEditsRebaseProbePathSnapshot(
+            fullPath rawFullPath: String,
+            rootScope: WorkspaceLookupRootScope
+        ) -> ApplyEditsRebaseProbePathSnapshot? {
+            let fullPath = StandardizedPath.absolute(rawFullPath)
+            guard let root = rootsForPathLookup(scope: rootScope)
+                .filter({ StandardizedPath.isDescendant(fullPath, of: $0.standardizedFullPath) })
+                .max(by: { $0.standardizedFullPath.count < $1.standardizedFullPath.count }),
+                let state = rootStatesByID[root.id]
+            else { return nil }
+            let relativePath = URL(fileURLWithPath: fullPath)
+                .relativePath(from: URL(fileURLWithPath: root.standardizedFullPath))
+            guard let file = file(rootID: root.id, relativePath: relativePath),
+                  file.standardizedFullPath == fullPath
+            else { return nil }
+            return ApplyEditsRebaseProbePathSnapshot(
+                rootID: root.id,
+                rootLifetimeID: state.lifetimeID,
+                rootToken: state.service.diagnosticRootToken,
+                rootPath: root.standardizedFullPath,
+                fileID: file.id,
+                fullPath: file.standardizedFullPath,
+                relativePath: file.standardizedRelativePath,
+                isSessionWorktree: root.kind == .sessionWorktree,
+                producedAppliedIndexGeneration: appliedIndexGenerationsByRootID[root.id] ?? 0
+            )
+        }
+
         func readSearchRootDiagnosticsSnapshot(
             recentPublicationLimit: Int = 8
         ) async -> [ReadSearchRootDiagnosticsSnapshot] {
@@ -589,6 +655,8 @@ actor WorkspaceFileContextStore {
                     rootKind: Self.rootKindDiagnosticLabel(state.root.kind),
                     crawlCount: rootCrawlCountsByRootID[rootID] ?? 0,
                     watcherActive: watcherActive,
+                    explicitWatcherDemand: explicitWatcherDemandRootIDs.contains(rootID),
+                    sessionWorktreeOwnerCount: sessionWorktreeOwnerCount(rootID: rootID, lifetimeID: state.lifetimeID),
                     ingress: publisherIngressCoordinator.debugSnapshot(rootID: rootID),
                     barrier: scopedIngressBarrierDebugSnapshot(rootID: rootID),
                     freshness: freshness,
@@ -897,6 +965,12 @@ actor WorkspaceFileContextStore {
             await storeBackedSearchLane.setPermitAcquiredHandlerForTesting(handler)
         }
 
+        func setStoreEditDeferredPublicationDidRegisterHandlerForTesting(
+            _ handler: (@Sendable (UUID, String) async -> Void)?
+        ) {
+            storeEditDeferredPublicationDidRegisterHandler = handler
+        }
+
         func setSearchContentReadChunkHandlerForTesting(
             rootID: UUID,
             _ handler: (@Sendable (String) async -> Void)?
@@ -1062,6 +1136,11 @@ actor WorkspaceFileContextStore {
         let generation: UInt64
     }
 
+    private struct StaticPathMatchSnapshotCacheEntry {
+        let snapshot: StaticPathMatchData
+        var lastAccessSequence: UInt64
+    }
+
     private var rootStatesByID: [UUID: RootState] = [:]
     private var rootIDsByStandardizedPath: [String: UUID] = [:]
     private var foldersByID: [UUID: WorkspaceFolderRecord] = [:]
@@ -1089,6 +1168,8 @@ actor WorkspaceFileContextStore {
     private var rootCatalogShardWeakReferencesByRootID: [UUID: [WeakRootCatalogShardReference]] = [:]
     private var rootCatalogShardDeltaStatesByRootID: [UUID: RootCatalogShardDeltaState] = [:]
     private var pathMatchSnapshotIdentitiesByScope: [WorkspaceLookupRootScope: PathMatchCacheIdentity] = [:]
+    private var staticPathMatchSnapshotsByScope: [WorkspaceLookupRootScope: StaticPathMatchSnapshotCacheEntry] = [:]
+    private var nextStaticPathMatchSnapshotAccessSequence: UInt64 = 0
     private let storeBackedSearchLane: StoreBackedWorkspaceSearchLane
     private let searchDecodedContentCache = WorkspaceSearchDecodedContentCache()
     private let interactiveReadCache = WorkspaceInteractiveReadCache()
@@ -1101,6 +1182,7 @@ actor WorkspaceFileContextStore {
     private var nextSearchContentInvalidationEpoch: UInt64 = 0
     private var activePublicationInvalidationBatch: PublicationInvalidationBatch?
     private static let maxCachedSearchCatalogSnapshotScopes = 16
+    private static let maxCachedStaticPathMatchSnapshotScopes = 16
     /// Covers overlapping readers/index builds while bounding retained full-root arrays. At the cap,
     /// callers receive an authoritative uncached rebuild until older ARC leases drain.
     private static let maxLiveRootCatalogShardGenerationsPerRoot = 8
@@ -1118,14 +1200,27 @@ actor WorkspaceFileContextStore {
     )
     private var codemapSnapshotsByFileID: [UUID: WorkspaceCodemapSnapshot] = [:]
     private var codemapFileIDsByRootID: [UUID: Set<UUID>] = [:]
+    private var pendingCodemapRepairFileIDs = Set<UUID>()
     private var initializingSessionWorktreeCodemapRootIDs = Set<UUID>()
     private var initializedSessionWorktreeCodemapRootIDs = Set<UUID>()
     private var cachedCodemapFileAPIAggregate: WorkspaceCodemapFileAPIAggregate?
+    private var cachedCodemapFileAPIAggregatesByScope: [WorkspaceLookupRootScope: WorkspaceCodemapFileAPIAggregate] = [:]
     private var codemapUpdateContinuations: [UUID: AsyncStream<WorkspaceCodemapUpdateEvent>.Continuation] = [:]
     private var fileSystemDeltaContinuations: [UUID: AsyncStream<WorkspaceFileSystemDeltaEvent>.Continuation] = [:]
     private var appliedIndexContinuations: [UUID: AsyncStream<WorkspaceAppliedIndexBatchEvent>.Continuation] = [:]
     private var appliedIndexGenerationsByRootID: [UUID: UInt64] = [:]
+    private var sliceRebaseSourceEntries: [SliceRebaseSourceCacheKey: SliceRebaseSourceCacheEntry] = [:]
+    private var sliceRebaseSourceEstimatedBytes = 0
+    private var sliceRebaseSourceAccessOrdinal: UInt64 = 0
+    private static let maxSliceRebaseSourceEntryCount = 64
+    private static let maxSliceRebaseSourceTotalBytes = 32 * 1024 * 1024
+    private static let maxSliceRebaseSourceEntryBytes = 8 * 1024 * 1024
     private var watcherCancellablesByRootID: [UUID: AnyCancellable] = [:]
+    private var explicitWatcherDemandRootIDs = Set<UUID>()
+    private var latestSessionWorktreeOwnershipGenerationByOwnerID: [UUID: UInt64] = [:]
+    private var installedSessionWorktreeOwnershipTokenByOwnerID: [UUID: WorkspaceSessionWorktreeOwnershipToken] = [:]
+    private var sessionWorktreeOwnershipRecordsByToken: [WorkspaceSessionWorktreeOwnershipToken: SessionWorktreeOwnershipRecord] = [:]
+    private var sessionWorktreeOwnershipTokensByRootLifetime: [SessionWorktreeRootLifetimeKey: Set<WorkspaceSessionWorktreeOwnershipToken>] = [:]
     private let publisherIngressCoordinator: WorkspaceFileSystemIngressCoordinator
     private let unloadTerminationPolicy: WorkspaceRootUnloadTerminationPolicy
     private var scopedIngressBarrierFlightStatesByRootID: [UUID: ScopedIngressBarrierRootFlightState] = [:]
@@ -1248,13 +1343,26 @@ actor WorkspaceFileContextStore {
     }
 
     func startWatchingRoot(id rootID: UUID) async throws {
-        let state = try state(for: rootID)
+        _ = try state(for: rootID)
+        explicitWatcherDemandRootIDs.insert(rootID)
+        do {
+            try await reconcileAggregateWatcherDemand(rootID: rootID)
+        } catch {
+            explicitWatcherDemandRootIDs.remove(rootID)
+            try? await reconcileAggregateWatcherDemand(rootID: rootID)
+            throw error
+        }
+    }
+
+    private func ensureWatcherInfrastructure(state: RootState, rootID: UUID) async throws {
         if watcherCancellablesByRootID[rootID] != nil {
             try await reconcileWatcherServiceState(state.service, rootID: rootID)
             await waitForCurrentPublisherIngress(rootIDs: [rootID])
             return
         }
-        guard try await attachPublisherIngress(state: state, rootID: rootID) else { return }
+        guard try await attachPublisherIngress(state: state, rootID: rootID) else {
+            throw WorkspaceSessionWorktreeOwnershipError.unavailableRoot(state.root.standardizedFullPath)
+        }
         do {
             try await reconcileWatcherServiceState(state.service, rootID: rootID)
             await waitForCurrentPublisherIngress(rootIDs: [rootID])
@@ -1340,13 +1448,300 @@ actor WorkspaceFileContextStore {
     #endif
 
     func stopWatchingRoot(id rootID: UUID) async {
-        watcherCancellablesByRootID.removeValue(forKey: rootID)?.cancel()
-        publisherIngressCoordinator.closePublisherIngress(rootID: rootID)
+        explicitWatcherDemandRootIDs.remove(rootID)
+        try? await reconcileAggregateWatcherDemand(rootID: rootID)
+    }
+
+    func prepareSessionWorktreeOwnership(
+        ownerID: UUID,
+        bindingFingerprint: String,
+        physicalRootPaths: [String]
+    ) async throws -> WorkspaceSessionWorktreeOwnershipPreparation {
+        let standardizedPaths = Array(Set(physicalRootPaths.map {
+            StandardizedPath.absolute(($0 as NSString).expandingTildeInPath)
+        })).sorted()
+        if let installedToken = installedSessionWorktreeOwnershipTokenByOwnerID[ownerID],
+           let installedRecord = sessionWorktreeOwnershipRecordsByToken[installedToken],
+           installedRecord.bindingFingerprint == bindingFingerprint,
+           installedRecord.roots.map(\.standardizedPhysicalPath).sorted() == standardizedPaths,
+           sessionWorktreeOwnershipRecordIsCurrent(installedRecord)
+        {
+            return WorkspaceSessionWorktreeOwnershipPreparation(
+                token: installedToken,
+                bindingFingerprint: bindingFingerprint,
+                roots: installedRecord.roots,
+                reusesInstalledOwnership: true
+            )
+        }
+
+        let generation = (latestSessionWorktreeOwnershipGenerationByOwnerID[ownerID] ?? 0) &+ 1
+        latestSessionWorktreeOwnershipGenerationByOwnerID[ownerID] = generation
+        let token = WorkspaceSessionWorktreeOwnershipToken(ownerID: ownerID, generation: generation)
+        let installedToken = installedSessionWorktreeOwnershipTokenByOwnerID[ownerID]
+        let supersededTokens = sessionWorktreeOwnershipRecordsByToken.keys.filter {
+            $0.ownerID == ownerID && $0 != installedToken
+        }
+        var supersededRoots: [WorkspaceSessionWorktreeOwnedRoot] = []
+        for supersededToken in supersededTokens {
+            supersededRoots.append(contentsOf: removeSessionWorktreeOwnershipToken(supersededToken))
+        }
+        await cleanupOrphanedSessionWorktreeRoots(supersededRoots)
+        guard latestSessionWorktreeOwnershipGenerationByOwnerID[ownerID] == generation else {
+            throw WorkspaceSessionWorktreeOwnershipError.staleUpdate
+        }
+
+        sessionWorktreeOwnershipRecordsByToken[token] = SessionWorktreeOwnershipRecord(
+            bindingFingerprint: bindingFingerprint,
+            roots: []
+        )
+        do {
+            var preparedRoots: [WorkspaceSessionWorktreeOwnedRoot] = []
+            for path in standardizedPaths {
+                let root = try await loadRoot(
+                    path: path,
+                    kind: .sessionWorktree,
+                    respectGitignore: true,
+                    respectRepoIgnore: true,
+                    respectCursorignore: true
+                )
+                guard let state = rootStatesByID[root.id],
+                      state.root.kind == .sessionWorktree,
+                      state.root.standardizedFullPath == path
+                else {
+                    throw WorkspaceSessionWorktreeOwnershipError.invalidRootKind(path)
+                }
+                let ownedRoot = WorkspaceSessionWorktreeOwnedRoot(
+                    rootID: root.id,
+                    lifetimeID: state.lifetimeID,
+                    standardizedPhysicalPath: path
+                )
+                guard latestSessionWorktreeOwnershipGenerationByOwnerID[ownerID] == generation else {
+                    await cleanupOrphanedSessionWorktreeRoots([ownedRoot])
+                    throw WorkspaceSessionWorktreeOwnershipError.staleUpdate
+                }
+                preparedRoots.append(ownedRoot)
+                sessionWorktreeOwnershipRecordsByToken[token] = SessionWorktreeOwnershipRecord(
+                    bindingFingerprint: bindingFingerprint,
+                    roots: preparedRoots
+                )
+                let rootKey = SessionWorktreeRootLifetimeKey(rootID: root.id, lifetimeID: state.lifetimeID)
+                sessionWorktreeOwnershipTokensByRootLifetime[rootKey, default: []].insert(token)
+                try await reconcileAggregateWatcherDemand(rootID: root.id)
+                guard latestSessionWorktreeOwnershipGenerationByOwnerID[ownerID] == generation,
+                      isRootLifetimeCurrent(rootID: root.id, expectedLifetimeID: state.lifetimeID)
+                else {
+                    throw WorkspaceSessionWorktreeOwnershipError.staleUpdate
+                }
+            }
+            return WorkspaceSessionWorktreeOwnershipPreparation(
+                token: token,
+                bindingFingerprint: bindingFingerprint,
+                roots: preparedRoots,
+                reusesInstalledOwnership: false
+            )
+        } catch {
+            let roots = removeSessionWorktreeOwnershipToken(token)
+            await cleanupOrphanedSessionWorktreeRoots(roots)
+            throw error
+        }
+    }
+
+    @discardableResult
+    func commitSessionWorktreeOwnership(
+        _ preparation: WorkspaceSessionWorktreeOwnershipPreparation
+    ) async throws -> [WorkspaceSessionWorktreeOwnedRoot] {
+        if preparation.reusesInstalledOwnership {
+            guard installedSessionWorktreeOwnershipTokenByOwnerID[preparation.token.ownerID] == preparation.token,
+                  let record = sessionWorktreeOwnershipRecordsByToken[preparation.token],
+                  sessionWorktreeOwnershipRecordIsCurrent(record)
+            else {
+                throw WorkspaceSessionWorktreeOwnershipError.staleUpdate
+            }
+            return record.roots
+        }
+        guard latestSessionWorktreeOwnershipGenerationByOwnerID[preparation.token.ownerID] == preparation.token.generation,
+              let record = sessionWorktreeOwnershipRecordsByToken[preparation.token],
+              record.bindingFingerprint == preparation.bindingFingerprint,
+              record.roots == preparation.roots,
+              sessionWorktreeOwnershipRecordIsCurrent(record)
+        else {
+            throw WorkspaceSessionWorktreeOwnershipError.staleUpdate
+        }
+
+        if record.roots.isEmpty {
+            installedSessionWorktreeOwnershipTokenByOwnerID.removeValue(forKey: preparation.token.ownerID)
+            var releasedRoots = removeSessionWorktreeOwnershipToken(preparation.token)
+            let previousTokens = sessionWorktreeOwnershipRecordsByToken.keys.filter {
+                $0.ownerID == preparation.token.ownerID
+            }
+            for previousToken in previousTokens {
+                releasedRoots.append(contentsOf: removeSessionWorktreeOwnershipToken(previousToken))
+            }
+            scheduleOrphanedSessionWorktreeRootCleanup(releasedRoots)
+            return []
+        }
+
+        let previousToken = installedSessionWorktreeOwnershipTokenByOwnerID.updateValue(
+            preparation.token,
+            forKey: preparation.token.ownerID
+        )
+        var previousRoots: [WorkspaceSessionWorktreeOwnedRoot] = []
+        if let previousToken, previousToken != preparation.token {
+            previousRoots = removeSessionWorktreeOwnershipToken(previousToken)
+        }
+        scheduleOrphanedSessionWorktreeRootCleanup(previousRoots)
+        return record.roots
+    }
+
+    func abortSessionWorktreeOwnership(
+        _ preparation: WorkspaceSessionWorktreeOwnershipPreparation
+    ) async {
+        guard !preparation.reusesInstalledOwnership,
+              installedSessionWorktreeOwnershipTokenByOwnerID[preparation.token.ownerID] != preparation.token
+        else { return }
+        let roots = removeSessionWorktreeOwnershipToken(preparation.token)
+        await cleanupOrphanedSessionWorktreeRoots(roots)
+    }
+
+    func releaseSessionWorktreeOwnership(ownerID: UUID) async {
+        latestSessionWorktreeOwnershipGenerationByOwnerID[ownerID, default: 0] &+= 1
+        installedSessionWorktreeOwnershipTokenByOwnerID.removeValue(forKey: ownerID)
+        let tokens = sessionWorktreeOwnershipRecordsByToken.keys.filter { $0.ownerID == ownerID }
+        var roots: [WorkspaceSessionWorktreeOwnedRoot] = []
+        for token in tokens {
+            roots.append(contentsOf: removeSessionWorktreeOwnershipToken(token))
+        }
+        await cleanupOrphanedSessionWorktreeRoots(roots)
+    }
+
+    func sessionWorktreeOwnershipCovers(
+        ownerID: UUID,
+        bindingFingerprint: String,
+        physicalRootPaths: Set<String>
+    ) -> Bool {
+        guard let token = installedSessionWorktreeOwnershipTokenByOwnerID[ownerID],
+              let record = sessionWorktreeOwnershipRecordsByToken[token],
+              record.bindingFingerprint == bindingFingerprint,
+              Set(record.roots.map(\.standardizedPhysicalPath)) == Set(physicalRootPaths.map {
+                  StandardizedPath.absolute(($0 as NSString).expandingTildeInPath)
+              }),
+              sessionWorktreeOwnershipRecordIsCurrent(record)
+        else { return false }
+        return true
+    }
+
+    func installedSessionWorktreeRoots(
+        ownerID: UUID,
+        bindingFingerprint: String,
+        physicalRootPaths: Set<String>
+    ) -> [WorkspaceRootRecord]? {
+        guard sessionWorktreeOwnershipCovers(
+            ownerID: ownerID,
+            bindingFingerprint: bindingFingerprint,
+            physicalRootPaths: physicalRootPaths
+        ),
+            let token = installedSessionWorktreeOwnershipTokenByOwnerID[ownerID],
+            let record = sessionWorktreeOwnershipRecordsByToken[token]
+        else { return nil }
+        return record.roots.compactMap { rootStatesByID[$0.rootID]?.root }
+    }
+
+    #if DEBUG
+        struct SessionWorktreeOwnershipDebugSnapshot: Equatable {
+            let installedOwnerCount: Int
+            let provisionalOwnerCount: Int
+            let rootClaimCount: Int
+            let explicitWatcherDemandCount: Int
+        }
+
+        func sessionWorktreeOwnershipDebugSnapshotForTesting() -> SessionWorktreeOwnershipDebugSnapshot {
+            let installedTokens = Set(installedSessionWorktreeOwnershipTokenByOwnerID.values)
+            return SessionWorktreeOwnershipDebugSnapshot(
+                installedOwnerCount: installedTokens.count,
+                provisionalOwnerCount: sessionWorktreeOwnershipRecordsByToken.keys.count(where: { !installedTokens.contains($0) }),
+                rootClaimCount: sessionWorktreeOwnershipTokensByRootLifetime.values.reduce(0) { $0 + $1.count },
+                explicitWatcherDemandCount: explicitWatcherDemandRootIDs.count
+            )
+        }
+    #endif
+
+    private func sessionWorktreeOwnershipRecordIsCurrent(_ record: SessionWorktreeOwnershipRecord) -> Bool {
+        record.roots.allSatisfy { root in
+            guard let state = rootStatesByID[root.rootID],
+                  state.lifetimeID == root.lifetimeID,
+                  state.root.kind == .sessionWorktree,
+                  state.root.standardizedFullPath == root.standardizedPhysicalPath,
+                  watcherCancellablesByRootID[root.rootID] != nil,
+                  publisherIngressCoordinator.hasOpenPublisherIngress(rootID: root.rootID)
+            else { return false }
+            let key = SessionWorktreeRootLifetimeKey(rootID: root.rootID, lifetimeID: root.lifetimeID)
+            return sessionWorktreeOwnershipTokensByRootLifetime[key]?.isEmpty == false
+        }
+    }
+
+    private func removeSessionWorktreeOwnershipToken(
+        _ token: WorkspaceSessionWorktreeOwnershipToken
+    ) -> [WorkspaceSessionWorktreeOwnedRoot] {
+        guard let record = sessionWorktreeOwnershipRecordsByToken.removeValue(forKey: token) else { return [] }
+        for root in record.roots {
+            let key = SessionWorktreeRootLifetimeKey(rootID: root.rootID, lifetimeID: root.lifetimeID)
+            sessionWorktreeOwnershipTokensByRootLifetime[key]?.remove(token)
+            if sessionWorktreeOwnershipTokensByRootLifetime[key]?.isEmpty == true {
+                sessionWorktreeOwnershipTokensByRootLifetime.removeValue(forKey: key)
+            }
+        }
+        return record.roots
+    }
+
+    private func scheduleOrphanedSessionWorktreeRootCleanup(
+        _ roots: [WorkspaceSessionWorktreeOwnedRoot]
+    ) {
+        guard !roots.isEmpty else { return }
+        Task { await cleanupOrphanedSessionWorktreeRoots(roots) }
+    }
+
+    private func cleanupOrphanedSessionWorktreeRoots(
+        _ roots: [WorkspaceSessionWorktreeOwnedRoot]
+    ) async {
+        var seen = Set<SessionWorktreeRootLifetimeKey>()
+        for root in roots {
+            let key = SessionWorktreeRootLifetimeKey(rootID: root.rootID, lifetimeID: root.lifetimeID)
+            guard seen.insert(key).inserted,
+                  isRootLifetimeCurrent(rootID: root.rootID, expectedLifetimeID: root.lifetimeID),
+                  !hasAggregateWatcherDemand(rootID: root.rootID, lifetimeID: root.lifetimeID)
+            else { continue }
+            try? await reconcileAggregateWatcherDemand(rootID: root.rootID)
+            guard isRootLifetimeCurrent(rootID: root.rootID, expectedLifetimeID: root.lifetimeID),
+                  !hasAggregateWatcherDemand(rootID: root.rootID, lifetimeID: root.lifetimeID),
+                  rootStatesByID[root.rootID]?.root.kind == .sessionWorktree
+            else { continue }
+            await unloadRoot(id: root.rootID)
+        }
+    }
+
+    private func sessionWorktreeOwnerCount(rootID: UUID, lifetimeID: UUID) -> Int {
+        sessionWorktreeOwnershipTokensByRootLifetime[
+            SessionWorktreeRootLifetimeKey(rootID: rootID, lifetimeID: lifetimeID)
+        ]?.count ?? 0
+    }
+
+    private func hasAggregateWatcherDemand(rootID: UUID, lifetimeID: UUID) -> Bool {
+        explicitWatcherDemandRootIDs.contains(rootID)
+            || sessionWorktreeOwnerCount(rootID: rootID, lifetimeID: lifetimeID) > 0
+    }
+
+    private func reconcileAggregateWatcherDemand(rootID: UUID) async throws {
         guard let state = rootStatesByID[rootID] else {
             await waitForCurrentPublisherIngress(rootIDs: [rootID])
             return
         }
-        try? await reconcileWatcherServiceState(state.service, rootID: rootID)
+        if hasAggregateWatcherDemand(rootID: rootID, lifetimeID: state.lifetimeID) {
+            try await ensureWatcherInfrastructure(state: state, rootID: rootID)
+            return
+        }
+        watcherCancellablesByRootID.removeValue(forKey: rootID)?.cancel()
+        publisherIngressCoordinator.closePublisherIngress(rootID: rootID)
+        try await reconcileWatcherServiceState(state.service, rootID: rootID)
         await waitForCurrentPublisherIngress(rootIDs: [rootID])
     }
 
@@ -1511,6 +1906,13 @@ actor WorkspaceFileContextStore {
             }
         #endif
         guard isRootLifetimeCurrent(rootID: root.id, expectedLifetimeID: expectedLifetimeID) else { return }
+        #if DEBUG
+            MCPApplyEditsRebaseProbeRecorder.recordPublisherIngress(
+                rootID: root.id,
+                source: publication.source,
+                deltas: publication.deltas
+            )
+        #endif
         if publication.source == .overflowRootRescan || publication.source == .recoveryFullResync {
             await invalidateRetainedSearchContentForRecoveryUncertainty(rootID: root.id)
             guard isRootLifetimeCurrent(rootID: root.id, expectedLifetimeID: expectedLifetimeID) else { return }
@@ -1624,6 +2026,22 @@ actor WorkspaceFileContextStore {
             generation: appliedIndexGenerationsByRootID[rootID] ?? 0,
             files: files(inRoot: rootID),
             folders: folders(inRoot: rootID)
+        )
+    }
+
+    struct ReadFileAutoSelectionCatalogValidationSnapshot: Equatable {
+        let visibleCatalogGeneration: UInt64
+        let rootScopeCatalogGeneration: UInt64
+        let rootScopeAvailability: WorkspaceLookupRootScopeAvailability
+    }
+
+    func readFileAutoSelectionCatalogValidationSnapshot(
+        rootScope: WorkspaceLookupRootScope
+    ) -> ReadFileAutoSelectionCatalogValidationSnapshot {
+        ReadFileAutoSelectionCatalogValidationSnapshot(
+            visibleCatalogGeneration: scopedSnapshotGeneration(scope: .visibleWorkspace),
+            rootScopeCatalogGeneration: scopedSnapshotGeneration(scope: rootScope),
+            rootScopeAvailability: rootScopeAvailability(rootScope)
         )
     }
 
@@ -2626,18 +3044,31 @@ actor WorkspaceFileContextStore {
         await awaitAppliedIngress(rootIDs: rootsForPathLookup(scope: rootScope).map(\.id))
     }
 
+    func awaitAppliedIngress(rootRefs: [WorkspaceRootRef]) async -> [WorkspaceIngressBarrierSample] {
+        await awaitAppliedIngress(rootIDs: rootRefs.map(\.id))
+    }
+
     func contentSearchFreshnessPolicy(
         rootScope: WorkspaceLookupRootScope,
         appliedIngressSamples: [WorkspaceIngressBarrierSample]
     ) async -> FileContentFreshnessPolicy {
-        let scopedRoots = rootsForPathLookup(scope: rootScope)
-        guard !scopedRoots.isEmpty,
-              appliedIngressSamples.count == scopedRoots.count
+        await contentSearchFreshnessPolicy(
+            rootRefs: rootRefs(scope: rootScope),
+            appliedIngressSamples: appliedIngressSamples
+        )
+    }
+
+    func contentSearchFreshnessPolicy(
+        rootRefs: [WorkspaceRootRef],
+        appliedIngressSamples: [WorkspaceIngressBarrierSample]
+    ) async -> FileContentFreshnessPolicy {
+        guard !rootRefs.isEmpty,
+              appliedIngressSamples.count == rootRefs.count
         else {
             return .validateDiskMetadata
         }
         let samplesByRootID = Dictionary(uniqueKeysWithValues: appliedIngressSamples.map { ($0.rootID, $0) })
-        for root in scopedRoots {
+        for root in rootRefs {
             guard let state = rootStatesByID[root.id],
                   let sample = samplesByRootID[root.id],
                   await state.service.canUseCachedSearchContent(
@@ -3221,6 +3652,33 @@ actor WorkspaceFileContextStore {
         #else
             let APIs = allCodemapSnapshots().compactMap(\.fileAPI)
         #endif
+        let aggregate = makeCodemapFileAPIAggregate(APIs)
+        #if DEBUG || EDIT_FLOW_PERF
+            EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.AutoSelect.AllCodemapFileAPIs.materialization, materialization)
+        #endif
+        cachedCodemapFileAPIAggregate = aggregate
+        return aggregate
+    }
+
+    func codemapFileAPIAggregate(rootScope: WorkspaceLookupRootScope) -> WorkspaceCodemapFileAPIAggregate {
+        if rootScope == .allLoaded {
+            return codemapFileAPIAggregate()
+        }
+        if let cached = cachedCodemapFileAPIAggregatesByScope[rootScope] {
+            return cached
+        }
+
+        let allowedRootIDs = Set(rootsForPathLookup(scope: rootScope).map(\.id))
+        let APIs = codemapSnapshotsByFileID.values
+            .filter { allowedRootIDs.contains($0.rootID) && isDiscoverableFileID($0.fileID) }
+            .sorted { $0.fullPath < $1.fullPath }
+            .compactMap(\.fileAPI)
+        let aggregate = makeCodemapFileAPIAggregate(APIs)
+        cachedCodemapFileAPIAggregatesByScope[rootScope] = aggregate
+        return aggregate
+    }
+
+    private func makeCodemapFileAPIAggregate(_ APIs: [FileAPI]) -> WorkspaceCodemapFileAPIAggregate {
         var firstFileAPIByStandardizedNestedPath: [String: FileAPI] = [:]
         firstFileAPIByStandardizedNestedPath.reserveCapacity(APIs.count)
         for api in APIs {
@@ -3229,19 +3687,24 @@ actor WorkspaceFileContextStore {
                 firstFileAPIByStandardizedNestedPath[standardizedNestedPath] = api
             }
         }
-        let aggregate = WorkspaceCodemapFileAPIAggregate(
+        return WorkspaceCodemapFileAPIAggregate(
             orderedFileAPIs: APIs,
             firstFileAPIByStandardizedNestedPath: firstFileAPIByStandardizedNestedPath
         )
-        #if DEBUG || EDIT_FLOW_PERF
-            EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.AutoSelect.AllCodemapFileAPIs.materialization, materialization)
-        #endif
-        cachedCodemapFileAPIAggregate = aggregate
-        return aggregate
+    }
+
+    func codemapSnapshotBundle(
+        rootScope: WorkspaceLookupRootScope = .allLoaded
+    ) -> WorkspaceCodemapSnapshotBundle {
+        let allowedRootIDs = Set(rootsForPathLookup(scope: rootScope).map(\.id))
+        let snapshots = codemapSnapshotsByFileID.values.filter {
+            allowedRootIDs.contains($0.rootID) && isDiscoverableFileID($0.fileID)
+        }
+        return WorkspaceCodemapSnapshotBundle(snapshots: Array(snapshots))
     }
 
     func codemapSnapshotDictionary() -> [UUID: WorkspaceCodemapSnapshot] {
-        codemapSnapshotsByFileID.filter { isDiscoverableFileID($0.key) }
+        codemapSnapshotBundle().snapshotsByFileID
     }
 
     func codemapSnapshots(inRoot rootID: UUID) -> [WorkspaceCodemapSnapshot] {
@@ -3430,12 +3893,17 @@ actor WorkspaceFileContextStore {
     }
 
     func makeFileTreeSelectionSnapshot(_ request: WorkspaceFileTreeSnapshotRequest) -> FileTreeSelectionSnapshot {
-        makeFileTreeSelectionSnapshot(request, selectedStoreFileIDs: request.selectedFileIDs)
+        makeFileTreeSelectionSnapshot(
+            request,
+            selectedStoreFileIDs: request.selectedFileIDs,
+            codemapSnapshotBundle: codemapSnapshotBundle(rootScope: request.rootScope)
+        )
     }
 
     func makeFileTreeSelectionSnapshot(
         selection: StoredSelection,
         request: WorkspaceFileTreeSnapshotRequest,
+        codemapSnapshotBundle frozenCodemaps: WorkspaceCodemapSnapshotBundle? = nil,
         profile: PathLocateProfile = .uiAssisted
     ) async -> FileTreeSelectionSnapshot {
         var selectedStoreFileIDs = Set<UUID>()
@@ -3456,7 +3924,13 @@ actor WorkspaceFileContextStore {
             else { continue }
             selectedStoreFileIDs.insert(file.id)
         }
-        return await makeFileTreeSelectionSnapshot(request, selectedStoreFileIDs: selectedStoreFileIDs, profile: profile)
+        let codemapSnapshotBundle = frozenCodemaps ?? codemapSnapshotBundle(rootScope: request.rootScope)
+        return await makeFileTreeSelectionSnapshot(
+            request,
+            selectedStoreFileIDs: selectedStoreFileIDs,
+            codemapSnapshotBundle: codemapSnapshotBundle,
+            profile: profile
+        )
     }
 
     private func lookupSelectionPath(
@@ -3531,11 +4005,13 @@ actor WorkspaceFileContextStore {
 
     private func makeFileTreeSelectionSnapshot(
         _ request: WorkspaceFileTreeSnapshotRequest,
-        selectedStoreFileIDs: Set<UUID>
+        selectedStoreFileIDs: Set<UUID>,
+        codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle
     ) -> FileTreeSelectionSnapshot {
         makeFileTreeSelectionSnapshot(
             request,
             selectedStoreFileIDs: selectedStoreFileIDs,
+            codemapSnapshotBundle: codemapSnapshotBundle,
             startFolder: nil
         )
     }
@@ -3543,19 +4019,31 @@ actor WorkspaceFileContextStore {
     private func makeFileTreeSelectionSnapshot(
         _ request: WorkspaceFileTreeSnapshotRequest,
         selectedStoreFileIDs: Set<UUID>,
+        codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle,
         profile: PathLocateProfile
     ) async -> FileTreeSelectionSnapshot {
         let trimmedStartPath = request.startPath?.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let trimmedStartPath, !trimmedStartPath.isEmpty else {
-            return makeFileTreeSelectionSnapshot(request, selectedStoreFileIDs: selectedStoreFileIDs, startFolder: nil)
+            return makeFileTreeSelectionSnapshot(
+                request,
+                selectedStoreFileIDs: selectedStoreFileIDs,
+                codemapSnapshotBundle: codemapSnapshotBundle,
+                startFolder: nil
+            )
         }
         let startFolder = await (lookupSelectionPath(trimmedStartPath, profile: profile, rootScope: request.rootScope))?.folder
-        return makeFileTreeSelectionSnapshot(request, selectedStoreFileIDs: selectedStoreFileIDs, startFolder: startFolder)
+        return makeFileTreeSelectionSnapshot(
+            request,
+            selectedStoreFileIDs: selectedStoreFileIDs,
+            codemapSnapshotBundle: codemapSnapshotBundle,
+            startFolder: startFolder
+        )
     }
 
     private func makeFileTreeSelectionSnapshot(
         _ request: WorkspaceFileTreeSnapshotRequest,
         selectedStoreFileIDs: Set<UUID>,
+        codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle,
         startFolder: WorkspaceFolderRecord?
     ) -> FileTreeSelectionSnapshot {
         let selectedFileIDs = selectedStoreFileIDs
@@ -3574,6 +4062,7 @@ actor WorkspaceFileContextStore {
                 rootStandardizedPath: root.standardizedFullPath,
                 state: state,
                 visited: &visited,
+                codemapSnapshotBundle: codemapSnapshotBundle,
                 explicitlyIncludedManagedOnlyFileIDs: explicitlyIncludedManagedOnlyFileIDs,
                 explicitlyIncludedManagedOnlyFolderIDs: explicitlyIncludedManagedOnlyFolderIDs
             ).map { [$0] } ?? []
@@ -3591,6 +4080,7 @@ actor WorkspaceFileContextStore {
                     rootStandardizedPath: root.standardizedFullPath,
                     state: state,
                     visited: &visited,
+                    codemapSnapshotBundle: codemapSnapshotBundle,
                     explicitlyIncludedManagedOnlyFileIDs: explicitlyIncludedManagedOnlyFileIDs,
                     explicitlyIncludedManagedOnlyFolderIDs: explicitlyIncludedManagedOnlyFolderIDs
                 )
@@ -3625,6 +4115,7 @@ actor WorkspaceFileContextStore {
 
     func cancelAllCodemapScans() async {
         await codeScanActor.cancelAllScans()
+        pendingCodemapRepairFileIDs.removeAll()
     }
 
     func cancelCodemapScansForCheckoutMutation(rootIDs: [UUID]) async {
@@ -4030,7 +4521,20 @@ actor WorkspaceFileContextStore {
         guard !orderedRootIDs.isEmpty else { return }
 
         var statesToUnload: [(rootID: UUID, state: RootState)] = []
+        var ownershipRootsReleasedByUnload: [WorkspaceSessionWorktreeOwnedRoot] = []
         for rootID in orderedRootIDs {
+            explicitWatcherDemandRootIDs.remove(rootID)
+            if let state = rootStatesByID[rootID] {
+                let lifetimeKey = SessionWorktreeRootLifetimeKey(rootID: rootID, lifetimeID: state.lifetimeID)
+                let ownershipTokens = sessionWorktreeOwnershipTokensByRootLifetime[lifetimeKey] ?? []
+                for token in ownershipTokens {
+                    latestSessionWorktreeOwnershipGenerationByOwnerID[token.ownerID, default: 0] &+= 1
+                    if installedSessionWorktreeOwnershipTokenByOwnerID[token.ownerID] == token {
+                        installedSessionWorktreeOwnershipTokenByOwnerID.removeValue(forKey: token.ownerID)
+                    }
+                    ownershipRootsReleasedByUnload.append(contentsOf: removeSessionWorktreeOwnershipToken(token))
+                }
+            }
             if let flightState = scopedIngressBarrierFlightStatesByRootID.removeValue(forKey: rootID) {
                 flightState.active?.task?.cancel()
                 flightState.active?.join.complete(with: nil)
@@ -4052,6 +4556,7 @@ actor WorkspaceFileContextStore {
             for fileID in entry.state.fileIDsByRelativePath.values {
                 searchContentInvalidationEpochsByFileID.removeValue(forKey: fileID)
             }
+            removeSliceRebaseSources(rootID: entry.rootID, rootLifetimeID: entry.state.lifetimeID)
             await searchDecodedContentCache.invalidate(rootID: entry.rootID)
             await interactiveReadCache.invalidate(rootID: entry.rootID)
         }
@@ -4081,6 +4586,8 @@ actor WorkspaceFileContextStore {
         #endif
 
         let removedRootIDSet = Set(statesToUnload.map(\.rootID))
+        let removedFileIDs = statesToUnload.flatMap(\.state.fileIDsByRelativePath.values)
+        pendingCodemapRepairFileIDs.subtract(removedFileIDs)
         initializingSessionWorktreeCodemapRootIDs.subtract(removedRootIDSet)
         initializedSessionWorktreeCodemapRootIDs.subtract(removedRootIDSet)
         rootLoadOrder.removeAll { removedRootIDSet.contains($0) }
@@ -4168,6 +4675,7 @@ actor WorkspaceFileContextStore {
                 rootID: rootID,
                 rootPath: state.root.standardizedFullPath,
                 generation: generation,
+                rootLifetimeID: state.lifetimeID,
                 removedFileIDs: Array(discoverableFileIDsByPath.values),
                 removedFolderIDs: Array(discoverableFolderIDsByPath.values),
                 removedFilePaths: Array(discoverableFileIDsByPath.keys).sorted(),
@@ -4215,6 +4723,12 @@ actor WorkspaceFileContextStore {
             )
         #endif
         finishRootUnload(for: unloadingPaths)
+        let removedLifetimeKeys = Set(statesToUnload.map {
+            SessionWorktreeRootLifetimeKey(rootID: $0.rootID, lifetimeID: $0.state.lifetimeID)
+        })
+        await cleanupOrphanedSessionWorktreeRoots(ownershipRootsReleasedByUnload.filter {
+            !removedLifetimeKeys.contains(SessionWorktreeRootLifetimeKey(rootID: $0.rootID, lifetimeID: $0.lifetimeID))
+        })
         #if DEBUG
             WorkspaceRestorePerfLog.event(
                 "store.rootUnload.end",
@@ -4301,6 +4815,43 @@ actor WorkspaceFileContextStore {
         return foldersByID[folderID]
     }
 
+    func cachedSearchContentSnapshot(
+        for expectedRecord: WorkspaceFileRecord
+    ) async -> FileSearchContentSnapshot {
+        guard let current = file(
+            rootID: expectedRecord.rootID,
+            relativePath: expectedRecord.standardizedRelativePath
+        ), current.id == expectedRecord.id else {
+            return staleSearchContentSnapshot(for: expectedRecord)
+        }
+        let epoch = searchContentInvalidationEpochsByFileID[current.id] ?? 0
+        let cacheKey = WorkspaceSearchContentCacheKey(
+            rootID: current.rootID,
+            fileID: current.id,
+            standardizedRelativePath: current.standardizedRelativePath
+        )
+        guard let cached = await searchDecodedContentCache.cachedSnapshot(
+            for: cacheKey,
+            invalidationEpoch: epoch
+        ), searchContentRecordIsCurrent(current, invalidationEpoch: epoch) else {
+            return staleSearchContentSnapshot(for: current)
+        }
+        if let state = rootStatesByID[current.rootID] {
+            retainSliceRebaseSource(
+                content: cached.content,
+                modificationDate: cached.modificationDate,
+                file: current,
+                rootLifetimeID: state.lifetimeID
+            )
+        }
+        return FileSearchContentSnapshot(
+            content: cached.content,
+            contentRevision: cached.revision,
+            modificationDate: cached.modificationDate,
+            isFresh: true
+        )
+    }
+
     func searchContentSnapshot(
         for expectedRecord: WorkspaceFileRecord,
         freshnessPolicy: FileContentFreshnessPolicy = .validateDiskMetadata
@@ -4331,6 +4882,12 @@ actor WorkspaceFileContextStore {
                     if attempt == 0 { continue }
                     return staleSearchContentSnapshot(for: current)
                 }
+                retainSliceRebaseSource(
+                    content: cached.content,
+                    modificationDate: cached.modificationDate,
+                    file: current,
+                    rootLifetimeID: state.lifetimeID
+                )
                 return FileSearchContentSnapshot(
                     content: cached.content,
                     contentRevision: cached.revision,
@@ -4379,6 +4936,12 @@ actor WorkspaceFileContextStore {
                     if attempt == 0 { continue }
                     return staleSearchContentSnapshot(for: current)
                 }
+                retainSliceRebaseSource(
+                    content: cached.content,
+                    modificationDate: cached.modificationDate,
+                    file: current,
+                    rootLifetimeID: state.lifetimeID
+                )
                 return FileSearchContentSnapshot(
                     content: cached.content,
                     contentRevision: cached.revision,
@@ -4468,6 +5031,12 @@ actor WorkspaceFileContextStore {
                     if attempt == 0 { continue }
                     return nil
                 }
+                retainSliceRebaseSource(
+                    content: preparedContent.linesWithEndings.joined(),
+                    modificationDate: fingerprint.modificationDate,
+                    file: current,
+                    rootLifetimeID: state.lifetimeID
+                )
                 return WorkspaceInteractiveReadSnapshot(
                     preparedContent: preparedContent,
                     cacheHit: cached.cacheHit
@@ -4492,6 +5061,21 @@ actor WorkspaceFileContextStore {
     func clearSearchDecodedContentCache() async {
         await searchDecodedContentCache.clear()
         await interactiveReadCache.clear()
+        clearSliceRebaseSources()
+    }
+
+    func readContentPrefix(
+        rootID: UUID,
+        relativePath: String,
+        maximumBytes: Int,
+        workloadClass: ContentReadWorkloadClass = .unspecified
+    ) async throws -> FileContentPrefix? {
+        let state = try state(for: rootID)
+        return try await state.service.loadContentPrefix(
+            ofRelativePath: StandardizedPath.relative(relativePath),
+            maximumBytes: maximumBytes,
+            workloadClass: workloadClass
+        )
     }
 
     func readContent(
@@ -4550,6 +5134,21 @@ actor WorkspaceFileContextStore {
             )
             throw error
         }
+    }
+
+    func readValidatedContentSnapshot(
+        rootID: UUID,
+        relativePath: String,
+        workloadClass: ContentReadWorkloadClass = .unspecified
+    ) async throws -> ValidatedFileContentSnapshot {
+        let state = try state(for: rootID)
+        let standardizedRelativePath = StandardizedPath.relative(relativePath)
+        let fingerprint = try await state.service.contentFingerprint(ofRelativePath: standardizedRelativePath)
+        return try await state.service.loadValidatedContent(
+            ofRelativePath: standardizedRelativePath,
+            expectedFingerprint: fingerprint,
+            workloadClass: workloadClass
+        )
     }
 
     func readContentWithDate(
@@ -4681,6 +5280,83 @@ actor WorkspaceFileContextStore {
             }
         }
         return pendingRootIDs
+    }
+
+    func enqueueMissingCodemapSnapshotRepairs(
+        for files: [WorkspaceFileRecord]
+    ) -> WorkspaceCodemapRepairResult {
+        let snapshots = codemapSnapshotDictionary()
+        var missingFiles: [WorkspaceFileRecord] = []
+        var seenFileIDs = Set<UUID>()
+
+        for file in files {
+            guard seenFileIDs.insert(file.id).inserted,
+                  isDiscoverableFileID(file.id),
+                  filesByID[file.id] != nil,
+                  snapshots[file.id] == nil
+            else { continue }
+            missingFiles.append(file)
+        }
+
+        var newlyQueuedFiles: [WorkspaceFileRecord] = []
+        for file in missingFiles where pendingCodemapRepairFileIDs.insert(file.id).inserted {
+            newlyQueuedFiles.append(file)
+        }
+
+        if !newlyQueuedFiles.isEmpty {
+            Task.detached(priority: .utility) { [store = self, newlyQueuedFiles] in
+                await store.performEnqueuedCodemapSnapshotRepairs(for: newlyQueuedFiles)
+            }
+        }
+
+        return WorkspaceCodemapRepairResult(
+            snapshotsByFileID: snapshots,
+            pendingFileIDs: Set(missingFiles.map(\.id))
+        )
+    }
+
+    private func performEnqueuedCodemapSnapshotRepairs(
+        for files: [WorkspaceFileRecord]
+    ) async {
+        await ensureCodeScanResultTask()
+        let currentFiles = files.filter { file in
+            pendingCodemapRepairFileIDs.contains(file.id)
+                && isDiscoverableFileID(file.id)
+                && filesByID[file.id] != nil
+                && codemapSnapshotsByFileID[file.id] == nil
+        }
+        let currentFileIDs = Set(currentFiles.map(\.id))
+        guard !currentFiles.isEmpty else {
+            pendingCodemapRepairFileIDs.subtract(files.map(\.id))
+            return
+        }
+
+        do {
+            let loadedRequests = try await codemapScanRequests(for: currentFiles)
+            let stillMissingFileIDs = currentFileIDs.filter { codemapSnapshotsByFileID[$0] == nil }
+            let requests = loadedRequests.filter { stillMissingFileIDs.contains($0.fileID) }
+            guard !requests.isEmpty else {
+                pendingCodemapRepairFileIDs.subtract(currentFileIDs)
+                return
+            }
+            let rootFolderPaths = Array(Set(requests.map(\.rootFolderPath)))
+            let requestResult = await codeScanActor.requestSelfHealingScans(
+                requests,
+                rootFolderPaths: rootFolderPaths,
+                existingScanModificationDatesByFileID: Dictionary(
+                    uniqueKeysWithValues: currentFiles.compactMap { file in
+                        file.modificationDate.map { (file.id, $0) }
+                    }
+                )
+            )
+            let scheduledFileIDs = requestResult.submittedFileIDs.union(requestResult.alreadyScheduledFileIDs)
+            pendingCodemapRepairFileIDs.subtract(currentFileIDs.subtracting(scheduledFileIDs))
+            pendingCodemapRepairFileIDs.subtract(
+                scheduledFileIDs.filter { codemapSnapshotsByFileID[$0] != nil }
+            )
+        } catch {
+            pendingCodemapRepairFileIDs.subtract(currentFileIDs)
+        }
     }
 
     func repairMissingCodemapSnapshots(
@@ -4940,22 +5616,81 @@ actor WorkspaceFileContextStore {
     @discardableResult
     func editFile(rootID: UUID, relativePath: String, newContent: String) async throws -> WorkspaceFileCatalogMaterializationResult? {
         let state = try state(for: rootID)
+        let expectedLifetimeID = state.lifetimeID
         let standardizedRelativePath = StandardizedPath.relative(relativePath)
+        let deferredPublicationToken: FileSystemDeferredEditPublicationToken
         do {
-            try await state.service.editFile(atRelativePath: standardizedRelativePath, newContent: newContent)
+            guard let token = try await state.service.editFile(
+                atRelativePath: standardizedRelativePath,
+                newContent: newContent,
+                modificationPublicationPolicy: .deferSyntheticModificationToSuccessfulCaller
+            ) else {
+                throw WorkspaceFileContextStoreError.catalogMaterializationFailed(
+                    "store-owned edit completed without a deferred modification publication token"
+                )
+            }
+            deferredPublicationToken = token
         } catch FileSystemError.fileNotFound {
             pruneCatalogFileMissingOnDisk(rootID: rootID, relativePath: standardizedRelativePath, publishDelta: true)
             throw FileSystemError.fileNotFound
         }
-        if let file = file(rootID: rootID, relativePath: standardizedRelativePath) {
-            invalidateSearchContent(file)
-            invalidateCodemapSnapshot(rootID: rootID, relativePath: standardizedRelativePath)
-            if isDiscoverableFileID(file.id) {
-                publishAppliedIndexEvent(root: state.root, modifiedFileIDs: [file.id])
+
+        do {
+            #if DEBUG
+                if let storeEditDeferredPublicationDidRegisterHandler {
+                    await storeEditDeferredPublicationDidRegisterHandler(rootID, standardizedRelativePath)
+                }
+            #endif
+            try Task.checkCancellation()
+            guard isRootLifetimeCurrent(rootID: rootID, expectedLifetimeID: expectedLifetimeID) else {
+                throw WorkspaceFileContextStoreError.rootNotLoaded(rootID)
             }
-            return .materialized(file)
+
+            let result: WorkspaceFileCatalogMaterializationResult?
+            let publishedCanonicalModification: Bool
+            if let file = file(rootID: rootID, relativePath: standardizedRelativePath) {
+                invalidateSearchContent(file)
+                invalidateCodemapSnapshot(rootID: rootID, relativePath: standardizedRelativePath)
+                publishedCanonicalModification = isDiscoverableFileID(file.id)
+                if publishedCanonicalModification {
+                    publishAppliedIndexEvent(root: state.root, modifiedFileIDs: [file.id])
+                    #if DEBUG
+                        MCPApplyEditsRebaseProbeRecorder.recordStoreModification(
+                            rootID: rootID,
+                            fileID: file.id,
+                            generation: appliedIndexGenerationsByRootID[rootID] ?? 0
+                        )
+                    #endif
+                }
+                result = .materialized(file)
+            } else {
+                let materialization = try await materializeCatalogFileAfterDiskWrite(
+                    rootID: rootID,
+                    relativePath: standardizedRelativePath
+                )
+                result = materialization
+                switch materialization {
+                case let .materialized(file):
+                    publishedCanonicalModification = isDiscoverableFileID(file.id)
+                case .ineligible:
+                    publishedCanonicalModification = false
+                }
+            }
+
+            await state.service.resolveDeferredEditPublication(
+                deferredPublicationToken,
+                resolution: publishedCanonicalModification
+                    ? .callerPublishedCanonicalModification
+                    : .publishSyntheticFallback
+            )
+            return result
+        } catch {
+            await state.service.resolveDeferredEditPublication(
+                deferredPublicationToken,
+                resolution: .publishSyntheticFallback
+            )
+            throw error
         }
-        return try await materializeCatalogFileAfterDiskWrite(rootID: rootID, relativePath: standardizedRelativePath)
     }
 
     func moveFile(rootID: UUID, from oldRelativePath: String, to newRelativePath: String) async throws {
@@ -5742,7 +6477,19 @@ actor WorkspaceFileContextStore {
     }
 
     func lookupPath(_ request: WorkspacePathLookupRequest) async -> WorkspacePathLookupResult? {
-        await lookupPath(request, rootRefs: rootRefs(scope: request.rootScope))
+        let normalizedPath = normalizeUserInputPath(request.userPath)
+        guard !normalizedPath.isEmpty else { return nil }
+
+        let selectedFileFullPaths = request.selectedFileFullPaths
+        let staticData = buildStaticSnapshot(scope: request.rootScope)
+        guard let match = await pathMatchWorker.locate(
+            userPath: normalizedPath,
+            profile: request.profile,
+            staticData: staticData,
+            selectedFileFullPaths: selectedFileFullPaths,
+            selectionSig: selectionSignature(for: selectedFileFullPaths)
+        ) else { return nil }
+        return lookupResult(input: request.userPath, match: match)
     }
 
     func lookupPath(
@@ -5847,6 +6594,13 @@ actor WorkspaceFileContextStore {
             return lookupResult(input: relativePath, root: state.root, correctedPath: folder.standardizedRelativePath)
         }
         return nil
+    }
+
+    func lookupDiscoverablePath(rootID: UUID, relativePath: String) -> WorkspacePathLookupResult? {
+        guard let result = lookupPath(rootID: rootID, relativePath: relativePath),
+              isDiscoverableLookupResult(result)
+        else { return nil }
+        return result
     }
 
     func lookupDiscoverableCatalogPathForExactAbsoluteSearchScope(
@@ -6157,12 +6911,35 @@ actor WorkspaceFileContextStore {
     }
 
     private func buildStaticSnapshot(scope: WorkspaceLookupRootScope) -> StaticPathMatchData {
-        buildStaticSnapshot(scope: scope, rootRefs: rootRefs(scope: scope))
+        let cacheIdentity = pathMatchCacheIdentity(scope: scope)
+        if var cached = staticPathMatchSnapshotsByScope[scope],
+           cached.snapshot.cacheIdentity == cacheIdentity
+        {
+            cached.lastAccessSequence = nextStaticPathMatchSnapshotAccessSequenceValue()
+            staticPathMatchSnapshotsByScope[scope] = cached
+            return cached.snapshot
+        }
+        let snapshot = buildStaticSnapshot(
+            rootRefs: rootRefs(scope: scope),
+            cacheIdentity: cacheIdentity
+        )
+        cacheStaticPathMatchSnapshot(snapshot, scope: scope)
+        return snapshot
     }
 
     private func buildStaticSnapshot(
         scope: WorkspaceLookupRootScope,
         rootRefs roots: [WorkspaceRootRef]
+    ) -> StaticPathMatchData {
+        buildStaticSnapshot(
+            rootRefs: roots,
+            cacheIdentity: pathMatchCacheIdentity(scope: scope, rootRefs: roots)
+        )
+    }
+
+    private func buildStaticSnapshot(
+        rootRefs roots: [WorkspaceRootRef],
+        cacheIdentity: PathMatchCacheIdentity
     ) -> StaticPathMatchData {
         let snapshotState = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.pathLookupStaticSnapshotBuild)
         defer { EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.pathLookupStaticSnapshotBuild, snapshotState) }
@@ -6208,8 +6985,6 @@ actor WorkspaceFileContextStore {
                 displayName: folder.name
             ) as FolderRecord
         }
-        let cacheIdentity = pathMatchCacheIdentity(scope: scope)
-        pathMatchSnapshotIdentitiesByScope[scope] = cacheIdentity
         return StaticPathMatchData(
             filesByFullPath: fileRecords,
             foldersByFullPath: folderRecords,
@@ -6219,12 +6994,69 @@ actor WorkspaceFileContextStore {
         )
     }
 
+    private func cacheStaticPathMatchSnapshot(
+        _ snapshot: StaticPathMatchData,
+        scope: WorkspaceLookupRootScope
+    ) {
+        if staticPathMatchSnapshotsByScope[scope] == nil,
+           staticPathMatchSnapshotsByScope.count >= Self.maxCachedStaticPathMatchSnapshotScopes,
+           let eviction = staticPathMatchSnapshotsByScope.min(by: {
+               $0.value.lastAccessSequence < $1.value.lastAccessSequence
+           })
+        {
+            staticPathMatchSnapshotsByScope.removeValue(forKey: eviction.key)
+            if pathMatchSnapshotIdentitiesByScope[eviction.key] == eviction.value.snapshot.cacheIdentity {
+                pathMatchSnapshotIdentitiesByScope.removeValue(forKey: eviction.key)
+            }
+            invalidatePathMatchCache(snapshotIdentities: [eviction.value.snapshot.cacheIdentity])
+        }
+        pathMatchSnapshotIdentitiesByScope[scope] = snapshot.cacheIdentity
+        staticPathMatchSnapshotsByScope[scope] = StaticPathMatchSnapshotCacheEntry(
+            snapshot: snapshot,
+            lastAccessSequence: nextStaticPathMatchSnapshotAccessSequenceValue()
+        )
+    }
+
+    private func nextStaticPathMatchSnapshotAccessSequenceValue() -> UInt64 {
+        nextStaticPathMatchSnapshotAccessSequence &+= 1
+        return nextStaticPathMatchSnapshotAccessSequence
+    }
+
     private func pathMatchCacheIdentity(scope: WorkspaceLookupRootScope) -> PathMatchCacheIdentity {
         PathMatchCacheIdentity(
             scopeID: scopeDiscriminator(scope),
             snapshotID: scopedSnapshotGeneration(scope: scope)
         )
     }
+
+    private func pathMatchCacheIdentity(
+        scope: WorkspaceLookupRootScope,
+        rootRefs roots: [WorkspaceRootRef]
+    ) -> PathMatchCacheIdentity {
+        var hasher = Hasher()
+        hasher.combine("explicitRootRefs")
+        hasher.combine(scopeDiscriminator(scope))
+        for root in roots {
+            hasher.combine(root.id)
+            hasher.combine(root.standardizedFullPath)
+            hasher.combine(rootStatesByID[root.id]?.lifetimeID)
+            hasher.combine(catalogGenerationsByRootID[root.id] ?? 0)
+        }
+        return PathMatchCacheIdentity(
+            scopeID: scopeDiscriminator(scope),
+            snapshotID: UInt64(bitPattern: Int64(hasher.finalize()))
+        )
+    }
+
+    #if DEBUG
+        func staticPathMatchSnapshotCacheCountForTesting() -> Int {
+            staticPathMatchSnapshotsByScope.count
+        }
+
+        func sessionCatalogGenerationForTesting(scope: WorkspaceLookupRootScope) -> UInt64? {
+            sessionCatalogGenerationStatesByScope[scope]?.generation
+        }
+    #endif
 
     private func scopedSnapshotGeneration(scope: WorkspaceLookupRootScope) -> UInt64 {
         let validationToken = searchCatalogSnapshotValidationToken(scope: scope)
@@ -6468,6 +7300,133 @@ actor WorkspaceFileContextStore {
         )
     }
 
+    private func retainSliceRebaseSource(
+        content: String?,
+        modificationDate: Date,
+        file: WorkspaceFileRecord,
+        rootLifetimeID: UUID
+    ) {
+        guard let content else { return }
+        let byteCost = content.utf8.count
+        guard byteCost <= Self.maxSliceRebaseSourceEntryBytes,
+              let state = rootStatesByID[file.rootID],
+              state.lifetimeID == rootLifetimeID,
+              self.file(rootID: file.rootID, relativePath: file.standardizedRelativePath)?.id == file.id
+        else { return }
+        let key = SliceRebaseSourceCacheKey(
+            rootID: file.rootID,
+            rootLifetimeID: rootLifetimeID,
+            fileID: file.id,
+            relativePath: file.standardizedRelativePath
+        )
+        if let previous = sliceRebaseSourceEntries.removeValue(forKey: key) {
+            sliceRebaseSourceEstimatedBytes -= previous.byteCost
+        }
+        sliceRebaseSourceAccessOrdinal &+= 1
+        let snapshot = WorkspaceSliceRebaseSourceSnapshot(
+            rootID: file.rootID,
+            rootLifetimeID: rootLifetimeID,
+            fileID: file.id,
+            relativePath: file.standardizedRelativePath,
+            fullPath: file.standardizedFullPath,
+            text: content,
+            modificationTime: modificationDate.timeIntervalSince1970
+        )
+        sliceRebaseSourceEntries[key] = SliceRebaseSourceCacheEntry(
+            snapshot: snapshot,
+            byteCost: byteCost,
+            accessOrdinal: sliceRebaseSourceAccessOrdinal
+        )
+        sliceRebaseSourceEstimatedBytes += byteCost
+        trimSliceRebaseSourcesIfNeeded()
+    }
+
+    private func takeSliceRebaseSource(
+        rootID: UUID,
+        rootLifetimeID: UUID,
+        file: WorkspaceFileRecord
+    ) -> WorkspaceSliceRebaseSourceSnapshot? {
+        let key = SliceRebaseSourceCacheKey(
+            rootID: rootID,
+            rootLifetimeID: rootLifetimeID,
+            fileID: file.id,
+            relativePath: file.standardizedRelativePath
+        )
+        guard let entry = sliceRebaseSourceEntries.removeValue(forKey: key) else { return nil }
+        sliceRebaseSourceEstimatedBytes -= entry.byteCost
+        guard entry.snapshot.fullPath == file.standardizedFullPath else { return nil }
+        if let recordTime = file.modificationDate?.timeIntervalSince1970,
+           abs(recordTime - entry.snapshot.modificationTime) > 0.001
+        {
+            return nil
+        }
+        return entry.snapshot
+    }
+
+    private func trimSliceRebaseSourcesIfNeeded() {
+        while sliceRebaseSourceEntries.count > Self.maxSliceRebaseSourceEntryCount
+            || sliceRebaseSourceEstimatedBytes > Self.maxSliceRebaseSourceTotalBytes
+        {
+            guard let oldest = sliceRebaseSourceEntries.min(by: { $0.value.accessOrdinal < $1.value.accessOrdinal }) else {
+                break
+            }
+            sliceRebaseSourceEstimatedBytes -= oldest.value.byteCost
+            sliceRebaseSourceEntries.removeValue(forKey: oldest.key)
+        }
+    }
+
+    private func clearSliceRebaseSources() {
+        sliceRebaseSourceEntries.removeAll(keepingCapacity: true)
+        sliceRebaseSourceEstimatedBytes = 0
+    }
+
+    private func removeSliceRebaseSources(
+        rootID: UUID,
+        rootLifetimeID: UUID? = nil,
+        fileID: UUID? = nil
+    ) {
+        let keys = sliceRebaseSourceEntries.keys.filter { key in
+            guard key.rootID == rootID else { return false }
+            if let rootLifetimeID, key.rootLifetimeID != rootLifetimeID { return false }
+            if let fileID, key.fileID != fileID { return false }
+            return true
+        }
+        for key in keys {
+            if let removed = sliceRebaseSourceEntries.removeValue(forKey: key) {
+                sliceRebaseSourceEstimatedBytes -= removed.byteCost
+            }
+        }
+    }
+
+    func sliceRebasePathState(fullPath rawFullPath: String) -> WorkspaceSliceRebasePathState? {
+        let fullPath = StandardizedPath.absolute(rawFullPath)
+        guard let root = rootStatesByID.values
+            .map(\.root)
+            .filter({ fullPath == $0.standardizedFullPath || fullPath.hasPrefix($0.standardizedFullPath + "/") })
+            .max(by: { $0.standardizedFullPath.count < $1.standardizedFullPath.count }),
+            let state = rootStatesByID[root.id]
+        else { return nil }
+        return WorkspaceSliceRebasePathState(
+            rootID: root.id,
+            rootLifetimeID: state.lifetimeID,
+            rootKind: root.kind,
+            appliedIndexGeneration: appliedIndexGenerationsByRootID[root.id] ?? 0
+        )
+    }
+
+    func sliceRebaseFileIsCurrent(
+        rootID: UUID,
+        rootLifetimeID: UUID,
+        fileID: UUID,
+        relativePath: String,
+        fullPath: String
+    ) -> Bool {
+        guard let state = rootStatesByID[rootID], state.lifetimeID == rootLifetimeID,
+              let current = file(rootID: rootID, relativePath: relativePath)
+        else { return false }
+        return current.id == fileID && current.standardizedFullPath == StandardizedPath.absolute(fullPath)
+    }
+
     private func invalidateSearchContent(_ file: WorkspaceFileRecord) {
         let key = WorkspaceSearchContentCacheKey(
             rootID: file.rootID,
@@ -6575,6 +7534,9 @@ actor WorkspaceFileContextStore {
         })
         pathMatchSnapshotIdentitiesByScope = pathMatchSnapshotIdentitiesByScope.filter { scope, identity in
             identity == pathMatchCacheIdentity(scope: scope)
+        }
+        staticPathMatchSnapshotsByScope = staticPathMatchSnapshotsByScope.filter { scope, entry in
+            entry.snapshot.cacheIdentity == pathMatchCacheIdentity(scope: scope)
         }
         invalidatePathMatchCache(snapshotIdentities: stalePathMatchIdentities)
     }
@@ -6684,11 +7646,34 @@ actor WorkspaceFileContextStore {
         let modifiedFileIDs = modifiedFileIDs.filter(isDiscoverableFileID)
         let modifiedFolderIDs = modifiedFolderIDs.filter(isDiscoverableFolderID)
         guard requiresFullResync || !upsertedFiles.isEmpty || !upsertedFolders.isEmpty || !removedFileIDs.isEmpty || !removedFolderIDs.isEmpty || !removedFilePaths.isEmpty || !removedFolderPaths.isEmpty || !modifiedFileIDs.isEmpty || !modifiedFolderIDs.isEmpty else { return }
+        let rootLifetimeID = rootStatesByID[root.id]?.lifetimeID
+        let modifiedFileSourceSnapshotsByID: [UUID: WorkspaceSliceRebaseSourceSnapshot] = Dictionary(
+            uniqueKeysWithValues: modifiedFileIDs.compactMap { fileID -> (UUID, WorkspaceSliceRebaseSourceSnapshot)? in
+                guard let rootLifetimeID,
+                      let file = filesByID[fileID],
+                      let snapshot = takeSliceRebaseSource(
+                          rootID: root.id,
+                          rootLifetimeID: rootLifetimeID,
+                          file: file
+                      )
+                else { return nil }
+                return (fileID, snapshot)
+            }
+        )
         let generation = nextAppliedIndexGeneration(forRootID: root.id)
+        #if DEBUG
+            MCPApplyEditsRebaseProbeRecorder.recordAppliedIndexModification(
+                rootID: root.id,
+                fileIDs: modifiedFileIDs,
+                generation: generation
+            )
+        #endif
         yieldAppliedIndexEvent(WorkspaceAppliedIndexBatchEvent(
             rootID: root.id,
             rootPath: root.standardizedFullPath,
             generation: generation,
+            rootLifetimeID: rootLifetimeID,
+            modifiedFileSourceSnapshotsByID: modifiedFileSourceSnapshotsByID,
             upsertedFiles: upsertedFiles.sorted { $0.standardizedRelativePath < $1.standardizedRelativePath },
             upsertedFolders: upsertedFolders.sorted { $0.standardizedRelativePath < $1.standardizedRelativePath },
             removedFileIDs: removedFileIDs,
@@ -6730,10 +7715,12 @@ actor WorkspaceFileContextStore {
         guard let fileID = state.fileIDsByRelativePath.removeValue(forKey: key),
               let file = filesByID.removeValue(forKey: fileID)
         else { return nil }
+        removeSliceRebaseSources(rootID: file.rootID, fileID: fileID)
         invalidateSearchContent(file)
         searchContentInvalidationEpochsByFileID.removeValue(forKey: fileID)
         fileIDsByStandardizedFullPath.removeValue(forKey: file.standardizedFullPath)
         managedOnlyFileIDs.remove(fileID)
+        pendingCodemapRepairFileIDs.remove(fileID)
         if codemapSnapshotsByFileID.removeValue(forKey: fileID) != nil {
             invalidateAllCodemapFileAPIsCache()
         }
@@ -6800,6 +7787,7 @@ actor WorkspaceFileContextStore {
 
     private func invalidateAllCodemapFileAPIsCache() {
         cachedCodemapFileAPIAggregate = nil
+        cachedCodemapFileAPIAggregatesByScope.removeAll(keepingCapacity: true)
     }
 
     private func isDiscoverableFileID(_ fileID: UUID) -> Bool {
@@ -6850,7 +7838,8 @@ actor WorkspaceFileContextStore {
         }
     }
 
-    private func applyCodeScanResults(_ results: [CodeScanActor.ScanResult]) {
+    private func applyCodeScanResults(_ results: [CodeScanActor.ScanResult]) async {
+        pendingCodemapRepairFileIDs.subtract(results.map(\.fileID))
         var snapshotsByRootID: [UUID: [WorkspaceCodemapSnapshot]] = [:]
         for result in results {
             guard isDiscoverableFileID(result.fileID),
@@ -6884,6 +7873,7 @@ actor WorkspaceFileContextStore {
                 snapshots: snapshots.sorted { $0.relativePath < $1.relativePath }
             ))
         }
+        await codeScanActor.acknowledgeScanResults(fileIDs: results.map(\.fileID))
     }
 
     private func removeAllCodemapSnapshots() {
@@ -6958,6 +7948,7 @@ actor WorkspaceFileContextStore {
         rootStandardizedPath: String,
         state: RootState,
         visited: inout Set<UUID>,
+        codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle,
         explicitlyIncludedManagedOnlyFileIDs: Set<UUID> = [],
         explicitlyIncludedManagedOnlyFolderIDs: Set<UUID> = []
     ) -> FileTreeFolderSnapshot? {
@@ -6980,6 +7971,7 @@ actor WorkspaceFileContextStore {
                 rootStandardizedPath: rootStandardizedPath,
                 state: state,
                 visited: &visited,
+                codemapSnapshotBundle: codemapSnapshotBundle,
                 explicitlyIncludedManagedOnlyFileIDs: explicitlyIncludedManagedOnlyFileIDs,
                 explicitlyIncludedManagedOnlyFolderIDs: explicitlyIncludedManagedOnlyFolderIDs
             ) {
@@ -6991,7 +7983,7 @@ actor WorkspaceFileContextStore {
                 id: file.id,
                 name: file.name,
                 fileExtension: (file.name as NSString).pathExtension.isEmpty ? nil : (file.name as NSString).pathExtension,
-                hasCodeMap: codemapSnapshotsByFileID[file.id]?.fullPath == file.standardizedFullPath && codemapSnapshotsByFileID[file.id]?.fileAPI != nil
+                hasCodeMap: codemapSnapshotBundle.hasRenderableCodemap(for: file)
             )))
         }
 

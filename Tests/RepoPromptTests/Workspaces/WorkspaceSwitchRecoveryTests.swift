@@ -587,6 +587,232 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         XCTAssertEqual(roots.map(\.standardizedFullPath), [rootB.standardizedFileURL.path])
     }
 
+    func testSwitchingFromAThroughDefaultAndBBackToAPreservesHydratedSelection() async throws {
+        let root = try makeTemporaryDirectory(named: "SelectionReplaySwitchRoot")
+        let storage = try makeTemporaryDirectory(named: "SelectionReplaySwitchStorage")
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: storage)
+        }
+        let fixture = try makeSelectionFixture(root: root, workspaceName: "Selection Replay A", storageDirectory: storage)
+        try writeWorkspace(fixture.workspace, to: storage.appendingPathComponent("workspace.json"))
+
+        let composition = makeComposition()
+        let manager = composition.workspaceManager
+        await manager.awaitInitialized()
+        manager.workspaces.append(fixture.workspace)
+
+        let initialResult = await manager.switchWorkspace(to: fixture.workspace, saveState: false)
+        XCTAssertTrue(initialResult.didSwitch)
+        assertSelectionFixture(fixture, composition: composition)
+
+        let defaultWorkspace = try XCTUnwrap(manager.workspaces.first(where: { $0.isSystemWorkspace || $0.name == "Default" }))
+        let defaultResult = await manager.switchWorkspace(to: defaultWorkspace, saveState: false)
+        XCTAssertTrue(defaultResult.didSwitch)
+        let returnFromDefaultResult = await manager.switchWorkspace(to: fixture.workspace, saveState: false)
+        XCTAssertTrue(returnFromDefaultResult.didSwitch)
+        assertSelectionFixture(fixture, composition: composition)
+
+        let workspaceB = manager.createWorkspace(
+            name: "Selection Replay B \(UUID().uuidString.prefix(8))",
+            repoPaths: [],
+            ephemeral: true
+        )
+        let workspaceBResult = await manager.switchWorkspace(to: workspaceB, saveState: false)
+        XCTAssertTrue(workspaceBResult.didSwitch)
+        let returnFromBResult = await manager.switchWorkspace(to: fixture.workspace, saveState: false)
+        XCTAssertTrue(returnFromBResult.didSwitch)
+        assertSelectionFixture(fixture, composition: composition)
+
+        try await Task.sleep(nanoseconds: 250_000_000)
+        await manager.pollAndSaveStateAsync()
+        let workspaceURL = manager.workspaceFileURL(for: fixture.workspace)
+        let saved = try WorkspaceManagerViewModel.loadWorkspaceFromFile(at: workspaceURL)
+        let savedTab = try XCTUnwrap(saved.composeTabs.first(where: { $0.id == fixture.tabID }))
+        XCTAssertFalse(savedTab.selection.selectedPaths.isEmpty)
+        XCTAssertEqual(savedTab.selection, fixture.selection)
+    }
+
+    func testInitialDiskBackedActivationAndReopenPreserveHydratedSelection() async throws {
+        let root = try makeTemporaryDirectory(named: "InitialSelectionReplayRoot")
+        let storageRoot = try makeTemporaryDirectory(named: "InitialSelectionReplayStorage")
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: storageRoot)
+        }
+        let fixture = try makeSelectionFixture(root: root, workspaceName: "Default")
+        try writeIndexedWorkspace(fixture.workspace, baseRoot: storageRoot)
+
+        for _ in 0 ..< 2 {
+            let composition = makeComposition(storageRoot: storageRoot)
+            let manager = composition.workspaceManager
+            await manager.awaitInitialized()
+
+            XCTAssertEqual(manager.activeWorkspaceID, fixture.workspace.id)
+            assertSelectionFixture(fixture, composition: composition)
+
+            try await Task.sleep(nanoseconds: 250_000_000)
+            await manager.pollAndSaveStateAsync()
+            let workspaceURL = manager.workspaceFileURL(for: fixture.workspace)
+            let saved = try WorkspaceManagerViewModel.loadWorkspaceFromFile(at: workspaceURL)
+            let savedTab = try XCTUnwrap(saved.composeTabs.first(where: { $0.id == fixture.tabID }))
+            XCTAssertFalse(savedTab.selection.selectedPaths.isEmpty)
+            XCTAssertEqual(savedTab.selection, fixture.selection)
+        }
+    }
+
+    func testRestoreActivationPreservesAgentCanonicalSelectionFromBlankTransientUI() async throws {
+        let root = try makeTemporaryDirectory(named: "AgentSelectionRestoreRoot")
+        let storage = try makeTemporaryDirectory(named: "AgentSelectionRestoreStorage")
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: storage)
+        }
+
+        let versionFile = root.appendingPathComponent("version.env")
+        let bootstrapLease = root.appendingPathComponent(
+            "Sources/RepoPrompt/Infrastructure/MCP/MCPBootstrapLease.swift"
+        )
+        try FileManager.default.createDirectory(
+            at: bootstrapLease.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try "VERSION=1\n".write(to: versionFile, atomically: true, encoding: .utf8)
+        try "struct MCPBootstrapLease {}\n".write(
+            to: bootstrapLease,
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let tabID = UUID()
+        let selection = StoredSelection(
+            selectedPaths: [versionFile.path, bootstrapLease.path],
+            codemapAutoEnabled: false
+        )
+        let tab = ComposeTabState(
+            id: tabID,
+            name: "Persisted Agent",
+            activeAgentSessionID: UUID(),
+            selection: selection
+        )
+        let workspace = WorkspaceModel(
+            name: "Agent Selection Restore",
+            repoPaths: [root.path],
+            customStoragePath: storage,
+            composeTabs: [tab],
+            activeComposeTabID: tabID
+        )
+        try writeWorkspace(workspace, to: storage.appendingPathComponent("workspace.json"))
+
+        let composition = makeComposition()
+        let manager = composition.workspaceManager
+        await manager.awaitInitialized()
+        manager.workspaces.append(workspace)
+
+        var injectedBlankSnapshot = false
+        manager.setWorkspaceSwitchPhaseDidChangeHandlerForTesting { phase in
+            guard phase == .hydratingRoots, !injectedBlankSnapshot else { return }
+            injectedBlankSnapshot = true
+            XCTAssertTrue(composition.workspaceFilesViewModel.snapshotSelection().selectedPaths.isEmpty)
+            manager.publishActiveComposeTabSnapshot(commitToMemory: true)
+        }
+        let result = await manager.switchWorkspace(
+            to: workspace,
+            saveState: false,
+            reason: "agentSelectionRestoreRace"
+        )
+        manager.setWorkspaceSwitchPhaseDidChangeHandlerForTesting(nil)
+
+        XCTAssertEqual(result, .switched)
+        XCTAssertTrue(injectedBlankSnapshot)
+        XCTAssertEqual(manager.composeTab(with: tabID)?.selection, selection)
+        XCTAssertEqual(
+            Set(composition.workspaceFilesViewModel.snapshotSelection().selectedPaths),
+            Set(selection.selectedPaths)
+        )
+        let routingSnapshot = try XCTUnwrap(
+            manager.resolveComposeTabRoutingSnapshot(
+                for: tabID,
+                captureActiveUIState: false
+            )
+        )
+        XCTAssertFalse(routingSnapshot.usesLiveUIState)
+        XCTAssertEqual(
+            Set(routingSnapshot.snapshot.selection.selectedPaths),
+            Set(selection.selectedPaths)
+        )
+
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(
+            try Set(XCTUnwrap(manager.composeTab(with: tabID)).selection.selectedPaths),
+            Set(selection.selectedPaths)
+        )
+
+        manager.markWorkspaceDirty()
+        await manager.pollAndSaveStateAsync()
+        let saved = try WorkspaceManagerViewModel.loadWorkspaceFromFile(
+            at: manager.workspaceFileURL(for: workspace)
+        )
+        XCTAssertEqual(
+            try Set(XCTUnwrap(saved.composeTabs.first(where: { $0.id == tabID })).selection.selectedPaths),
+            Set(selection.selectedPaths)
+        )
+    }
+
+    func testPostHydrationReplayPreservesNewerCanonicalSelection() async throws {
+        let root = try makeTemporaryDirectory(named: "NewerCanonicalSelectionRoot")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let originalFile = root.appendingPathComponent("Original.swift")
+        let newerFile = root.appendingPathComponent("Newer.swift")
+        try "let original = true\n".write(to: originalFile, atomically: true, encoding: .utf8)
+        try "let newer = true\n".write(to: newerFile, atomically: true, encoding: .utf8)
+
+        let tabID = UUID()
+        let originalSelection = StoredSelection(
+            selectedPaths: [originalFile.path],
+            codemapAutoEnabled: false
+        )
+        let newerSelection = StoredSelection(
+            selectedPaths: [newerFile.path],
+            codemapAutoEnabled: false
+        )
+        let workspace = WorkspaceModel(
+            name: "Newer Canonical Selection",
+            repoPaths: [root.path],
+            ephemeralFlag: true,
+            composeTabs: [ComposeTabState(id: tabID, selection: originalSelection)],
+            activeComposeTabID: tabID
+        )
+
+        let composition = makeComposition()
+        let manager = composition.workspaceManager
+        await manager.awaitInitialized()
+        manager.workspaces.append(workspace)
+
+        var updatedCanonicalSelection = false
+        manager.setWorkspaceSwitchPhaseDidChangeHandlerForTesting { phase in
+            guard phase == .hydratingRoots, !updatedCanonicalSelection else { return }
+            updatedCanonicalSelection = true
+            guard var updatedTab = manager.composeTab(with: tabID) else {
+                return XCTFail("Expected active compose tab during hydration")
+            }
+            updatedTab.selection = newerSelection
+            XCTAssertTrue(manager.updateComposeTabStoredOnly(updatedTab, inWorkspaceID: workspace.id))
+        }
+        let result = await manager.switchWorkspace(
+            to: workspace,
+            saveState: false,
+            reason: "newerCanonicalSelectionDuringHydration"
+        )
+        manager.setWorkspaceSwitchPhaseDidChangeHandlerForTesting(nil)
+
+        XCTAssertEqual(result, .switched)
+        XCTAssertTrue(updatedCanonicalSelection)
+        XCTAssertEqual(manager.composeTab(with: tabID)?.selection, newerSelection)
+        XCTAssertEqual(composition.workspaceFilesViewModel.snapshotSelection(), newerSelection)
+    }
+
     func testWatcherActivationFailureDegradesWorkspaceReadiness() async throws {
         let root = try makeTemporaryDirectory(named: "WatcherActivationFailure")
         defer { try? FileManager.default.removeItem(at: root) }
@@ -717,17 +943,101 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
 
     private func makeComposition(
         store: WorkspaceFileContextStore = WorkspaceFileContextStore(),
-        timingPolicy: WorkspaceSwitchTimingPolicy = .production
+        timingPolicy: WorkspaceSwitchTimingPolicy = .production,
+        storageRoot: URL? = nil
     ) -> WindowStateComposition {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        let defaults = UserDefaults.standard
+        let previousStoragePath = defaults.string(forKey: "GlobalCustomStorageURL")
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
-        defer { GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false) }
+        if let storageRoot {
+            defaults.set(storageRoot.path, forKey: "GlobalCustomStorageURL")
+        }
+        defer {
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            if let previousStoragePath {
+                defaults.set(previousStoragePath, forKey: "GlobalCustomStorageURL")
+            } else {
+                defaults.removeObject(forKey: "GlobalCustomStorageURL")
+            }
+        }
         return WindowStateCompositionFactory.make(
             windowID: -900 - Int.random(in: 1 ... 99),
             deferredInitialAgentSystemWorkspaceRefresh: true,
             sharedMCPService: MCPService(),
             workspaceFileContextStore: store,
             workspaceSwitchTimingPolicy: timingPolicy
+        )
+    }
+
+    private struct SelectionFixture {
+        let workspace: WorkspaceModel
+        let tabID: UUID
+        let selection: StoredSelection
+    }
+
+    private func makeSelectionFixture(
+        root: URL,
+        workspaceName: String,
+        storageDirectory: URL? = nil
+    ) throws -> SelectionFixture {
+        let sources = root.appendingPathComponent("Sources", isDirectory: true)
+        try FileManager.default.createDirectory(at: sources, withIntermediateDirectories: true)
+        let selected = sources.appendingPathComponent("Selected.swift")
+        let dependency = sources.appendingPathComponent("Dependency.swift")
+        try "one\ntwo\nthree\n".write(to: selected, atomically: true, encoding: .utf8)
+        try "struct Dependency {}\n".write(to: dependency, atomically: true, encoding: .utf8)
+
+        let selection = StoredSelection(
+            selectedPaths: [selected.path],
+            autoCodemapPaths: [dependency.path],
+            codemapAutoEnabled: false
+        )
+        let tab = ComposeTabState(selection: selection)
+        let workspace = WorkspaceModel(
+            name: workspaceName,
+            repoPaths: [root.path],
+            customStoragePath: storageDirectory,
+            composeTabs: [tab],
+            activeComposeTabID: tab.id
+        )
+        return SelectionFixture(
+            workspace: workspace,
+            tabID: tab.id,
+            selection: selection
+        )
+    }
+
+    private func assertSelectionFixture(
+        _ fixture: SelectionFixture,
+        composition: WindowStateComposition,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let actual = composition.workspaceFilesViewModel.snapshotSelection()
+        XCTAssertEqual(actual.selectedPaths, fixture.selection.selectedPaths, file: file, line: line)
+        XCTAssertEqual(actual.autoCodemapPaths, fixture.selection.autoCodemapPaths, file: file, line: line)
+        XCTAssertEqual(actual.codemapAutoEnabled, fixture.selection.codemapAutoEnabled, file: file, line: line)
+    }
+
+    private func writeWorkspace(_ workspace: WorkspaceModel, to url: URL) throws {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try JSONEncoder().encode(workspace).write(to: url, options: .atomic)
+    }
+
+    private func writeIndexedWorkspace(_ workspace: WorkspaceModel, baseRoot: URL) throws {
+        let workspaceDirectory = baseRoot.appendingPathComponent("Workspace-\(workspace.name)-\(workspace.id.uuidString)")
+        try writeWorkspace(workspace, to: workspaceDirectory.appendingPathComponent("workspace.json"))
+        let entry = WorkspaceIndexEntry(
+            id: workspace.id,
+            name: workspace.name,
+            customStoragePath: workspace.customStoragePath,
+            isSystemWorkspace: workspace.isSystemWorkspace,
+            isHiddenInMenus: workspace.isHiddenInMenus
+        )
+        try JSONEncoder().encode([entry]).write(
+            to: baseRoot.appendingPathComponent("workspacesIndex.json"),
+            options: .atomic
         )
     }
 

@@ -42,6 +42,9 @@ extension AgentModeViewModel {
         var rawToolResultPayloadRenderRevision: Int = 0
         var onSourceItemsChanged: ((TabSession, SourceItemsMutation) -> Void)?
         var onRunStateChanged: ((TabSession) -> Void)?
+        #if DEBUG
+            private(set) var test_incrementalRetentionCompactionCount = 0
+        #endif
 
         /// Run state
         @Published var runState: AgentSessionRunState = .idle {
@@ -102,6 +105,7 @@ extension AgentModeViewModel {
 
         var isPreparingInitialWorktree: Bool = false
         var isChangingExecutionLocation: Bool = false
+        var worktreeBindingTransitionInProgress: Bool = false
 
         // Wait/question state
         @Published var waitingPrompt: String? = nil
@@ -1299,6 +1303,39 @@ extension AgentModeViewModel {
             derivedTranscriptRefreshGeneration &+= 1
             derivedTranscriptRefreshTask?.cancel()
             derivedTranscriptRefreshTask = nil
+        }
+
+        @discardableResult
+        func replaceItemSilentlyForRetentionCompaction(
+            at index: Int,
+            with compactedItem: AgentChatItem,
+            retainedRawPayload: String
+        ) -> Bool {
+            guard items.indices.contains(index) else { return false }
+            let previousItem = items[index]
+            guard previousItem.id == compactedItem.id,
+                  previousItem != compactedItem,
+                  ephemeralToolResultPayloadByItemID[previousItem.id] == retainedRawPayload
+            else {
+                return false
+            }
+
+            suppressSourceItemsChanged = true
+            items[index] = compactedItem
+            suppressSourceItemsChanged = false
+            nextSequenceIndex = max(nextSequenceIndex, compactedItem.sequenceIndex + 1)
+            updateToolCorrelationIndexes(
+                previousItem: previousItem,
+                updatedItem: compactedItem,
+                at: index
+            )
+            sourceItemsRevision &+= 1
+            derivedTranscriptSyncState = nil
+            #if DEBUG
+                test_incrementalRetentionCompactionCount += 1
+            #endif
+            assertSourceItemDerivedStateIsConsistent()
+            return true
         }
 
         /// Compact any summary-only tool-result items in place and align

@@ -1051,8 +1051,11 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             codexModelsSubscriptionTask != nil
         }
 
-        func test_stopCodexModelsSubscription() {
-            stopCodexModelsSubscription()
+        func test_cancelAndDrainCodexModelsSubscription() async {
+            let task = codexModelsSubscriptionTask
+            task?.cancel()
+            codexModelsSubscriptionTask = nil
+            await task?.value
         }
     #endif
 
@@ -2585,6 +2588,11 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
         let finalizedConnections = await ContextBuilderChildConnectionFinalizer.finalize(
             connectionIDs: agentConnections,
+            awaitResponseDeliveryDrain: { cid in
+                await ServerNetworkManager.shared.waitUntilResponseDeliveryDrained(
+                    for: cid
+                )
+            },
             commitContext: { [weak self, weak record] cid in
                 guard let self, let record,
                       activeAgentRuns.contains(runID),
@@ -3572,6 +3580,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         prompt: String,
         selection: StoredSelection,
         lookupContext: WorkspaceLookupContext? = nil,
+        agentModeSessionID: UUID? = nil,
+        agentModeRunID: UUID? = nil,
         chatName: String,
         model: AIModel,
         chatPresetID: UUID?,
@@ -3630,7 +3640,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 named: chatName,
                 tabID: tabID,
                 activateInUI: shouldActivate,
-                setActiveForTab: true
+                setActiveForTab: true,
+                agentModeSessionID: agentModeSessionID,
+                agentModeRunID: agentModeRunID
             )
             createdSessionID = createdSession.id
             session.followUpOracleSessionID = createdSession.id
@@ -3754,6 +3766,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     func runMCPPlanOrQuestion(
         for tabID: UUID,
         oracleViewModel: OracleViewModel,
+        agentModeSessionID: UUID? = nil,
+        agentModeRunID: UUID? = nil,
         mode: HeadlessMode,
         prompt: String,
         selection: StoredSelection,
@@ -3802,6 +3816,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             prompt: prompt,
             selection: selection,
             lookupContext: lookupContext,
+            agentModeSessionID: agentModeSessionID,
+            agentModeRunID: agentModeRunID,
             chatName: chatNameForTab(tabID),
             model: modelSelection.model,
             chatPresetID: modelSelection.chatPresetID,

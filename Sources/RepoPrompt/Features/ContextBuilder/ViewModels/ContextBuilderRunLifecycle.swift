@@ -37,6 +37,7 @@ enum ContextBuilderRunWaiterResolution {
 /// Termination completion is joined before connection/run mappings are removed.
 @MainActor
 enum ContextBuilderChildConnectionFinalizer {
+    typealias AwaitResponseDeliveryDrain = @MainActor (_ connectionID: UUID) async -> Bool
     typealias RequestTermination = @MainActor (_ connectionID: UUID) -> Task<Void, Never>
     typealias CommitContext = @MainActor (_ connectionID: UUID) async -> Bool
     typealias BeforeTerminationRequest = @MainActor () async -> Void
@@ -45,6 +46,7 @@ enum ContextBuilderChildConnectionFinalizer {
 
     static func finalize(
         connectionIDs: [UUID],
+        awaitResponseDeliveryDrain: AwaitResponseDeliveryDrain,
         commitContext: CommitContext,
         beforeTerminationRequest: BeforeTerminationRequest,
         requestTermination: RequestTermination,
@@ -52,6 +54,7 @@ enum ContextBuilderChildConnectionFinalizer {
         cleanupMapping: CleanupMapping
     ) async -> Bool {
         for connectionID in connectionIDs {
+            guard await awaitResponseDeliveryDrain(connectionID) else { return false }
             guard await commitContext(connectionID) else { return false }
         }
 

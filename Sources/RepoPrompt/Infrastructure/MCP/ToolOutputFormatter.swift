@@ -175,11 +175,14 @@ enum ToolOutputFormatter {
         var lines: [String] = []
         let isBackpressure = dto.errorCode == "search_backpressure" && dto.retryable == true
         let isWorktreeUnavailable = dto.errorCode == "worktree_scope_unavailable" && dto.retryable == true
-        lines.append((isBackpressure || isWorktreeUnavailable) ? "## Search Results ⚠️" : "## Search Results ❌")
+        let isFreshnessTimeout = dto.errorCode == "workspace_freshness_timeout" && dto.retryable == true
+        lines.append((isBackpressure || isWorktreeUnavailable || isFreshnessTimeout) ? "## Search Results ⚠️" : "## Search Results ❌")
         if isBackpressure {
             lines.append("- **Status**: Temporarily busy")
         } else if isWorktreeUnavailable {
             lines.append("- **Status**: Worktree unavailable")
+        } else if isFreshnessTimeout {
+            lines.append("- **Status**: Workspace freshness timed out")
         }
         lines.append("- **Error**: \(error)")
         if let errorCode = dto.errorCode, !errorCode.isEmpty {
@@ -2270,6 +2273,9 @@ extension ToolOutputFormatter {
                     out.append("- Git: \(formatTokenCount(git))")
                 }
             }
+            if let accounting = ctx.tokenAccounting {
+                out.append("- Token accounting: \(accounting.status) from \(accounting.source)\(accounting.refreshPending ? "; refresh pending" : "")")
+            }
             if let sel = ctx.selection {
                 if let summary = sel.summary {
                     let totalCount = summary.fullCount + summary.sliceCount + summary.codemapCount
@@ -2713,6 +2719,10 @@ extension ToolOutputFormatter {
             if let total = dto.totalTokens {
                 out.append("- Total tokens: \(total) (Auto view)")
             }
+        }
+
+        if let accounting = dto.tokenAccounting {
+            out.append("- Token accounting: \(accounting.status) from \(accounting.source)\(accounting.refreshPending ? "; refresh pending" : "")")
         }
 
         // Copy preset effect (only if it differs from auto)

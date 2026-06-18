@@ -3644,8 +3644,11 @@ public class APISettingsViewModel: ObservableObject {
             contextBuilderProviderValidationTask != nil
         }
 
-        func test_stopCodexModelsSubscription() {
-            stopCodexModelsSubscription()
+        func test_cancelAndDrainCodexModelsSubscription() async {
+            let task = codexModelsTask
+            task?.cancel()
+            codexModelsTask = nil
+            await task?.value
         }
     #endif
 
