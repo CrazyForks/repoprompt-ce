@@ -693,7 +693,6 @@ enum SettingsTab: String, CaseIterable {
                 "deep link",
                 "deep links",
                 "repoprompt-ce://",
-                "repoprompt://",
                 "open links",
                 "prompt",
                 "instructions",

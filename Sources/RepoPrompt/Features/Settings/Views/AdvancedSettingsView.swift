@@ -311,7 +311,7 @@ struct AdvancedSettingsView: View {
                     )
                 }
 
-                Text("Supported opener parameters: workspace, files, prompt, focus, ephemeral, and persist. Use \(canonicalURLPrefix) for external links; \(AppDeepLinkURLScheme.legacy):// may be handled by classic RepoPrompt when both apps are installed.")
+                Text("Supported opener parameters: workspace, files, prompt, focus, ephemeral, and persist. Use \(canonicalURLPrefix) for external links.")
                     .font(.caption)
                     .foregroundColor(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
