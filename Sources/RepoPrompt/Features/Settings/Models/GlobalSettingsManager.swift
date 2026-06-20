@@ -453,6 +453,16 @@ class GlobalSettingsStore: ObservableObject {
         }
     }
 
+    func showDatesInMessageTimestamps() -> Bool {
+        scalarPreferences.ui?.showDatesInMessageTimestamps ?? false
+    }
+
+    func setShowDatesInMessageTimestamps(_ enabled: Bool, commit: Bool = true) {
+        updateUIScalar(commit: commit) { settings in
+            settings.showDatesInMessageTimestamps = enabled
+        }
+    }
+
     func experimentalAttributedTextEditor() -> Bool {
         scalarPreferences.ui?.experimentalAttributedTextEditor ?? false
     }
@@ -1316,17 +1326,29 @@ class GlobalSettingsStore: ObservableObject {
 
     // MARK: - Global Context Builder Agent Selection (Single Source of Truth)
 
-    /// Returns the global Context Builder agent and model selection.
-    /// This is the single source of truth for Context Builder agent/model across all workspaces.
-    /// - Returns: Tuple of (agentRaw, modelRaw) where modelRaw is the model for the selected agent
-    func globalContextBuilderAgentSelection() -> (agentRaw: String?, modelRaw: String?) {
-        let agentRaw = globalDefaults.discoverAgentRaw
-        let storedModelRaw: String? = if let agent = agentRaw {
-            globalDefaults.discoverModelsByAgent?[agent]
-        } else {
-            nil
+    /// Returns the raw persisted global Context Builder selection without synthesizing a fallback.
+    /// Startup restoration needs to distinguish a real saved value from the catalog's historical
+    /// Claude Code / Opus default so it can validate availability and use recommendations instead.
+    func persistedGlobalContextBuilderAgentSelection() -> (agentRaw: String?, modelRaw: String?) {
+        guard let agentRaw = globalDefaults.discoverAgentRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !agentRaw.isEmpty
+        else {
+            return (nil, nil)
         }
-        let normalized = AgentModelCatalog.normalizeSelection(agentRaw: agentRaw, modelRaw: storedModelRaw)
+        let modelRaw = globalDefaults.discoverModelsByAgent?[agentRaw]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return (agentRaw, modelRaw?.isEmpty == false ? modelRaw : nil)
+    }
+
+    /// Returns a normalized global Context Builder agent and model selection.
+    /// Callers performing startup restoration should use
+    /// `persistedGlobalContextBuilderAgentSelection()` and validate against current availability.
+    func globalContextBuilderAgentSelection() -> (agentRaw: String?, modelRaw: String?) {
+        let persisted = persistedGlobalContextBuilderAgentSelection()
+        let normalized = AgentModelCatalog.normalizeSelection(
+            agentRaw: persisted.agentRaw,
+            modelRaw: persisted.modelRaw
+        )
         return (normalized.agent.rawValue, normalized.modelRaw)
     }
 

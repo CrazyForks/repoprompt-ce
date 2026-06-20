@@ -11,21 +11,23 @@ struct OracleExportDestination: Equatable {
     let workspaceID: UUID
     let windowID: Int
     let tabID: UUID?
+    /// Logical/canonical primary root returned to the bound child.
     let primaryRootPath: String
-    let rootScope: WorkspaceLookupRootScope
+    /// Frozen logical-to-physical scope used for disk I/O and read-back verification.
+    let lookupContext: WorkspaceLookupContext
 
     init(
         workspaceID: UUID,
         windowID: Int,
         tabID: UUID?,
         primaryRootPath: String,
-        rootScope: WorkspaceLookupRootScope = .visibleWorkspace
+        lookupContext: WorkspaceLookupContext = .visibleWorkspace
     ) {
         self.workspaceID = workspaceID
         self.windowID = windowID
         self.tabID = tabID
         self.primaryRootPath = primaryRootPath
-        self.rootScope = rootScope
+        self.lookupContext = lookupContext
     }
 }
 
@@ -1550,6 +1552,7 @@ struct AgentRunMCPToolService {
         }
         let session = object["session"]?.objectValue
         let agent = object["agent"]?.objectValue
+        let runID = object["run_id"]?.stringValue.flatMap(UUID.init(uuidString:))
         let interaction = object["interaction"]?.objectValue.flatMap(interaction(from:))
         let updatedAt = object["updated_at"]?.stringValue.flatMap(Self.timestampFormatter.date(from:)) ?? Date()
         let tabID = (session?["context_id"] ?? session?["tab_id"])?.stringValue.flatMap(UUID.init(uuidString:))
@@ -1559,6 +1562,7 @@ struct AgentRunMCPToolService {
         let activeWorktreeMerges = activeWorktreeMerges(from: object)
         return AgentRunMCPSnapshot(
             sessionID: sessionID,
+            runID: runID,
             tabID: tabID,
             sessionName: session?["name"]?.stringValue,
             agentRaw: agent?["id"]?.stringValue,

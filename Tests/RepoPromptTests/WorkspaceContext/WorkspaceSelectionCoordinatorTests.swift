@@ -351,6 +351,64 @@ final class WorkspaceSelectionCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.selectionForActiveUISnapshot(staleUI, tabID: harness.tabID), staleUI)
     }
 
+    func testDeferredMCPMirrorRefreshesFenceBeforeQueuedCatalogSnapshotPublishes() async {
+        let first = StoredSelection(
+            selectedPaths: ["/tmp/Full.swift"],
+            autoCodemapPaths: ["/tmp/DependencyA.swift", "/tmp/DependencyB.swift"],
+            codemapAutoEnabled: true
+        )
+        let latest = StoredSelection(
+            selectedPaths: ["/tmp/Full.swift", "/tmp/Sliced.swift"],
+            autoCodemapPaths: [
+                "/tmp/DependencyA.swift",
+                "/tmp/DependencyB.swift",
+                "/tmp/DependencyC.swift",
+                "/tmp/DependencyD.swift"
+            ],
+            slices: ["/tmp/Sliced.swift": [LineRange(start: 4, end: 7)]],
+            codemapAutoEnabled: true
+        )
+        let completeCatalog = StoredSelection(
+            selectedPaths: ["/tmp/Full.swift", "/tmp/Sliced.swift"],
+            autoCodemapPaths: (0 ..< 300).map { "/tmp/Catalog/\($0).swift" },
+            codemapAutoEnabled: true
+        )
+        let harness = CoordinatorHarness(initialSelection: StoredSelection())
+        let coordinator = WorkspaceSelectionCoordinator(workspaceManager: harness.manager, store: harness.store)
+        harness.manager.activeUISnapshotResolver = { selection, tabID in
+            coordinator.selectionForActiveUISnapshot(selection, tabID: tabID)
+        }
+        harness.manager.advanceLiveUISelectionRevisionDuringMirror = true
+
+        for expected in [first, latest] {
+            _ = await coordinator.persistActiveSelection(
+                expected,
+                source: .mcpTabContext,
+                mirrorToUI: false
+            )
+            harness.manager.pendingUISelection = completeCatalog
+
+            await coordinator.mirrorSelectionToActiveUI(expected, forTabID: harness.tabID)
+
+            // Model the already-enqueued selected-files debounce. This is not a read-file
+            // drain or manage_selection get; it is the ordinary UI publication that runs
+            // after the programmatic mirror has advanced the live selection revision.
+            harness.manager.publishActiveComposeTabSnapshot(
+                commitToMemory: true,
+                touchModified: false
+            )
+
+            XCTAssertEqual(harness.manager.composeTab(for: harness.identity)?.selection, expected)
+        }
+
+        XCTAssertEqual(harness.manager.mirroredSelection, latest)
+        XCTAssertEqual(harness.manager.publishedSelections, [first, latest])
+        XCTAssertTrue(harness.manager.publishedSelections.allSatisfy {
+            $0.selectedPaths.count + $0.autoCodemapPaths.count <= 6
+        })
+        XCTAssertFalse(harness.manager.publishedSelections.contains(completeCatalog))
+    }
+
     func testTwoSourceWindowsRejectDelayedOlderPropagationAfterNewerLocalMutation() async {
         let initial = StoredSelection(selectedPaths: ["/tmp/initial.swift"])
         let older = StoredSelection(selectedPaths: ["/tmp/older.swift"])
@@ -807,6 +865,8 @@ private final class FakeWorkspaceSelectionManager: WorkspaceSelectionHost {
     var pendingUISelection: StoredSelection?
     var activeUISnapshotResolver: ((StoredSelection, UUID) -> StoredSelection)?
     var presentationHandler: (() -> Void)?
+    var advanceLiveUISelectionRevisionDuringMirror = false
+    private(set) var publishedSelections: [StoredSelection] = []
     private(set) var publishSnapshotCallCount = 0
     private(set) var updateStoredOnlyCallCount = 0
     var firstMirrorGate: SelectionMirrorGate?
@@ -853,7 +913,9 @@ private final class FakeWorkspaceSelectionManager: WorkspaceSelectionHost {
               let activeID = workspace.activeComposeTabID,
               let index = workspace.composeTabs.firstIndex(where: { $0.id == activeID })
         else { return }
-        workspace.composeTabs[index].selection = activeUISnapshotResolver?(pendingUISelection, activeID) ?? pendingUISelection
+        let publishedSelection = activeUISnapshotResolver?(pendingUISelection, activeID) ?? pendingUISelection
+        workspace.composeTabs[index].selection = publishedSelection
+        publishedSelections.append(publishedSelection)
         if touchModified {
             workspace.composeTabs[index].lastModified = Date()
         }
@@ -877,6 +939,9 @@ private final class FakeWorkspaceSelectionManager: WorkspaceSelectionHost {
         }
         mirroredSelection = selection
         mirrorCompletedSelections.append(selection)
+        if advanceLiveUISelectionRevisionDuringMirror {
+            liveUISelectionRevision &+= 1
+        }
     }
 
     func appendTab(_ tab: ComposeTabState) {

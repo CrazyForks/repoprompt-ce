@@ -73,6 +73,13 @@ actor FileSystemService {
             requiresFullResync: requiresFullResync,
             deltas: deltas
         )
+        #if DEBUG
+            MCPApplyEditsRebaseProbeRecorder.recordServicePublication(
+                rootToken: diagnosticRootToken,
+                source: source,
+                deltas: deltas
+            )
+        #endif
         #if DEBUG || EDIT_FLOW_PERF
             let publicationCorrelation = EditFlowPerf.makeLifecycleCorrelationIfActive()
             EditFlowPerf.lifecycleEvent(
@@ -130,12 +137,17 @@ actor FileSystemService {
 
         /// Test-only hook invoked inside the real-filesystem off-actor content worker before each read.
         var contentReadChunkHandler: (@Sendable (String) async -> Void)?
+        var contentFingerprintRequestCountForTesting = 0
+        var cachedSearchContentWatcherActiveOverrideForTesting: Bool?
 
         /// Test-only hook invoked inside each real-filesystem parallel folder enumeration worker.
         var parallelFolderEnumerationHookForTesting: (@Sendable (String) async throws -> Void)?
 
         /// Test-only gate invoked from the detached mutation worker immediately before filesystem I/O.
         var mutationIOWillBeginHandler: (@Sendable (FileSystemUncancellableMutation) async -> Void)?
+
+        /// Test-only replacement for the real Finder Trash operation.
+        var moveItemToTrashIOForTesting: (@Sendable (URL) throws -> Void)?
 
         enum WatcherActivationFailurePoint {
             case streamCreation
@@ -148,6 +160,7 @@ actor FileSystemService {
 
     /// Request waiters are actor-owned and may be cancelled independently from detached filesystem I/O.
     var mutationWaiters: [UUID: FileSystemMutationWaiter] = [:]
+    var deferredEditPublicationsByMutationID: [UUID: FileSystemDeferredEditPublication] = [:]
 
     /// Tracks paths we know about, to detect additions/removals
     var visitedPaths = Set<String>()
@@ -352,8 +365,16 @@ actor FileSystemService {
             mutationIOWillBeginHandler = handler
         }
 
+        func setMoveItemToTrashIOForTesting(_ operation: (@Sendable (URL) throws -> Void)?) {
+            moveItemToTrashIOForTesting = operation
+        }
+
         func pendingMutationWaiterCountForTesting() -> Int {
             mutationWaiters.count
+        }
+
+        func pendingDeferredEditPublicationCountForTesting() -> Int {
+            deferredEditPublicationsByMutationID.count
         }
 
         /// Test-only initializer that allows injecting initial state

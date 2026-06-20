@@ -49,7 +49,20 @@ actor GitService {
 
     private let worktreeMutationCoordinator = GitWorktreeMutationCoordinator()
     private let inheritedProcessEnvironment = ProcessInfo.processInfo.environment
+    private let gitExecutableURL: URL
+    private let processAdmissionController: GitProcessAdmissionController
+    private let processTerminationGrace: Duration
     private var preparedBaseProcessEnvironment: [String: String]?
+
+    init(
+        gitExecutableURL: URL = URL(fileURLWithPath: "/usr/bin/git"),
+        processAdmissionController: GitProcessAdmissionController = .shared,
+        processTerminationGrace: Duration = GitService.gitProcessTerminationGrace
+    ) {
+        self.gitExecutableURL = gitExecutableURL
+        self.processAdmissionController = processAdmissionController
+        self.processTerminationGrace = processTerminationGrace
+    }
 
     struct UncommittedFile: Equatable {
         let path: String
@@ -2344,7 +2357,7 @@ actor GitService {
         let budgetURL = budgetRepoURL ?? repoURL
         let repositoryKey = getLayout(for: budgetURL)?.commonDir.standardizedFileURL.path
             ?? budgetURL.standardizedFileURL.path
-        let lease = try await GitProcessAdmissionController.shared.acquire(repositoryKey: repositoryKey)
+        let lease = try await processAdmissionController.acquire(repositoryKey: repositoryKey)
         do {
             try Task.checkCancellation()
             let result = try await runAdmittedGit(
@@ -2355,10 +2368,10 @@ actor GitService {
                 diagnosticRepositoryPath: budgetURL.standardizedFileURL.path,
                 processQueueWaitMicroseconds: lease.queueWaitMicroseconds
             )
-            await GitProcessAdmissionController.shared.release(lease)
+            await processAdmissionController.release(lease)
             return result
         } catch {
-            await GitProcessAdmissionController.shared.release(lease)
+            await processAdmissionController.release(lease)
             throw error
         }
     }
@@ -2373,8 +2386,9 @@ actor GitService {
     ) async throws -> (String, String, Int32) {
         let process = Process()
         let timeoutController = GitProcessTimeoutController()
+        let lifecycleController = GitProcessLifecycleController()
         let commandRecorder = MCPToolWorkCountDiagnostics.gitCommandRecorder()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.executableURL = gitExecutableURL
         process.arguments = args
         process.currentDirectoryURL = repoURL
         process.environment = environment
@@ -2397,8 +2411,12 @@ actor GitService {
         // Build async streams for stdout/stderr and single consumer tasks to collect data.
         // GitProcessPipeDrain serializes readability callbacks with termination/cancellation
         // so a final chunk cannot be read by a callback and then dropped after stream closure.
-        let (outStream, outDrain) = GitProcessPipeDrain.makeStream()
-        let (errStream, errDrain) = GitProcessPipeDrain.makeStream()
+        let (outStream, outDrain) = try GitProcessPipeDrain.makeStream(
+            readingFrom: outPipe.fileHandleForReading
+        )
+        let (errStream, errDrain) = try GitProcessPipeDrain.makeStream(
+            readingFrom: errPipe.fileHandleForReading
+        )
 
         let processMetrics = GitProcessMetricsBox()
         let outCollector = Task(priority: .userInitiated) { () -> Data in
@@ -2416,18 +2434,23 @@ actor GitService {
             return buf
         }
 
-        return try await withTaskCancellationHandler(operation: {
+        let result = try await withTaskCancellationHandler(operation: {
             try await withCheckedThrowingContinuation { continuation in
                 // Drain stdout
                 outPipe.fileHandleForReading.readabilityHandler = { handle in
-                    outDrain.consumeAvailableData(from: handle)
+                    if outDrain.consumeAvailableData() {
+                        handle.readabilityHandler = nil
+                    }
                 }
                 // Drain stderr
                 errPipe.fileHandleForReading.readabilityHandler = { handle in
-                    errDrain.consumeAvailableData(from: handle)
+                    if errDrain.consumeAvailableData() {
+                        handle.readabilityHandler = nil
+                    }
                 }
 
                 process.terminationHandler = { proc in
+                    lifecycleController.didTerminate()
                     timeoutController.cancel()
 
                     // Stop handlers to break strong reference cycles
@@ -2436,8 +2459,8 @@ actor GitService {
 
                     // Drain bytes that arrived between the last readability callback and
                     // process termination, then close each stream after any in-flight callback.
-                    outDrain.finishReading(from: outPipe.fileHandleForReading)
-                    errDrain.finishReading(from: errPipe.fileHandleForReading)
+                    outDrain.finishReading()
+                    errDrain.finishReading()
 
                     Task {
                         let stdoutData = await outCollector.value
@@ -2458,15 +2481,26 @@ actor GitService {
                 }
 
                 do {
+                    try lifecycleController.checkCancellationBeforeSpawn()
                     let spawnStart = DispatchTime.now().uptimeNanoseconds
                     try process.run()
                     let processIdentifier = process.processIdentifier
-                    timeoutController.schedule(
+                    let spawnState = lifecycleController.didSpawn(
                         process: process,
                         processIdentifier: processIdentifier,
-                        timeout: Self.gitProcessTimeout,
-                        terminationGrace: Self.gitProcessTerminationGrace
+                        terminationGrace: processTerminationGrace
                     )
+                    if spawnState == .running {
+                        timeoutController.schedule(
+                            process: process,
+                            processIdentifier: processIdentifier,
+                            timeout: Self.gitProcessTimeout,
+                            terminationGrace: processTerminationGrace
+                        )
+                        if !lifecycleController.shouldKeepNormalTimeout() {
+                            timeoutController.cancel()
+                        }
+                    }
                     let spawnEnd = DispatchTime.now().uptimeNanoseconds
                     processMetrics.spawnMicroseconds = Int(
                         clamping: spawnEnd >= spawnStart ? (spawnEnd - spawnStart) / 1000 : 0
@@ -2507,21 +2541,21 @@ actor GitService {
                     errPipe.fileHandleForReading.readabilityHandler = nil
                     outDrain.cancel()
                     errDrain.cancel()
-                    continuation.resume(throwing: error)
+                    continuation.resume(throwing: lifecycleController.cancellationErrorIfRequested() ?? error)
                 }
             }
         }, onCancel: {
             timeoutController.cancel()
-            // Stop callbacks and terminate before waiting on a drain lock. A callback may be
-            // blocked in FileHandle.availableData until the child closes its pipe.
-            outPipe.fileHandleForReading.readabilityHandler = nil
-            errPipe.fileHandleForReading.readabilityHandler = nil
-            if process.isRunning {
-                process.terminate()
-            }
-            outDrain.cancel()
-            errDrain.cancel()
+            // Keep stdout/stderr drains active until termination. A child may flush more than
+            // pipe capacity while handling SIGTERM; closing the drains here can block that
+            // flush forever and prevent the termination handler from reaping the process.
+            lifecycleController.requestCancellation(
+                process: process,
+                terminationGrace: processTerminationGrace
+            )
         })
+        try Task.checkCancellation()
+        return result
     }
 
     static func shouldFallbackFromWorktreeListZError(_ stderr: String) -> Bool {
@@ -2935,31 +2969,101 @@ private final class GitProcessMetricsBox: @unchecked Sendable {
 
 ///
 /// `FileHandle.readabilityHandler` may already be executing when a process termination
-/// handler clears it. Without this lock, that callback can read the final bytes, lose the
-/// race to stream closure, and have its subsequent yield discarded.
+/// handler clears it. Foundation may also invalidate its file handle before a queued callback
+/// runs. The drain owns a close-on-exec duplicate descriptor so all reads and closure are
+/// serialized independently of the `FileHandle` lifecycle.
 final class GitProcessPipeDrain: @unchecked Sendable {
+    private enum DescriptorReadResult {
+        case data(Data)
+        case unavailable
+        case terminal
+    }
+
+    private static let readBufferSize = 64 * 1024
+
     private let lock = NSLock()
     private let continuation: AsyncStream<Data>.Continuation
+    private var ownedDescriptor: Int32?
     private var isFinished = false
 
-    private init(continuation: AsyncStream<Data>.Continuation) {
+    private init(
+        continuation: AsyncStream<Data>.Continuation,
+        ownedDescriptor: Int32? = nil
+    ) {
         self.continuation = continuation
+        self.ownedDescriptor = ownedDescriptor
+    }
+
+    deinit {
+        if let ownedDescriptor {
+            _ = Darwin.close(ownedDescriptor)
+        }
     }
 
     static func makeStream() -> (stream: AsyncStream<Data>, drain: GitProcessPipeDrain) {
+        makeStream(ownedDescriptor: nil)
+    }
+
+    static func makeStream(
+        readingFrom handle: FileHandle
+    ) throws -> (stream: AsyncStream<Data>, drain: GitProcessPipeDrain) {
+        let duplicateDescriptor = fcntl(handle.fileDescriptor, F_DUPFD_CLOEXEC, 0)
+        guard duplicateDescriptor >= 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+
+        let statusFlags = fcntl(duplicateDescriptor, F_GETFL)
+        guard statusFlags >= 0 else {
+            let failureErrno = errno
+            _ = Darwin.close(duplicateDescriptor)
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(failureErrno))
+        }
+        guard fcntl(duplicateDescriptor, F_SETFL, statusFlags | O_NONBLOCK) >= 0 else {
+            let failureErrno = errno
+            _ = Darwin.close(duplicateDescriptor)
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(failureErrno))
+        }
+
+        return makeStream(ownedDescriptor: duplicateDescriptor)
+    }
+
+    private static func makeStream(
+        ownedDescriptor: Int32?
+    ) -> (stream: AsyncStream<Data>, drain: GitProcessPipeDrain) {
         var drain: GitProcessPipeDrain?
         let stream = AsyncStream<Data>(bufferingPolicy: .unbounded) { continuation in
-            drain = GitProcessPipeDrain(continuation: continuation)
+            drain = GitProcessPipeDrain(
+                continuation: continuation,
+                ownedDescriptor: ownedDescriptor
+            )
         }
         return (stream, drain!)
     }
 
-    func consumeAvailableData(from handle: FileHandle) {
-        consume { handle.availableData }
+    /// Returns true when the `FileHandle` should stop monitoring readability.
+    @discardableResult
+    func consumeAvailableData() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isFinished, let ownedDescriptor else { return true }
+
+        switch Self.readChunk(from: ownedDescriptor) {
+        case let .data(data):
+            continuation.yield(data)
+            return false
+        case .unavailable:
+            return false
+        case .terminal:
+            finishLocked()
+            return true
+        }
     }
 
-    func finishReading(from handle: FileHandle) {
-        finish { handle.readDataToEndOfFile() }
+    func finishReading() {
+        finish { [self] in
+            guard let ownedDescriptor else { return Data() }
+            return Self.readToEnd(from: ownedDescriptor)
+        }
     }
 
     func consume(read: () -> Data) {
@@ -2986,8 +3090,7 @@ final class GitProcessPipeDrain: @unchecked Sendable {
         if !data.isEmpty {
             continuation.yield(data)
         }
-        isFinished = true
-        continuation.finish()
+        finishLocked()
     }
 
     func cancel() {
@@ -2995,8 +3098,50 @@ final class GitProcessPipeDrain: @unchecked Sendable {
         defer { lock.unlock() }
         guard !isFinished else { return }
 
+        finishLocked()
+    }
+
+    private func finishLocked() {
         isFinished = true
+        if let ownedDescriptor {
+            self.ownedDescriptor = nil
+            _ = Darwin.close(ownedDescriptor)
+        }
         continuation.finish()
+    }
+
+    private static func readToEnd(from descriptor: Int32) -> Data {
+        var result = Data()
+        while true {
+            switch readChunk(from: descriptor) {
+            case let .data(data):
+                result.append(data)
+            case .unavailable, .terminal:
+                return result
+            }
+        }
+    }
+
+    private static func readChunk(from descriptor: Int32) -> DescriptorReadResult {
+        var buffer = [UInt8](repeating: 0, count: readBufferSize)
+        while true {
+            let count = buffer.withUnsafeMutableBytes { bytes in
+                Darwin.read(descriptor, bytes.baseAddress, bytes.count)
+            }
+            if count > 0 {
+                return .data(Data(buffer.prefix(Int(count))))
+            }
+            if count == 0 {
+                return .terminal
+            }
+            if errno == EINTR {
+                continue
+            }
+            if errno == EAGAIN || errno == EWOULDBLOCK {
+                return .unavailable
+            }
+            return .terminal
+        }
     }
 }
 
@@ -3042,6 +3187,136 @@ private final class GitProcessTimeoutController: @unchecked Sendable {
         defer { lock.unlock() }
         task?.cancel()
         task = nil
+    }
+}
+
+private final class GitProcessLifecycleController: @unchecked Sendable {
+    enum SpawnState: Equatable {
+        case running
+        case cancellationRequested
+        case terminated
+    }
+
+    private let lock = NSLock()
+    private var cancellationRequested = false
+    private var processIdentifier: pid_t?
+    private var terminated = false
+    private var cancellationEscalationTask: Task<Void, Never>?
+
+    func checkCancellationBeforeSpawn() throws {
+        lock.lock()
+        let shouldCancel = cancellationRequested
+        lock.unlock()
+        if shouldCancel {
+            throw CancellationError()
+        }
+    }
+
+    func didSpawn(
+        process: Process,
+        processIdentifier: pid_t,
+        terminationGrace: Duration
+    ) -> SpawnState {
+        lock.lock()
+        if terminated {
+            let wasCancelled = cancellationRequested
+            lock.unlock()
+            return wasCancelled ? .cancellationRequested : .terminated
+        }
+
+        self.processIdentifier = processIdentifier
+        let shouldTerminate = cancellationRequested
+        if shouldTerminate {
+            armCancellationEscalationLocked(
+                process: process,
+                processIdentifier: processIdentifier,
+                terminationGrace: terminationGrace
+            )
+        }
+        lock.unlock()
+
+        if shouldTerminate, process.isRunning {
+            process.terminate()
+        }
+        return shouldTerminate ? .cancellationRequested : .running
+    }
+
+    func requestCancellation(
+        process: Process,
+        terminationGrace: Duration
+    ) {
+        lock.lock()
+        cancellationRequested = true
+        let processIdentifier = terminated ? nil : processIdentifier
+        if let processIdentifier {
+            armCancellationEscalationLocked(
+                process: process,
+                processIdentifier: processIdentifier,
+                terminationGrace: terminationGrace
+            )
+        }
+        lock.unlock()
+
+        if processIdentifier != nil, process.isRunning {
+            process.terminate()
+        }
+    }
+
+    func shouldKeepNormalTimeout() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !cancellationRequested && !terminated
+    }
+
+    func cancellationErrorIfRequested() -> CancellationError? {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancellationRequested ? CancellationError() : nil
+    }
+
+    func didTerminate() {
+        lock.lock()
+        terminated = true
+        processIdentifier = nil
+        let escalationTask = cancellationEscalationTask
+        cancellationEscalationTask = nil
+        lock.unlock()
+        escalationTask?.cancel()
+    }
+
+    private func armCancellationEscalationLocked(
+        process: Process,
+        processIdentifier: pid_t,
+        terminationGrace: Duration
+    ) {
+        guard cancellationEscalationTask == nil else { return }
+        cancellationEscalationTask = Task.detached { [self] in
+            do {
+                try await Task.sleep(for: terminationGrace)
+            } catch {
+                return
+            }
+            sendCancellationKillIfNeeded(
+                process: process,
+                processIdentifier: processIdentifier
+            )
+        }
+    }
+
+    private func sendCancellationKillIfNeeded(
+        process: Process,
+        processIdentifier: pid_t
+    ) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard cancellationRequested,
+              !terminated,
+              self.processIdentifier == processIdentifier,
+              process.isRunning
+        else {
+            return
+        }
+        _ = kill(processIdentifier, SIGKILL)
     }
 }
 

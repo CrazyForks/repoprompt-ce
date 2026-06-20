@@ -64,7 +64,7 @@ extension Notification.Name {
     /// userInfo: ["windowID": Int]
     static let showMCPServerPopover = Notification.Name("showMCPServerPopover")
     /// Posted when Agent Mode should open the Oracle pill popover.
-    /// userInfo: ["windowID": Int, "tabID": UUID?, "chatID": String?]
+    /// userInfo: ["windowID": Int, "workspaceID": UUID, "tabID": UUID, "chatID": String]
     static let showAgentOraclePopover = Notification.Name("showAgentOraclePopover")
     /// Posted when Agent Mode should open the Workflow pill popover.
     /// userInfo: ["windowID": Int]
@@ -73,6 +73,9 @@ extension Notification.Name {
     /// object: WorkspaceManagerViewModel instance (window-scoped)
     /// userInfo: ["isVisible": Bool]
     static let workspaceSwitchOverlayDidChange = Notification.Name("workspaceSwitchOverlayDidChange")
+    /// Posted when a compose tab's persisted display name changes.
+    /// userInfo: ["tabID": UUID, "windowID": Int, "name": String]
+    static let composeTabNameChanged = Notification.Name("composeTabNameChanged")
 
     /// Toggle the Agent session sidebar for the focused window.
     /// `userInfo["windowID"]` should be the target window ID.

@@ -156,7 +156,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                     let abs = entry.file.standardizedFullPath
                     if seenPaths.insert(abs).inserted { combined.append(entry.file) }
                 }
-                let reply = try await dependencies.buildCodeStructureDTO(combined, maxResults, true, lookupContext.bindingProjection)
+                let reply = try await dependencies.buildCodeStructureDTO(combined, maxResults, true, lookupContext)
                 try Task.checkCancellation()
                 return try Value(reply)
             default:
@@ -178,7 +178,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 try Task.checkCancellation()
                 let resolvedFiles = try await dependencies.resolveFilesForCodeStructure(resolvedPaths, lookupRootScope)
                 try Task.checkCancellation()
-                let reply = try await dependencies.buildCodeStructureDTO(resolvedFiles, maxResults, false, lookupContext.bindingProjection)
+                let reply = try await dependencies.buildCodeStructureDTO(resolvedFiles, maxResults, false, lookupContext)
                 try Task.checkCancellation()
                 return try Value(reply)
             }
@@ -371,7 +371,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             EditFlowPerf.Dimensions(outcome: readResult.shouldAutoSelect ? "attempted" : "skipped")
         ) {
             if readResult.shouldAutoSelect {
-                await dependencies.enqueueReadFileAutoSelection(readResult.reply, path, metadata)
+                await dependencies.enqueueReadFileAutoSelection(readResult.reply, path, resolvedPath, metadata)
             }
         }
         try Task.checkCancellation()
@@ -490,9 +490,16 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
         }
 
         let mode = SearchMode(rawValue: modeRaw) ?? .auto
-        let metadata = await dependencies.captureRequestMetadata()
+        let metadata = await EditFlowPerf.measure(EditFlowPerf.Stage.Search.providerRequestMetadata) {
+            await dependencies.captureRequestMetadata()
+        }
         try Task.checkCancellation()
-        let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+        let lookupContext = await EditFlowPerf.measure(
+            EditFlowPerf.Stage.Search.providerLookupContextResolution,
+            EditFlowPerf.Dimensions(searchMode: mode.rawValue, countOnly: countOnly)
+        ) {
+            await dependencies.resolveFileToolLookupContext(metadata)
+        }
         try Task.checkCancellation()
         let usesWorktreeProjection = lookupContext.bindingProjection != nil
         let worktreeScope = ToolResultDTOs.WorktreeScopeDTO.sessionBound(from: lookupContext.bindingProjection)
@@ -517,13 +524,25 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 EditFlowPerf.Dimensions(outcome: "completed", searchMode: mode.rawValue, countOnly: countOnly)
             )
         } catch let error as StoreBackedWorkspaceSearchError {
+            let outcome = switch error {
+            case .worktreeScopeUnavailable:
+                "worktreeScopeUnavailable"
+            case .workspaceFreshnessTimedOut:
+                "workspaceFreshnessTimedOut"
+            case .workspaceReadinessUnavailable:
+                "workspaceReadinessUnavailable"
+            case .workspaceReadinessTimedOut:
+                "workspaceReadinessTimedOut"
+            case .workspaceReadinessSuperseded:
+                "workspaceReadinessSuperseded"
+            }
             EditFlowPerf.lifecycleEvent(
                 EditFlowPerf.Lifecycle.Search.providerWorkspaceSearchReturned,
-                EditFlowPerf.Dimensions(outcome: "worktreeScopeUnavailable", searchMode: mode.rawValue, countOnly: countOnly)
+                EditFlowPerf.Dimensions(outcome: outcome, searchMode: mode.rawValue, countOnly: countOnly)
             )
-            let reply = Self.searchWorktreeUnavailableDTO(for: error, worktreeScope: worktreeScope)
-            EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerDTOReady, EditFlowPerf.Dimensions(outcome: "worktreeScopeUnavailable"))
-            EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerAutoSelectionReturned, EditFlowPerf.Dimensions(outcome: "skippedWorktreeScopeUnavailable"))
+            let reply = Self.searchRetryableFailureDTO(for: error, worktreeScope: worktreeScope)
+            EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerDTOReady, EditFlowPerf.Dimensions(outcome: outcome))
+            EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerAutoSelectionReturned, EditFlowPerf.Dimensions(outcome: "skippedRetryableFailure"))
             return reply
         } catch let error as StoreBackedWorkspaceSearchAdmissionError {
             EditFlowPerf.lifecycleEvent(
@@ -639,7 +658,15 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 )
             }
             endDTOBuildIfNeeded()
-            EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerDTOReady, EditFlowPerf.Dimensions(outcome: "completed", countOnly: true))
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.Search.providerDTOReady,
+                EditFlowPerf.Dimensions(
+                    outcome: "completed",
+                    matchCount: reply.totalMatches,
+                    usesWorktreeProjection: usesWorktreeProjection,
+                    countOnly: true
+                )
+            )
             EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerAutoSelectionReturned, EditFlowPerf.Dimensions(outcome: "skippedCountOnly"))
             return reply
         }
@@ -754,26 +781,63 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             )
         }
         endDTOBuildIfNeeded()
+        var physicalPathsByLogicalPath: [String: Set<String>] = [:]
+        for (logicalMatch, physicalMatch) in zip(
+            includedContentMatches,
+            (results.matches ?? []).prefix(includedContentMatches.count)
+        ) {
+            physicalPathsByLogicalPath[logicalMatch.filePath, default: []].insert(physicalMatch.filePath)
+        }
+        let autoSelectionResolvedPhysicalPaths = reply.contentMatchGroups.compactMap { group -> String? in
+            guard let candidates = physicalPathsByLogicalPath[group.path], candidates.count == 1 else {
+                return nil
+            }
+            return candidates.first
+        }
         EditFlowPerf.lifecycleEvent(
             EditFlowPerf.Lifecycle.Search.providerDTOReady,
-            EditFlowPerf.Dimensions(outcome: dtoBuildOutcome, searchMode: mode.rawValue, countOnly: false)
+            EditFlowPerf.Dimensions(
+                outcome: dtoBuildOutcome,
+                matchCount: reply.totalMatches,
+                usesWorktreeProjection: usesWorktreeProjection,
+                searchMode: mode.rawValue,
+                countOnly: false
+            )
         )
         try Task.checkCancellation()
         await EditFlowPerf.measure(
             EditFlowPerf.Stage.Search.providerAutoSelection,
             EditFlowPerf.Dimensions(searchMode: mode.rawValue, contextLines: contextLines)
         ) {
-            await dependencies.enqueueFileSearchAutoSelection(mode, contextLines, reply, metadata)
+            await dependencies.enqueueFileSearchAutoSelection(
+                mode,
+                contextLines,
+                reply,
+                autoSelectionResolvedPhysicalPaths,
+                metadata
+            )
         }
         EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerAutoSelectionReturned)
         return reply
     }
 
-    static func searchWorktreeUnavailableDTO(
+    static func searchRetryableFailureDTO(
         for error: StoreBackedWorkspaceSearchError,
         worktreeScope: ToolResultDTOs.WorktreeScopeDTO? = nil
     ) -> ToolResultDTOs.SearchResultDTO {
-        ToolResultDTOs.SearchResultDTO(
+        let errorCode = switch error {
+        case .worktreeScopeUnavailable:
+            "worktree_scope_unavailable"
+        case .workspaceFreshnessTimedOut:
+            "workspace_freshness_timeout"
+        case .workspaceReadinessUnavailable:
+            "workspace_readiness_unavailable"
+        case .workspaceReadinessTimedOut:
+            "workspace_readiness_timeout"
+        case .workspaceReadinessSuperseded:
+            "workspace_readiness_superseded"
+        }
+        return ToolResultDTOs.SearchResultDTO(
             totalMatches: 0,
             totalFiles: 0,
             contentMatches: 0,
@@ -783,7 +847,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             pathMatchLines: [],
             contentMatchGroups: [],
             errorMessage: error.localizedDescription,
-            errorCode: "worktree_scope_unavailable",
+            errorCode: errorCode,
             retryable: true,
             retryAfterMilliseconds: error.retryAfterMilliseconds,
             suggestion: error.suggestion,

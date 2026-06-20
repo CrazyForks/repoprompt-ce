@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import XCTest
 @_spi(TestSupport) @testable import RepoPrompt
@@ -7,13 +8,16 @@ private let lifecycleAwaitTimeoutSeconds: TimeInterval = 5
 @MainActor
 final class AgentModeRunServiceLifecycleTests: XCTestCase {
     private var temporaryURLs: [URL] = []
+    private var lifecycleHosts: [AgentModeViewModel] = []
+    private var acpControllers: [ObjectIdentifier: ACPAgentSessionController] = [:]
 
-    override func tearDown() {
+    override func tearDown() async throws {
+        await cleanupRegisteredRuntime()
         for url in temporaryURLs {
             try? FileManager.default.removeItem(at: url)
         }
         temporaryURLs.removeAll()
-        super.tearDown()
+        try await super.tearDown()
     }
 
     func testTerminalCommitPreservesRebuiltToolCorrelationIndexes() async throws {
@@ -590,6 +594,64 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertEqual(Set(policyEvents).count, 1)
     }
 
+    func testLifecycleCleanupReapsCompletedReusableOpenCodeProcess() async throws {
+        let recorder = LifecycleRecorder()
+        let workspace = try makeTemporaryDirectory()
+        let processIDURL = workspace.appendingPathComponent("opencode-process-id.txt")
+        let scriptURL = try makeOpenCodeModeFlowServerScript()
+        let provider = LifecycleFakeACPProvider(
+            providerID: .openCode,
+            commandPath: scriptURL.path,
+            environment: ["ACP_PID_PATH": processIDURL.path],
+            recorder: recorder
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            workspacePathProvider: { _ in workspace.path },
+            acpProviderFactory: { agent, _ in
+                XCTAssertEqual(agent, .openCode)
+                return provider
+            },
+            autoSignalACPRouting: true
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .openCode
+
+        let outcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "Complete and remain reusable",
+            initialMessageForRun: "Complete and remain reusable",
+            attachments: []
+        )
+
+        XCTAssertNil(outcome)
+        try await withLifecycleTimeout("OpenCode reusable-session run") {
+            await session.agentTask?.value
+        }
+        XCTAssertEqual(session.runState, .completed)
+        let controller = try XCTUnwrap(session.acpController)
+        let wasReusable = await controller.hasReusableSession
+        XCTAssertTrue(wasReusable)
+
+        try await waitUntil("OpenCode process ID should be recorded") {
+            FileManager.default.fileExists(atPath: processIDURL.path)
+        }
+        let processIDText = try String(contentsOf: processIDURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let processID = try XCTUnwrap(pid_t(processIDText))
+        XCTAssertTrue(Self.processIsRunning(processID))
+
+        await cleanupRegisteredRuntime()
+
+        try await waitUntil("OpenCode process should exit during lifecycle cleanup") {
+            !Self.processIsRunning(processID)
+        }
+        XCTAssertFalse(Self.processIsRunning(processID))
+        let remainsReusable = await controller.hasReusableSession
+        XCTAssertFalse(remainsReusable)
+    }
+
     func testTerminalBarrierRejectsStaleOwnership() async {
         let recorder = LifecycleRecorder()
         let barrier = AgentRunTerminalCommitBarrier(hooks: makeHooks(recorder: recorder))
@@ -771,7 +833,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                     ? .rejected(reason: "test_transient_rejection")
                     : .accepted(successorEpoch: successor)
             },
-            makeTerminalPublicationEnvelope: { _, _, _ in
+            makeTerminalPublicationEnvelope: { _, _, _, _ in
                 .init(epoch: epoch, snapshot: .expired(sessionID: sessionID))
             },
             startFollowUpRun: { _, text in recorder.record("follow-up:\(text)") }
@@ -1318,13 +1380,14 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         }
     }
 
-    private func makeHarness(
+    func makeHarness(
         recorder: LifecycleRecorder,
         workspacePathProvider: @escaping (AgentModeViewModel.TabSession) throws -> String? = { _ in FileManager.default.currentDirectoryPath },
         idleWaiter: @escaping LifecycleMCPIdleWaiter = { _ in },
         cancelMCPTools: @escaping (_ runID: UUID, _ reason: String) -> Void = { _, _ in },
         codexController: LifecycleNoopCodexController? = nil,
         claudeController: LifecycleFakeNativeController? = nil,
+        claudeControllerFactory: ClaudeAgentModeCoordinator.ClaudeControllerFactory? = nil,
         headlessProviderFactory: AgentModeViewModel.HeadlessProviderFactory? = nil,
         acpProviderFactory: AgentModeViewModel.ACPProviderFactory? = nil,
         acpControllerFactory: AgentModeViewModel.ACPControllerFactory? = nil,
@@ -1342,9 +1405,14 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             recorder.record("factory:acp-provider")
             return nil
         }
-        let acpControllerFactory = acpControllerFactory ?? { provider, request in
+        let baseACPControllerFactory = acpControllerFactory ?? { provider, request in
             recorder.record("factory:acp-controller")
             return try ACPAgentSessionController(provider: provider, runRequest: request)
+        }
+        let trackedACPControllerFactory: AgentModeViewModel.ACPControllerFactory = { [weak self] provider, request in
+            let controller = try baseACPControllerFactory(provider, request)
+            self?.registerACPController(controller)
+            return controller
         }
         let policyInstaller: AgentModeViewModel.ConnectionPolicyInstaller = { clientName, _, _, _, _, _, _, runID, _, _, _, _, _ in
             recorder.record("policy:\(clientName):\(runID?.uuidString ?? "nil")")
@@ -1357,22 +1425,24 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             testWindowID: 1,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in codexController },
-            claudeControllerFactory: { _, _, _, _, _, _, _ in
+            claudeControllerFactory: claudeControllerFactory ?? { _, _, _, _ in
                 recorder.record("factory:claude")
                 return claudeController
             },
             headlessProviderFactory: headlessProviderFactory,
             acpProviderFactory: acpProviderFactory,
-            acpControllerFactory: acpControllerFactory,
+            acpControllerFactory: trackedACPControllerFactory,
             connectionPolicyInstaller: policyInstaller,
             mcpServerEnabler: serverEnabler
         )
+        lifecycleHosts.append(host)
         let dependencies = AgentModeRunService.Dependencies(
             windowID: 1,
             headlessProviderFactory: headlessProviderFactory,
             acpProviderFactory: acpProviderFactory,
-            acpControllerFactory: acpControllerFactory,
+            acpControllerFactory: trackedACPControllerFactory,
             connectionPolicyInstaller: policyInstaller,
+            expectedPIDPolicyArmer: { _ in true },
             mcpServerEnabler: serverEnabler,
             workspacePathProvider: workspacePathProvider,
             codexCoordinator: host.test_codexCoordinator,
@@ -1412,7 +1482,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         makeTerminalPublicationEnvelope: ((
             AgentModeViewModel.TabSession,
             AgentRunOwnership,
-            AgentSessionRunState
+            AgentSessionRunState,
+            UUID?
         ) -> AgentRunTerminalPublicationEnvelope?)? = nil,
         startFollowUpRun: ((UUID, String) -> Void)? = nil
     ) -> AgentModeRunService.Hooks {
@@ -1449,7 +1520,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             flushPendingAssistantDelta: flushPendingAssistantDelta,
             clearPendingAssistantDelta: { _ in },
             prepareTerminalPublication: { _ in recorder.record("prepare-publication") },
-            makeTerminalPublicationEnvelope: makeTerminalPublicationEnvelope ?? { _, _, _ in nil },
+            makeTerminalPublicationEnvelope: makeTerminalPublicationEnvelope ?? { _, _, _, _ in nil },
             publishTerminalCommit: { session, revision, successorKind in
                 if let publishTerminalCommitResult {
                     return await publishTerminalCommitResult(session, revision, successorKind)
@@ -1467,7 +1538,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         )
     }
 
-    private func makeRunningClaudeSession(controller: LifecycleFakeNativeController) -> AgentModeViewModel.TabSession {
+    func makeRunningClaudeSession(controller: LifecycleFakeNativeController) -> AgentModeViewModel.TabSession {
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .claudeCode
         session.runState = .running
@@ -1477,7 +1548,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         return session
     }
 
-    private func makeClaudeSteeringInstruction(
+    func makeClaudeSteeringInstruction(
         session: AgentModeViewModel.TabSession,
         text: String
     ) -> AgentModeViewModel.TabSession.ClaudeSteeringInstruction {
@@ -1538,7 +1609,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         request: ACPRunRequest,
         recorder: LifecycleRecorder
     ) throws -> ACPAgentSessionController {
-        try ACPAgentSessionController(
+        let controller = try ACPAgentSessionController(
             provider: provider,
             runRequest: request,
             diagnosticSink: { event in
@@ -1552,6 +1623,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 recorder.record("acp:\(method)")
             }
         )
+        registerACPController(controller)
+        return controller
     }
 
     private func makeTemporaryDirectory() throws -> URL {
@@ -1572,8 +1645,13 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         import sys
 
         record_path = os.environ.get("ACP_RECORD_PATH")
+        pid_path = os.environ.get("ACP_PID_PATH")
         current_model = "model-a"
         current_mode = "ask"
+
+        if pid_path:
+            with open(pid_path, "w", encoding="utf-8") as handle:
+                handle.write(str(os.getpid()))
 
         def record(method, params):
             if not record_path:
@@ -1709,6 +1787,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         try await withLifecycleTimeout("ACP controller shutdown", cancelOperationOnTimeout: false) {
             await controller.shutdown()
         }
+        acpControllers.removeValue(forKey: ObjectIdentifier(controller))
     }
 
     private func shutdownACPControllerAfterFailure(_ controller: ACPAgentSessionController) async {
@@ -1717,6 +1796,31 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         } catch {
             XCTFail("ACP controller cleanup failed: \(error.localizedDescription)")
         }
+    }
+
+    private func registerACPController(_ controller: ACPAgentSessionController) {
+        acpControllers[ObjectIdentifier(controller)] = controller
+    }
+
+    private func cleanupRegisteredRuntime() async {
+        let hosts = lifecycleHosts.reversed()
+        lifecycleHosts.removeAll()
+        for host in hosts {
+            await host.prepareForWindowClose()
+        }
+
+        let controllers = Array(acpControllers.values)
+        acpControllers.removeAll()
+        for controller in controllers {
+            await controller.shutdown()
+        }
+    }
+
+    private nonisolated static func processIsRunning(_ processID: pid_t) -> Bool {
+        if kill(processID, 0) == 0 {
+            return true
+        }
+        return errno == EPERM
     }
 
     private func withLifecycleTimeout<Value: Sendable>(
@@ -1759,7 +1863,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         throw LifecycleTimeoutError(operation: message, timeoutSeconds: 0.5)
     }
 
-    private func assertOrderedEvents(
+    func assertOrderedEvents(
         _ expected: [String],
         in recorder: LifecycleRecorder,
         afterFirstMatchOf marker: String? = nil,
@@ -1783,7 +1887,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
     }
 }
 
-private typealias LifecycleMCPIdleWaiter = (_ runID: UUID) async throws -> Void
+typealias LifecycleMCPIdleWaiter = (_ runID: UUID) async throws -> Void
 
 private struct LifecycleTimeoutError: LocalizedError {
     let operation: String
@@ -1832,7 +1936,7 @@ private actor LifecycleTimeoutGate<Value: Sendable> {
     }
 }
 
-private struct LifecycleHarness {
+struct LifecycleHarness {
     let service: AgentModeRunService
     let host: AgentModeViewModel
 }
@@ -1844,7 +1948,7 @@ private enum LifecycleCancellationRow: String, CaseIterable {
     case acp
 }
 
-private enum LifecycleTestError: LocalizedError {
+enum LifecycleTestError: LocalizedError {
     case workspaceMissing
     case expectedACPDispatchStop
     case unexpectedACPControllerCreation
@@ -1867,7 +1971,7 @@ private enum LifecycleTestError: LocalizedError {
     }
 }
 
-private final class LifecycleRecorder: @unchecked Sendable {
+final class LifecycleRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var storage: [String] = []
 
@@ -1954,7 +2058,7 @@ private final class LifecycleNoopHeadlessProvider: HeadlessAgentProvider {
     func dispose() async {}
 }
 
-private final class LifecycleNoopCodexController: CodexSessionControlling {
+final class LifecycleNoopCodexController: CodexSessionControlling {
     enum SendBehavior: CustomStringConvertible {
         case success
         case failure
@@ -2074,75 +2178,6 @@ private final class LifecycleNoopCodexController: CodexSessionControlling {
     }
 
     func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async {}
-}
-
-private actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
-    private let recorder: LifecycleRecorder
-    private let turnInFlight: Bool
-    private let failSend: Bool
-    private let sessionRef = NativeAgentRuntimeSessionRef(sessionID: "lifecycle-claude-session")
-    private let stream: AsyncStream<NativeAgentRuntimeEvent>
-
-    init(
-        recorder: LifecycleRecorder,
-        hasTurnInFlight: Bool = false,
-        failSend: Bool = false
-    ) {
-        self.recorder = recorder
-        turnInFlight = hasTurnInFlight
-        self.failSend = failSend
-        stream = AsyncStream { _ in }
-    }
-
-    var hasActiveSession: Bool {
-        true
-    }
-
-    var hasTurnInFlight: Bool {
-        turnInFlight
-    }
-
-    var events: AsyncStream<NativeAgentRuntimeEvent> {
-        stream
-    }
-
-    func ensureEventsStreamReady() async {}
-    func resetEventsStreamForNewRun() async {}
-
-    func startOrResume(
-        existingSessionID: String?,
-        model: String?,
-        effortLevel: NativeAgentRuntimeEffortLevel?,
-        systemPromptOverride: String?
-    ) async throws -> NativeAgentRuntimeSessionRef {
-        recorder.record("claude:start")
-        return sessionRef
-    }
-
-    func currentSessionRef() async -> NativeAgentRuntimeSessionRef {
-        sessionRef
-    }
-
-    func applyModelAndEffort(model: String?, effortLevel: NativeAgentRuntimeEffortLevel?) async throws {}
-
-    func sendUserMessage(_ text: String) async throws -> UUID {
-        recorder.record("claude:send")
-        if failSend {
-            throw LifecycleTestError.expectedClaudeSendFailure
-        }
-        return UUID()
-    }
-
-    func interruptTurn(reason: String) async -> NativeAgentRuntimeInterruptOutcome {
-        recorder.record("claude:interrupt:\(reason)")
-        return .noTurnInFlight
-    }
-
-    func shutdown() async {
-        recorder.record("claude:shutdown")
-    }
-
-    func respondToPermissionRequest(id: String, decision: AgentApprovalDecision) async {}
 }
 
 private struct LifecycleFakeACPProvider: ACPAgentProvider {

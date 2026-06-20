@@ -9,8 +9,11 @@ struct MCPWindowToolDependencies {
     struct ContextBuilderTabResolution {
         let tabID: UUID
         let workspaceID: UUID?
+        let agentModeSessionID: UUID?
+        let agentModeRunID: UUID?
         let bindCaller: Bool
         let lookupContext: WorkspaceLookupContext
+        let workspaceContext: ContextBuilderWorkspaceContext?
     }
 
     typealias ExecuteTool = @Sendable (_ args: [String: Value]) async throws -> Value
@@ -50,7 +53,8 @@ struct MCPWindowToolDependencies {
         _ selection: StoredSelection,
         _ includeBlocks: Bool,
         _ display: FilePathDisplay,
-        _ codeMapUsageOverride: CodeMapUsage?
+        _ codeMapUsageOverride: CodeMapUsage?,
+        _ lookupContextOverride: WorkspaceLookupContext?
     ) async throws -> ToolResultDTOs.SelectionReply
     typealias SendStageProgress = @Sendable (
         _ connectionID: UUID?,
@@ -77,9 +81,12 @@ struct MCPWindowToolDependencies {
     typealias RunMCPPlanOrQuestion = @MainActor @Sendable (
         _ contextBuilderVM: ContextBuilderAgentViewModel,
         _ tabID: UUID,
+        _ agentModeSessionID: UUID?,
+        _ agentModeRunID: UUID?,
         _ mode: HeadlessMode,
         _ prompt: String,
         _ selection: StoredSelection,
+        _ lookupContext: WorkspaceLookupContext?,
         _ progressReporter: ContextBuilderMCPProgressReporter?,
         _ activityReporter: ContextBuilderMCPActivityReporter?
     ) async throws -> ChatSendReply
@@ -110,7 +117,8 @@ struct MCPWindowToolDependencies {
         _ display: FilePathDisplay,
         _ extraInvalid: [String],
         _ viewMode: String?,
-        _ resolvedContext: MCPServerViewModel.ResolvedTabContextSnapshot
+        _ resolvedContext: MCPServerViewModel.ResolvedTabContextSnapshot,
+        _ lookupContext: WorkspaceLookupContext
     ) async throws -> ToolResultDTOs.SelectionReply
     typealias BuildSelectionPreviewReply = @MainActor @Sendable (
         _ selection: StoredSelection,
@@ -128,7 +136,8 @@ struct MCPWindowToolDependencies {
         _ extraInvalid: [String],
         _ viewMode: String?,
         _ codeMapUsageOverride: CodeMapUsage?,
-        _ virtualContext: MCPServerViewModel.TabScopedContext?
+        _ virtualContext: MCPServerViewModel.TabScopedContext?,
+        _ lookupContext: WorkspaceLookupContext
     ) async throws -> ToolResultDTOs.SelectionReply
     typealias BuildManageSelectionSetSelection = @MainActor @Sendable (
         _ inputs: MCPServerViewModel.ManageSelectionInputs,
@@ -175,15 +184,26 @@ struct MCPWindowToolDependencies {
         _ metadata: MCPServerViewModel.RequestMetadata,
         _ mutated: Bool
     ) async -> MCPServerViewModel.MCPSelectionPersistenceVerification?
-    typealias MakeSelectionHintError = @MainActor @Sendable (_ paths: [String], _ operation: String, _ lookupRootScope: WorkspaceLookupRootScope) async -> String
+    typealias MakeSelectionHintError = @MainActor @Sendable (_ paths: [String], _ operation: String, _ lookupContext: WorkspaceLookupContext) async -> String
     typealias PerformFileAction = @MainActor @Sendable (_ action: String, _ path: String, _ content: String?, _ newPath: String?, _ ifExists: String?) async throws -> String?
-    typealias BuildCodeStructureDTO = @MainActor @Sendable (_ files: [WorkspaceFileRecord], _ maxResults: Int, _ includeUnmappedPaths: Bool, _ projection: WorkspaceRootBindingProjection?) async throws -> ToolResultDTOs.SelectedCodeStructureDTO
+    typealias BuildCodeStructureDTO = @MainActor @Sendable (_ files: [WorkspaceFileRecord], _ maxResults: Int, _ includeUnmappedPaths: Bool, _ lookupContext: WorkspaceLookupContext) async throws -> ToolResultDTOs.SelectedCodeStructureDTO
     typealias ResolveFilesForCodeStructure = @MainActor @Sendable (_ paths: [String], _ lookupRootScope: WorkspaceLookupRootScope) async throws -> [WorkspaceFileRecord]
     typealias BuildStoreBackedFileTreeResult = @MainActor @Sendable (_ mode: String, _ maxDepth: Int?, _ startPath: String?, _ lookupContext: WorkspaceLookupContext) async throws -> (result: FileTreeResult, rootCount: Int)
     typealias ReadFile = @MainActor @Sendable (_ path: String, _ startLine1Based: Int?, _ lineCount: Int?, _ lookupRootScope: WorkspaceLookupRootScope) async throws -> (reply: ToolResultDTOs.ReadFileReply, shouldAutoSelect: Bool)
-    typealias EnqueueReadFileAutoSelection = @MainActor @Sendable (_ reply: ToolResultDTOs.ReadFileReply, _ requestedPath: String, _ metadata: MCPServerViewModel.RequestMetadata) async -> Void
+    typealias EnqueueReadFileAutoSelection = @MainActor @Sendable (
+        _ reply: ToolResultDTOs.ReadFileReply,
+        _ requestedPath: String,
+        _ resolvedPhysicalPath: String,
+        _ metadata: MCPServerViewModel.RequestMetadata
+    ) async -> Void
     typealias DrainReadFileAutoSelection = @MainActor @Sendable (_ metadata: MCPServerViewModel.RequestMetadata, _ requirement: MCPReadFileAutoSelectionCoordinator.DrainRequirement) async -> MCPReadFileAutoSelectionCoordinator.DrainResult
-    typealias EnqueueFileSearchAutoSelection = @MainActor @Sendable (_ mode: SearchMode, _ contextLines: Int, _ reply: ToolResultDTOs.SearchResultDTO, _ metadata: MCPServerViewModel.RequestMetadata) async -> Void
+    typealias EnqueueFileSearchAutoSelection = @MainActor @Sendable (
+        _ mode: SearchMode,
+        _ contextLines: Int,
+        _ reply: ToolResultDTOs.SearchResultDTO,
+        _ resolvedPhysicalPaths: [String],
+        _ metadata: MCPServerViewModel.RequestMetadata
+    ) async -> Void
     typealias WorkspaceContextMessage = @MainActor @Sendable (_ operation: String?, _ path: String?) async -> String
     typealias ParseCopyPresetSelector = @Sendable (_ value: Value?) -> MCPServerViewModel.CopyPresetSelector?
     typealias ResolveCopyPreset = @MainActor @Sendable (_ selector: MCPServerViewModel.CopyPresetSelector) -> CopyPreset?
