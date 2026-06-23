@@ -23,6 +23,7 @@ enum WorkspaceCodemapGitTerminalUnavailableReason: String, Equatable {
     case nonGit
     case bareRepository
     case unsupportedObjectFormat
+    case unsupportedGit
     case invalidLayout
     case invalidLoadedRootContainment
     case namespaceUnavailable

@@ -76,6 +76,25 @@ final class WorkspaceCodemapGitCapabilityServiceTests: XCTestCase {
             .terminalUnavailable(.unsupportedObjectFormat)
         )
 
+        let unavailableGit = fixture.sandbox.appendingPathComponent("unavailable-git")
+        try """
+        #!/bin/sh
+        case "$*" in
+          *--show-toplevel*) printf '%s\n' "$PWD" ;;
+          *--show-object-format*) printf 'unsupported option\n' >&2; exit 1 ;;
+          *) exit 1 ;;
+        esac
+        """.write(to: unavailableGit, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: unavailableGit.path)
+        let unavailableService = WorkspaceCodemapGitCapabilityService(
+            gitService: GitService(gitExecutableURL: unavailableGit),
+            namespaceSalt: namespaceSalt
+        )
+        await assertEqual(
+            unavailableService.resolve(root: request(for: unsupportedRoot, seed: 14)),
+            .terminalUnavailable(.unsupportedGit)
+        )
+
         let localeLog = fixture.sandbox.appendingPathComponent("locale.log")
         let localizedGit = fixture.sandbox.appendingPathComponent("localized-git")
         try """
@@ -267,6 +286,52 @@ final class WorkspaceCodemapGitCapabilityServiceTests: XCTestCase {
         _ = try fixture.runGit(["pack-refs", "--all"], at: root)
         let afterPackedRefs = try await capability(service.resolve(root: rootRequest)).repositoryAuthority
         XCTAssertNotEqual(afterPackedRefs.metadataGeneration, afterHead.metadataGeneration)
+    }
+
+    func testAuthorityEvidenceDescriptorRejectsLeafReplacementAndParentSymlinkSwap() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: #function)
+
+        let leafRoot = try fixture.makeRepository(named: "leaf")
+        let leafConfig = leafRoot.appendingPathComponent(".git/config").standardizedFileURL
+        let leafReplacement = AuthorityEvidenceLeafReplacement(
+            target: leafConfig,
+            replacementContents: Data("[core]\nrepositoryformatversion = 999\n".utf8)
+        )
+        let leafService = WorkspaceCodemapGitCapabilityService(
+            namespaceSalt: namespaceSalt,
+            hooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                afterAuthorityEvidenceOpen: { leafReplacement.replaceIfTarget($0) }
+            )
+        )
+        guard case .transientUnavailable(.repositoryChanging, _) = await leafService.resolve(
+            root: request(for: leafRoot, seed: 26)
+        ) else { return XCTFail("Leaf replacement after descriptor open must fail closed.") }
+
+        let parentRoot = try fixture.makeRepository(named: "parent")
+        let info = parentRoot.appendingPathComponent(".git/info", isDirectory: true)
+        let attributes = info.appendingPathComponent("attributes")
+        try "*.swift text\n".write(to: attributes, atomically: true, encoding: .utf8)
+        let outside = fixture.sandbox.appendingPathComponent("outside-info", isDirectory: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try "*.swift filter=outside\n".write(
+            to: outside.appendingPathComponent("attributes"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let parentSwap = AuthorityEvidenceParentSymlinkSwap(
+            targetDirectory: info,
+            triggerFile: attributes,
+            outsideDirectory: outside
+        )
+        let parentService = WorkspaceCodemapGitCapabilityService(
+            namespaceSalt: namespaceSalt,
+            hooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                afterAuthorityEvidenceOpen: { parentSwap.swapIfTarget($0) }
+            )
+        )
+        guard case .transientUnavailable(.repositoryChanging, _) = await parentService.resolve(
+            root: request(for: parentRoot, seed: 27)
+        ) else { return XCTFail("Parent symlink swap after descriptor open must fail closed.") }
     }
 
     func testLinkedWorktreeCommonAndPerWorktreeAuthorityChanges() async throws {
@@ -850,6 +915,55 @@ final class WorkspaceCodemapGitCapabilityServiceTests: XCTestCase {
           *) exit 1 ;;
         esac
         """
+    }
+}
+
+private final class AuthorityEvidenceLeafReplacement: @unchecked Sendable {
+    private let lock = NSLock()
+    private let targetPath: String
+    private let replacementContents: Data
+    private var didReplace = false
+
+    init(target: URL, replacementContents: Data) {
+        targetPath = target.standardizedFileURL.path
+        self.replacementContents = replacementContents
+    }
+
+    func replaceIfTarget(_ openedURL: URL) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !didReplace, openedURL.standardizedFileURL.path == targetPath else { return }
+        didReplace = true
+        try? replacementContents.write(to: URL(fileURLWithPath: targetPath), options: .atomic)
+    }
+}
+
+private final class AuthorityEvidenceParentSymlinkSwap: @unchecked Sendable {
+    private let lock = NSLock()
+    private let targetDirectory: URL
+    private let backupDirectory: URL
+    private let triggerPath: String
+    private let outsideDirectory: URL
+    private var didSwap = false
+
+    init(targetDirectory: URL, triggerFile: URL, outsideDirectory: URL) {
+        self.targetDirectory = targetDirectory
+        backupDirectory = targetDirectory.deletingLastPathComponent()
+            .appendingPathComponent(targetDirectory.lastPathComponent + "-original", isDirectory: true)
+        triggerPath = triggerFile.standardizedFileURL.path
+        self.outsideDirectory = outsideDirectory
+    }
+
+    func swapIfTarget(_ openedURL: URL) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !didSwap, openedURL.standardizedFileURL.path == triggerPath else { return }
+        didSwap = true
+        try? FileManager.default.moveItem(at: targetDirectory, to: backupDirectory)
+        try? FileManager.default.createSymbolicLink(
+            at: targetDirectory,
+            withDestinationURL: outsideDirectory
+        )
     }
 }
 

@@ -256,6 +256,27 @@ struct VerifiedGitBlobCodeMapLocatorAssociation: @unchecked Sendable, Equatable 
             outcome: casHandle.outcome
         )
     }
+
+    /// Reconstitutes the proof carried by a securely decoded locator or current-authority manifest.
+    /// The persistence layer already admitted the identity/key association; the verified CAS handle
+    /// supplies the exact current outcome. This path intentionally avoids source materialization.
+    static func revalidatePersisted(
+        identity: GitBlobCodeMapLocatorIdentity,
+        artifactKey: CodeMapArtifactKey,
+        casHandle: CodeMapArtifactHandle
+    ) throws -> Self {
+        guard identity.pipelineIdentity == artifactKey.pipelineIdentity else {
+            throw VerifiedGitBlobCodeMapLocatorAssociationError.pipelineMismatch
+        }
+        guard casHandle.key == artifactKey else {
+            throw VerifiedGitBlobCodeMapLocatorAssociationError.casHandleMismatch
+        }
+        return Self(
+            identity: identity,
+            artifactKey: artifactKey,
+            outcome: casHandle.outcome
+        )
+    }
 }
 
 private extension GitObjectFormat {

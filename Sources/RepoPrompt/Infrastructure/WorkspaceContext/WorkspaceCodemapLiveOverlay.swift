@@ -12,6 +12,7 @@ actor WorkspaceCodemapLiveOverlay {
         let binding: WorkspaceCodemapArtifactBinding
         let leaseOwner: WorkspaceCodemapSharedArtifactLease
         let source: WorkspaceCodemapLiveOverlaySource
+        let completionTicket: WorkspaceCodemapLiveDemandTicket?
         var accessOrdinal: UInt64
 
         var completion: WorkspaceCodemapArtifactCompletion {
@@ -65,6 +66,7 @@ actor WorkspaceCodemapLiveOverlay {
         var manifest: CodeMapRootManifestSnapshot?
         var manifestInvalidationGeneration: UInt64
         var manifestAdoptedInvalidationGeneration: UInt64?
+        var manifestAdoptionOperationID: UUID?
         var cleanByRelativePath: [String: StoredReady]
         var liveByFileID: [UUID: LiveEntry]
         var liveFileIDByRelativePath: [String: UUID]
@@ -87,10 +89,21 @@ actor WorkspaceCodemapLiveOverlay {
         let fileID: UUID?
     }
 
+    private struct DemandPreflight {
+        let ticket: WorkspaceCodemapLiveDemandPreflightTicket
+        let identity: WorkspaceCodemapArtifactBindingIdentity
+        let requestGeneration: UInt64
+        let catalogGeneration: UInt64
+    }
+
     private let policy: WorkspaceCodemapLiveOverlayPolicy
     private let manifestRecordEqualityTraversal: @Sendable () -> Void
+    private let manifestAdoptionCommitHook: @Sendable () async -> Void
+    private let initialManifestInvalidationGeneration: UInt64
+    private let initialContributionGeneration: UInt64
     private var roots: [WorkspaceCodemapRootEpoch: RootState] = [:]
     private var admissionReservations: [WorkspaceCodemapLiveDemandReservation] = []
+    private var demandPreflights: [UUID: DemandPreflight] = [:]
     private var activeAdmissionReservationID: UUID?
     private var nextAccessOrdinal: UInt64
     private var evictionCount: UInt64
@@ -101,10 +114,16 @@ actor WorkspaceCodemapLiveOverlay {
         policy: WorkspaceCodemapLiveOverlayPolicy = .default,
         initialAccessOrdinal: UInt64 = 1,
         initialCounterValue: UInt64 = 0,
-        manifestRecordEqualityTraversal: @escaping @Sendable () -> Void = {}
+        initialManifestInvalidationGeneration: UInt64 = 1,
+        initialContributionGeneration: UInt64 = 1,
+        manifestRecordEqualityTraversal: @escaping @Sendable () -> Void = {},
+        manifestAdoptionCommitHook: @escaping @Sendable () async -> Void = {}
     ) {
         self.policy = policy
         self.manifestRecordEqualityTraversal = manifestRecordEqualityTraversal
+        self.manifestAdoptionCommitHook = manifestAdoptionCommitHook
+        self.initialManifestInvalidationGeneration = initialManifestInvalidationGeneration
+        self.initialContributionGeneration = initialContributionGeneration
         nextAccessOrdinal = initialAccessOrdinal
         evictionCount = initialCounterValue
         busyDropCount = initialCounterValue
@@ -165,13 +184,14 @@ actor WorkspaceCodemapLiveOverlay {
             registration: registration,
             authorityIsCurrent: true,
             manifest: nil,
-            manifestInvalidationGeneration: 1,
+            manifestInvalidationGeneration: initialManifestInvalidationGeneration,
             manifestAdoptedInvalidationGeneration: nil,
+            manifestAdoptionOperationID: nil,
             cleanByRelativePath: [:],
             liveByFileID: [:],
             liveFileIDByRelativePath: [:],
             shadows: [:],
-            contributionGeneration: .init(rawValue: 1)
+            contributionGeneration: .init(rawValue: initialContributionGeneration)
         )
         return .registered
     }
@@ -188,6 +208,7 @@ actor WorkspaceCodemapLiveOverlay {
     ) -> WorkspaceCodemapLiveManifestAdoptionTicket? {
         guard let root = roots[rootEpoch], root.authorityIsCurrent else { return nil }
         return WorkspaceCodemapLiveManifestAdoptionTicket(
+            operationID: UUID(),
             rootEpoch: rootEpoch,
             catalogGeneration: root.registration.catalogGeneration,
             repositoryAuthority: root.registration.capability.repositoryAuthority,
@@ -195,11 +216,20 @@ actor WorkspaceCodemapLiveOverlay {
         )
     }
 
+    func isManifestAdoptionTicketCurrent(
+        _ ticket: WorkspaceCodemapLiveManifestAdoptionTicket
+    ) -> Bool {
+        guard let root = roots[ticket.rootEpoch], root.authorityIsCurrent else { return false }
+        return ticket.catalogGeneration == root.registration.catalogGeneration &&
+            ticket.repositoryAuthority == root.registration.capability.repositoryAuthority &&
+            ticket.invalidationGeneration == root.manifestInvalidationGeneration
+    }
+
     func adoptManifest(
         ticket: WorkspaceCodemapLiveManifestAdoptionTicket,
         snapshot: CodeMapRootManifestSnapshot,
         readyEntries: [WorkspaceCodemapLiveManifestAdoptionEntry]
-    ) -> WorkspaceCodemapLiveManifestAdoptionDisposition {
+    ) async -> WorkspaceCodemapLiveManifestAdoptionDisposition {
         let rootEpoch = ticket.rootEpoch
         guard var root = roots[rootEpoch] else {
             return .rejected(.rootNotRegistered)
@@ -233,34 +263,42 @@ actor WorkspaceCodemapLiveOverlay {
         }
 
         let usage = usage(excludingCleanEntriesFor: rootEpoch)
-        let projectedRootEntryCount = addingSaturating(readyEntries.count, root.liveByFileID.count)
-        let projectedProcessEntryCount = addingSaturating(
+        guard let projectedRootEntryCount = addingChecked(
+            readyEntries.count,
+            root.liveByFileID.count
+        ), let projectedProcessEntryCount = addingChecked(
             subtractingFloor(usage.entryCount, root.shadows.count),
             readyEntries.count
-        )
-        guard projectedRootEntryCount <= policy.maximumEntryCountPerRoot,
-              projectedProcessEntryCount <= policy.maximumEntryCount
+        ), projectedRootEntryCount <= policy.maximumEntryCountPerRoot,
+        projectedProcessEntryCount <= policy.maximumEntryCount
         else {
             recordBusyDrop()
             return .busy(.entryLimit)
         }
-        guard addingSaturating(readyEntries.count, liveLeaseCount(root)) <=
-            policy.maximumLeaseCountPerRoot,
-            addingSaturating(usage.leaseCount, readyEntries.count) <= policy.maximumLeaseCount
+        guard let projectedRootLeaseCount = addingChecked(
+            readyEntries.count,
+            liveLeaseCount(root)
+        ), let projectedProcessLeaseCount = addingChecked(usage.leaseCount, readyEntries.count),
+        projectedRootLeaseCount <= policy.maximumLeaseCountPerRoot,
+        projectedProcessLeaseCount <= policy.maximumLeaseCount
         else {
             recordBusyDrop()
             return .busy(.leaseLimit)
         }
         var byteCount: UInt64 = 0
         for entry in readyEntries {
-            byteCount = addingSaturating(byteCount, entry.lease.handle.estimatedResidentByteCount)
-            guard addingSaturating(liveArtifactBytes(root), byteCount) <=
-                policy.maximumArtifactByteCountPerRoot,
-                addingSaturating(usage.artifactByteCount, byteCount) <= policy.maximumArtifactByteCount
+            guard let nextByteCount = addingChecked(
+                byteCount,
+                entry.lease.handle.estimatedResidentByteCount
+            ), let projectedRootBytes = addingChecked(liveArtifactBytes(root), nextByteCount),
+            let projectedProcessBytes = addingChecked(usage.artifactByteCount, nextByteCount),
+            projectedRootBytes <= policy.maximumArtifactByteCountPerRoot,
+            projectedProcessBytes <= policy.maximumArtifactByteCount
             else {
                 recordBusyDrop()
                 return .busy(.artifactByteLimit)
             }
+            byteCount = nextByteCount
         }
 
         if let currentManifest = root.manifest,
@@ -325,24 +363,139 @@ actor WorkspaceCodemapLiveOverlay {
         ensureAccessOrdinalCapacity(requiredCount: validatedEntries.count)
         root.manifest = snapshot
         root.manifestAdoptedInvalidationGeneration = root.manifestInvalidationGeneration
+        root.manifestAdoptionOperationID = ticket.operationID
         root.cleanByRelativePath = Dictionary(uniqueKeysWithValues: validatedEntries.map { relativePath, entry in
             (relativePath, StoredReady(
                 binding: entry.binding,
                 leaseOwner: WorkspaceCodemapSharedArtifactLease(entry.lease),
                 source: .cleanManifest,
+                completionTicket: nil,
                 accessOrdinal: takeAccessOrdinal()
             ))
         })
         root.shadows.removeAll()
-        advanceContributionGeneration(&root)
+        advanceContributionGeneration(&root, rootEpoch: rootEpoch)
         roots[rootEpoch] = root
+        await manifestAdoptionCommitHook()
         return .adopted(readyEntryCount: validatedEntries.count)
+    }
+
+    @discardableResult
+    func rollbackManifestAdoption(
+        ticket: WorkspaceCodemapLiveManifestAdoptionTicket,
+        manifestGeneration: UInt64
+    ) -> Bool {
+        guard var root = roots[ticket.rootEpoch],
+              root.authorityIsCurrent,
+              ticket.catalogGeneration == root.registration.catalogGeneration,
+              ticket.repositoryAuthority == root.registration.capability.repositoryAuthority,
+              ticket.invalidationGeneration == root.manifestInvalidationGeneration,
+              root.manifestAdoptedInvalidationGeneration == ticket.invalidationGeneration,
+              root.manifestAdoptionOperationID == ticket.operationID,
+              root.manifest?.manifestGeneration == manifestGeneration
+        else { return false }
+        root.manifest = nil
+        root.manifestAdoptedInvalidationGeneration = nil
+        root.manifestAdoptionOperationID = nil
+        root.cleanByRelativePath.removeAll()
+        advanceManifestInvalidationGeneration(&root, rootEpoch: ticket.rootEpoch)
+        if root.authorityIsCurrent {
+            advanceContributionGeneration(&root, rootEpoch: ticket.rootEpoch)
+        }
+        roots[ticket.rootEpoch] = root
+        return true
+    }
+
+    func preflightDemand(
+        owner: WorkspaceCodemapLiveDemandOwner,
+        identity: WorkspaceCodemapArtifactBindingIdentity,
+        requestGeneration: UInt64,
+        catalogGeneration: UInt64
+    ) -> WorkspaceCodemapLiveDemandPreflightDisposition {
+        let rootEpoch = WorkspaceCodemapRootEpoch(
+            rootID: identity.rootID,
+            rootLifetimeID: identity.rootLifetimeID
+        )
+        guard let root = roots[rootEpoch] else {
+            return .rejected(.rootNotRegistered)
+        }
+        guard root.authorityIsCurrent else {
+            return .rejected(.rootAuthorityInvalid)
+        }
+        guard catalogGeneration == root.registration.catalogGeneration else {
+            return .rejected(.catalogGenerationMismatch)
+        }
+        guard requestGeneration > 0,
+              validatedRelativePath(identity.standardizedRelativePath) != nil
+        else {
+            return .rejected(.invalidToken)
+        }
+        if let existing = root.liveByFileID[identity.fileID],
+           existing.identity == identity,
+           existing.requestGeneration == requestGeneration,
+           case let .ready(ready) = existing
+        {
+            return .ready(readySnapshot(rootEpoch: rootEpoch, ready: ready))
+        }
+        let rootPreflightCount = demandPreflights.values.count(where: {
+            $0.ticket.rootEpoch == rootEpoch
+        })
+        let currentUsage = usage()
+        guard admissionReservations.count + demandPreflights.count <
+            policy.maximumAdmissionReservationCount,
+            admissionReservationCount(rootEpoch: rootEpoch) <
+            policy.maximumAdmissionReservationCountPerRoot,
+            addingSaturating(currentUsage.entryCount, demandPreflights.count + 1) <=
+            policy.maximumEntryCount,
+            addingSaturating(entryCount(root), rootPreflightCount + 1) <=
+            policy.maximumEntryCountPerRoot,
+            addingSaturating(currentUsage.waiterCount, demandPreflights.count + 1) <=
+            policy.maximumWaiterCount,
+            addingSaturating(rootWaiterCount(root), rootPreflightCount + 1) <=
+            policy.maximumWaiterCountPerRoot
+        else {
+            recordBusyDrop()
+            return .busy(.admissionQueueLimit)
+        }
+        let ticket = WorkspaceCodemapLiveDemandPreflightTicket(
+            rootEpoch: rootEpoch,
+            owner: owner,
+            reservationID: UUID()
+        )
+        demandPreflights[ticket.reservationID] = DemandPreflight(
+            ticket: ticket,
+            identity: identity,
+            requestGeneration: requestGeneration,
+            catalogGeneration: catalogGeneration
+        )
+        return .reserved(ticket)
+    }
+
+    @discardableResult
+    func cancelDemandPreflight(_ ticket: WorkspaceCodemapLiveDemandPreflightTicket) -> Bool {
+        guard let current = demandPreflights[ticket.reservationID], current.ticket == ticket else {
+            return false
+        }
+        demandPreflights.removeValue(forKey: ticket.reservationID)
+        return true
     }
 
     func beginDemand(
         owner: WorkspaceCodemapLiveDemandOwner,
-        token: WorkspaceCodemapArtifactRequestToken
+        token: WorkspaceCodemapArtifactRequestToken,
+        preflight: WorkspaceCodemapLiveDemandPreflightTicket? = nil
     ) -> WorkspaceCodemapLiveDemandDisposition {
+        if let preflight {
+            guard let reservation = demandPreflights.removeValue(forKey: preflight.reservationID),
+                  reservation.ticket == preflight,
+                  reservation.ticket.owner == owner,
+                  reservation.identity == token.identity,
+                  reservation.requestGeneration == token.requestGeneration,
+                  reservation.catalogGeneration == token.catalogGeneration
+            else {
+                return .rejected(.admissionReservationInvalid)
+            }
+        }
         ensureAccessOrdinalCapacity(requiredCount: 1)
         let rootEpoch = WorkspaceCodemapRootEpoch(
             rootID: token.identity.rootID,
@@ -439,12 +592,21 @@ actor WorkspaceCodemapLiveOverlay {
             return partial + pending.owners.count
         }
         let removesShadow = root.shadows[relativePath] != nil
+        let rootPreflightCount = demandPreflights.values.count(where: {
+            $0.ticket.rootEpoch == rootEpoch
+        })
         let rootProjectedWaiters = addingSaturating(
-            subtractingFloor(rootWaiterCount(root), removedWaiters),
+            addingSaturating(
+                subtractingFloor(rootWaiterCount(root), removedWaiters),
+                rootPreflightCount
+            ),
             1
         )
         let processProjectedWaiters = addingSaturating(
-            subtractingFloor(usage().waiterCount, removedWaiters),
+            addingSaturating(
+                subtractingFloor(usage().waiterCount, removedWaiters),
+                demandPreflights.count
+            ),
             1
         )
         guard rootProjectedWaiters <= policy.maximumWaiterCountPerRoot,
@@ -460,16 +622,22 @@ actor WorkspaceCodemapLiveOverlay {
             let shadowEntries = removesShadow && currentRoot.shadows[relativePath] != nil ? 1 : 0
             return (
                 addingSaturating(
-                    subtractingFloor(
-                        subtractingFloor(entryCount(currentRoot), removedEntries),
-                        shadowEntries
+                    addingSaturating(
+                        subtractingFloor(
+                            subtractingFloor(entryCount(currentRoot), removedEntries),
+                            shadowEntries
+                        ),
+                        rootPreflightCount
                     ),
                     1
                 ),
                 addingSaturating(
-                    subtractingFloor(
-                        subtractingFloor(usage().entryCount, removedEntries),
-                        shadowEntries
+                    addingSaturating(
+                        subtractingFloor(
+                            subtractingFloor(usage().entryCount, removedEntries),
+                            shadowEntries
+                        ),
+                        demandPreflights.count
                     ),
                     1
                 )
@@ -499,7 +667,7 @@ actor WorkspaceCodemapLiveOverlay {
             removeLiveEntry(fileID: fileID, from: &root)
         }
         root.shadows.removeValue(forKey: relativePath)
-        advanceContributionGeneration(&root)
+        advanceContributionGeneration(&root, rootEpoch: rootEpoch)
         let ticket = WorkspaceCodemapLiveDemandTicket(
             token: token,
             contributionGeneration: root.contributionGeneration,
@@ -573,8 +741,8 @@ actor WorkspaceCodemapLiveOverlay {
             let path = pending.binding.identity.standardizedRelativePath
             removeLiveEntry(fileID: pending.binding.identity.fileID, from: &root)
             root.shadows[path] = Shadow(reason: .modified, accessOrdinal: takeAccessOrdinal())
-            advanceManifestInvalidationGeneration(&root)
-            advanceContributionGeneration(&root)
+            advanceManifestInvalidationGeneration(&root, rootEpoch: rootEpoch)
+            advanceContributionGeneration(&root, rootEpoch: rootEpoch)
         } else {
             root.liveByFileID[ticket.token.identity.fileID] = .pending(pending)
         }
@@ -587,9 +755,15 @@ actor WorkspaceCodemapLiveOverlay {
         ensureAccessOrdinalCapacity(requiredCount: usage().entryCount)
         let reservationCountBefore = admissionReservations.count
         admissionReservations.removeAll { $0.owner == owner }
+        let preflightCountBefore = demandPreflights.count
+        demandPreflights = demandPreflights.filter { $0.value.ticket.owner != owner }
         var cancellationCount = subtractingFloor(
             reservationCountBefore,
             admissionReservations.count
+        )
+        cancellationCount = addingSaturating(
+            cancellationCount,
+            subtractingFloor(preflightCountBefore, demandPreflights.count)
         )
         let orderedRootEpochs = roots.keys.sorted(by: rootEpochPrecedes)
         for rootEpoch in orderedRootEpochs {
@@ -606,13 +780,13 @@ actor WorkspaceCodemapLiveOverlay {
                     let path = pending.binding.identity.standardizedRelativePath
                     removeLiveEntry(fileID: fileID, from: &root)
                     root.shadows[path] = Shadow(reason: .modified, accessOrdinal: takeAccessOrdinal())
-                    advanceManifestInvalidationGeneration(&root)
+                    advanceManifestInvalidationGeneration(&root, rootEpoch: rootEpoch)
                 } else {
                     root.liveByFileID[fileID] = .pending(pending)
                 }
             }
             if changed {
-                advanceContributionGeneration(&root)
+                advanceContributionGeneration(&root, rootEpoch: rootEpoch)
                 roots[rootEpoch] = root
             }
         }
@@ -623,7 +797,7 @@ actor WorkspaceCodemapLiveOverlay {
         ticket: WorkspaceCodemapLiveDemandTicket,
         completion: WorkspaceCodemapArtifactCompletion,
         lease: CodeMapArtifactLease
-    ) -> WorkspaceCodemapLiveCompletionDisposition {
+    ) async -> WorkspaceCodemapLiveCompletionDisposition {
         ensureAccessOrdinalCapacity(requiredCount: 1)
         let rootEpoch = WorkspaceCodemapRootEpoch(
             rootID: ticket.token.identity.rootID,
@@ -649,12 +823,14 @@ actor WorkspaceCodemapLiveOverlay {
         }
         guard case let .pending(pending) = root.liveByFileID[ticket.token.identity.fileID] else {
             if case var .ready(ready)? = root.liveByFileID[ticket.token.identity.fileID],
+               ready.completionTicket == ticket,
                ready.completion == completion,
                artifactMatches(lease.handle, completion: completion)
             {
                 ready.accessOrdinal = takeAccessOrdinal()
                 root.liveByFileID[ticket.token.identity.fileID] = .ready(ready)
                 roots[rootEpoch] = root
+                await lease.close()
                 return .exactDuplicate(readySnapshot(rootEpoch: rootEpoch, ready: ready))
             }
             recordStaleCompletionDrop()
@@ -734,10 +910,11 @@ actor WorkspaceCodemapLiveOverlay {
             binding: candidateBinding,
             leaseOwner: WorkspaceCodemapSharedArtifactLease(lease),
             source: .live,
+            completionTicket: ticket,
             accessOrdinal: takeAccessOrdinal()
         )
         root.liveByFileID[ticket.token.identity.fileID] = .ready(ready)
-        advanceContributionGeneration(&root)
+        advanceContributionGeneration(&root, rootEpoch: rootEpoch)
         roots[rootEpoch] = root
         return .accepted(readySnapshot(rootEpoch: rootEpoch, ready: ready))
     }
@@ -797,7 +974,7 @@ actor WorkspaceCodemapLiveOverlay {
             accessOrdinal: takeAccessOrdinal()
         )
         root.liveFileIDByRelativePath[identity.standardizedRelativePath] = identity.fileID
-        advanceContributionGeneration(&root)
+        advanceContributionGeneration(&root, rootEpoch: rootEpoch)
         roots[rootEpoch] = root
         return .accepted
     }
@@ -832,8 +1009,8 @@ actor WorkspaceCodemapLiveOverlay {
             }
         }
         if observedValidPath {
-            advanceManifestInvalidationGeneration(&root)
-            advanceContributionGeneration(&root)
+            advanceManifestInvalidationGeneration(&root, rootEpoch: rootEpoch)
+            advanceContributionGeneration(&root, rootEpoch: rootEpoch)
         }
         roots[rootEpoch] = root
         return invalidated
@@ -850,14 +1027,15 @@ actor WorkspaceCodemapLiveOverlay {
         else { return false }
         root.authorityIsCurrent = false
         removeAdmissionReservations(rootEpoch: rootEpoch)
-        advanceManifestInvalidationGeneration(&root)
+        advanceManifestInvalidationGeneration(&root, rootEpoch: rootEpoch)
         root.manifest = nil
         root.manifestAdoptedInvalidationGeneration = nil
+        root.manifestAdoptionOperationID = nil
         root.cleanByRelativePath.removeAll()
         root.liveByFileID.removeAll()
         root.liveFileIDByRelativePath.removeAll()
         root.shadows.removeAll()
-        advanceContributionGeneration(&root)
+        advanceContributionGeneration(&root, rootEpoch: rootEpoch)
         roots[rootEpoch] = root
         return true
     }
@@ -946,7 +1124,10 @@ actor WorkspaceCodemapLiveOverlay {
             waiterCount: perRoot.reduce(0) { addingSaturating($0, $1.waiterCount) },
             leaseCount: perRoot.reduce(0) { addingSaturating($0, $1.leaseCount) },
             artifactByteCount: perRoot.reduce(0) { addingSaturating($0, $1.artifactByteCount) },
-            admissionReservationCount: admissionReservations.count,
+            admissionReservationCount: addingSaturating(
+                admissionReservations.count,
+                demandPreflights.count
+            ),
             evictionCount: evictionCount,
             busyDropCount: busyDropCount,
             staleCompletionDropCount: staleCompletionDropCount,
@@ -1132,11 +1313,15 @@ actor WorkspaceCodemapLiveOverlay {
     }
 
     private func admissionReservationCount(rootEpoch: WorkspaceCodemapRootEpoch) -> Int {
-        admissionReservations.reduce(0) {
+        let queued = admissionReservations.reduce(0) {
             let matches = $1.token.identity.rootID == rootEpoch.rootID &&
                 $1.token.identity.rootLifetimeID == rootEpoch.rootLifetimeID
             return addingSaturating($0, matches ? 1 : 0)
         }
+        let preflights = demandPreflights.values.reduce(0) {
+            addingSaturating($0, $1.ticket.rootEpoch == rootEpoch ? 1 : 0)
+        }
+        return addingSaturating(queued, preflights)
     }
 
     private func entryCount(_ root: RootState) -> Int {
@@ -1273,25 +1458,44 @@ actor WorkspaceCodemapLiveOverlay {
             root.cleanByRelativePath.removeValue(forKey: candidate.relativePath)
         }
         if candidate.isNegative {
-            advanceManifestInvalidationGeneration(&root)
+            advanceManifestInvalidationGeneration(&root, rootEpoch: candidate.rootEpoch)
         }
-        advanceContributionGeneration(&root)
+        advanceContributionGeneration(&root, rootEpoch: candidate.rootEpoch)
         roots[candidate.rootEpoch] = root
         evictionCount = addingSaturating(evictionCount, 1)
         return true
     }
 
-    private func advanceContributionGeneration(_ root: inout RootState) {
-        root.contributionGeneration = .init(
-            rawValue: addingSaturating(root.contributionGeneration.rawValue, 1)
-        )
+    private func advanceContributionGeneration(
+        _ root: inout RootState,
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) {
+        let (next, overflow) = root.contributionGeneration.rawValue.addingReportingOverflow(1)
+        guard !overflow else {
+            failClosedGenerationExhaustion(&root, rootEpoch: rootEpoch)
+            return
+        }
+        root.contributionGeneration = .init(rawValue: next)
     }
 
-    private func advanceManifestInvalidationGeneration(_ root: inout RootState) {
-        root.manifestInvalidationGeneration = addingSaturating(
-            root.manifestInvalidationGeneration,
-            1
-        )
+    private func advanceManifestInvalidationGeneration(
+        _ root: inout RootState,
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) {
+        let (next, overflow) = root.manifestInvalidationGeneration.addingReportingOverflow(1)
+        guard !overflow else {
+            failClosedGenerationExhaustion(&root, rootEpoch: rootEpoch)
+            return
+        }
+        root.manifestInvalidationGeneration = next
+    }
+
+    private func failClosedGenerationExhaustion(
+        _ root: inout RootState,
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) {
+        root.authorityIsCurrent = false
+        removeAdmissionReservations(rootEpoch: rootEpoch)
     }
 
     private func rootEpochPrecedes(
@@ -1437,8 +1641,13 @@ actor WorkspaceCodemapLiveOverlay {
             )
             return addingSaturating($0, candidateRoot == rootEpoch ? 1 : 0)
         }
-        guard rootCount < policy.maximumAdmissionReservationCountPerRoot,
-              admissionReservations.count < policy.maximumAdmissionReservationCount
+        let preflightRootCount = demandPreflights.values.count(where: {
+            $0.ticket.rootEpoch == rootEpoch
+        })
+        guard addingSaturating(rootCount, preflightRootCount) <
+            policy.maximumAdmissionReservationCountPerRoot,
+            addingSaturating(admissionReservations.count, demandPreflights.count) <
+            policy.maximumAdmissionReservationCount
         else {
             recordBusyDrop()
             return .busy(.admissionQueueLimit)
@@ -1457,6 +1666,7 @@ actor WorkspaceCodemapLiveOverlay {
             $0.token.identity.rootID == rootEpoch.rootID &&
                 $0.token.identity.rootLifetimeID == rootEpoch.rootLifetimeID
         }
+        demandPreflights = demandPreflights.filter { $0.value.ticket.rootEpoch != rootEpoch }
     }
 
     private func resolvedCompletion(
@@ -1486,7 +1696,7 @@ actor WorkspaceCodemapLiveOverlay {
             reason: .terminalArtifact(outcome),
             accessOrdinal: takeAccessOrdinal()
         )
-        advanceContributionGeneration(&root)
+        advanceContributionGeneration(&root, rootEpoch: rootEpoch)
         roots[rootEpoch] = root
         lease.closeSynchronously()
         return .acceptedUnavailable(outcome)
@@ -1517,8 +1727,7 @@ actor WorkspaceCodemapLiveOverlay {
 
         func charge(_ byteCount: Int) -> Bool {
             guard let bytes = UInt64(exactly: byteCount) else { return false }
-            let next = addingSaturating(total, bytes)
-            guard next <= limit else { return false }
+            guard let next = addingChecked(total, bytes), next <= limit else { return false }
             total = next
             return true
         }
@@ -1586,6 +1795,16 @@ actor WorkspaceCodemapLiveOverlay {
         let components = path.split(separator: "/", omittingEmptySubsequences: false)
         guard components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else { return nil }
         return components.joined(separator: "/")
+    }
+
+    private func addingChecked(_ lhs: Int, _ rhs: Int) -> Int? {
+        let (value, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? nil : value
+    }
+
+    private func addingChecked(_ lhs: UInt64, _ rhs: UInt64) -> UInt64? {
+        let (value, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? nil : value
     }
 
     private func addingSaturating(_ lhs: Int, _ rhs: Int) -> Int {

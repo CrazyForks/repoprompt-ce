@@ -838,7 +838,6 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         XCTAssertEqual(accounting.counters.locatorCorruptResults, 2)
         XCTAssertEqual(accounting.counters.misses, 1)
         XCTAssertEqual(accounting.counters.locatorInserted, 1)
-        XCTAssertEqual(accounting.counters.locatorSkippedCorrupt, 0)
     }
 
     func testArtifactStoreAloneOwnsResidentEvictionAndExplicitLeaseSurvivesEviction() async throws {
@@ -1362,6 +1361,53 @@ final class CodeMapArtifactBuildCoordinatorTests: XCTestCase {
         XCTAssertEqual(accounting.counters.failures, 1)
         XCTAssertEqual(accounting.counters.readyResults, 1)
         XCTAssertEqual(accounting.retainedInputByteCount, 0)
+    }
+
+    func testCancellationDuringLocatorReadIsCountedExactlyOnceWithoutDownstreamWork() async throws {
+        let fixture = try makeFixture()
+        defer { fixture.remove() }
+        let input = try makeInput("locator-cancellation-telemetry", root: fixture.root, withLocator: true)
+        let gate = CoordinatorTestGate()
+        let buildCount = CoordinatorTestRecorder()
+        let locatorClient = GitBlobCodeMapLocatorStoreClient(
+            read: { identity in
+                await gate.enter()
+                try Task.checkCancellation()
+                return try await fixture.locatorStore.read(identity: identity)
+            },
+            write: { try await fixture.locatorStore.write(association: $0) }
+        )
+        let coordinator = CodeMapArtifactBuildCoordinator(
+            artifactStore: CodeMapArtifactStoreClient(store: fixture.artifactStore),
+            locatorStore: locatorClient,
+            builder: CodeMapArtifactBuilderClient(build: { _, _, _ in
+                await buildCount.record("build")
+                return .readyNoSymbols
+            })
+        )
+
+        let task = Task { try await coordinator.resolve(request(input)) }
+        await gate.waitUntilEntered()
+        task.cancel()
+        await gate.release()
+        do {
+            _ = try await task.value
+            XCTFail("Expected caller cancellation.")
+        } catch is CancellationError {
+            // Expected.
+        }
+
+        let accounting = await coordinator.accounting()
+        XCTAssertEqual(accounting.counters.requests, 1)
+        XCTAssertEqual(accounting.counters.waiterCancellations, 1)
+        XCTAssertEqual(accounting.counters.lastWaiterCancellations, 0)
+        XCTAssertEqual(accounting.counters.sharedTaskCancellations, 0)
+        XCTAssertEqual(accounting.activeFlightCount, 0)
+        XCTAssertEqual(accounting.queuedBuildCount, 0)
+        XCTAssertEqual(accounting.waiterCount, 0)
+        XCTAssertEqual(accounting.retainedInputByteCount, 0)
+        let observedBuildCount = await buildCount.count
+        XCTAssertEqual(observedBuildCount, 0)
     }
 
     func testLocatorInputRequiresExactCleanGitBlobProvenanceForSHA1AndSHA256() async throws {

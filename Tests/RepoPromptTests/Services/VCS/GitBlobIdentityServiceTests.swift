@@ -357,6 +357,40 @@ final class GitBlobIdentityServiceTests: XCTestCase {
         XCTAssertEqual(component.outcome, .securityExcluded(.symlinkPathComponent))
     }
 
+    func testParentSymlinkSwapDuringDescriptorTraversalFailsClosedWithoutEscapingRoot() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: #function)
+        let repository = try fixture.makeRepository(
+            named: "repo",
+            files: ["Sources/Parent/Race.swift": "let inside = true\n"]
+        )
+        let outside = fixture.sandbox.appendingPathComponent("outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try "let outside = true\n".write(
+            to: outside.appendingPathComponent("Race.swift"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let swap = GitBlobParentSymlinkSwap(
+            root: repository,
+            relativeDirectory: "Sources/Parent",
+            outsideDirectory: outside
+        )
+        let service = GitBlobIdentityService(hooks: GitBlobIdentityServiceHooks(
+            afterGitCollection: {},
+            afterPathSecurityComponentOpen: { swap.swapIfNeeded(openedPath: $0) }
+        ))
+
+        let batch = await service.classify(
+            workspaceRoot: repository,
+            relativePaths: ["Sources/Parent/Race.swift"]
+        )
+        XCTAssertTrue(batch.retriedAfterInstability)
+        XCTAssertEqual(
+            batch.classifications.first?.outcome,
+            .securityExcluded(.symlinkPathComponent)
+        )
+    }
+
     func testIndexAndWorktreeRacesRetryThenSuppressEligibility() async throws {
         let fixture = try ReviewGitRepositoryFixture(name: #function)
         let repository = try fixture.makeRepository(named: "repo")
@@ -609,8 +643,26 @@ final class GitBlobIdentityServiceTests: XCTestCase {
         try fixture.write("let value = 1\n", to: "File.swift", at: root)
 
         let service = GitBlobIdentityService(gitService: GitService(gitExecutableURL: executable))
-        let batch = await service.classify(workspaceRoot: root, relativePaths: ["File.swift"])
+        var batch = await service.classify(workspaceRoot: root, relativePaths: ["File.swift"])
         XCTAssertEqual(batch.classifications.first?.outcome, .unsupported(.unsupportedGit))
+
+        let invalidFormatExecutable = fixture.sandbox.appendingPathComponent("invalid-format-git")
+        let invalidFormatScript = """
+        #!/bin/sh
+        if [ "$1" = "rev-parse" ] && [ "$2" = "--show-toplevel" ]; then pwd; exit 0; fi
+        if [ "$1" = "rev-parse" ] && [ "$2" = "--show-object-format" ]; then printf 'sha512\\n'; exit 0; fi
+        exit 1
+        """
+        try invalidFormatScript.write(to: invalidFormatExecutable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: invalidFormatExecutable.path
+        )
+        let invalidFormatService = GitBlobIdentityService(
+            gitService: GitService(gitExecutableURL: invalidFormatExecutable)
+        )
+        batch = await invalidFormatService.classify(workspaceRoot: root, relativePaths: ["File.swift"])
+        XCTAssertEqual(batch.classifications.first?.outcome, .unsupported(.invalidObjectFormat))
     }
 
     func testGitObjectFormatRejectsUppercaseWhitespaceAndNUL() {
@@ -677,6 +729,31 @@ final class GitBlobIdentityServiceTests: XCTestCase {
             file: file,
             line: line
         )
+    }
+}
+
+private final class GitBlobParentSymlinkSwap: @unchecked Sendable {
+    private let lock = NSLock()
+    private let directory: URL
+    private let backup: URL
+    private let outsideDirectory: URL
+    private let relativeDirectory: String
+    private var didSwap = false
+
+    init(root: URL, relativeDirectory: String, outsideDirectory: URL) {
+        directory = root.appendingPathComponent(relativeDirectory)
+        backup = root.appendingPathComponent(relativeDirectory + "-original")
+        self.outsideDirectory = outsideDirectory
+        self.relativeDirectory = relativeDirectory
+    }
+
+    func swapIfNeeded(openedPath: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !didSwap, openedPath == relativeDirectory else { return }
+        didSwap = true
+        try? FileManager.default.moveItem(at: directory, to: backup)
+        try? FileManager.default.createSymbolicLink(at: directory, withDestinationURL: outsideDirectory)
     }
 }
 

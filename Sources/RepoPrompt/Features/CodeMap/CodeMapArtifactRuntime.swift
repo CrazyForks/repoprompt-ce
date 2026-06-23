@@ -10,6 +10,7 @@ final class CodeMapArtifactRuntime: @unchecked Sendable {
     let locatorStore: GitBlobCodeMapLocatorStore
     let manifestStore: CodeMapRootManifestStore
     let coordinator: CodeMapArtifactBuildCoordinator
+    private let bindingEngineProvider: WorkspaceCodemapBindingEngineProvider
 
     init(
         rootURL: URL,
@@ -23,7 +24,9 @@ final class CodeMapArtifactRuntime: @unchecked Sendable {
         builder: CodeMapArtifactBuilderClient = CodeMapArtifactBuilderClient(),
         coordinatorPolicy: CodeMapArtifactBuildCoordinatorPolicy = .default,
         coordinatorClock: CodeMapArtifactBuildCoordinatorClock = .continuous,
-        coordinatorHooks: CodeMapArtifactBuildCoordinatorHooks = .none
+        coordinatorHooks: CodeMapArtifactBuildCoordinatorHooks = .none,
+        bindingEngineFactory: @escaping WorkspaceCodemapBindingEngineProvider.Factory =
+            WorkspaceCodemapBindingEngineProvider.unconfiguredFactory
     ) throws {
         let artifactStore = try CodeMapArtifactStore(
             rootURL: rootURL,
@@ -54,6 +57,11 @@ final class CodeMapArtifactRuntime: @unchecked Sendable {
         self.locatorStore = locatorStore
         self.manifestStore = manifestStore
         self.coordinator = coordinator
+        bindingEngineProvider = WorkspaceCodemapBindingEngineProvider(factory: bindingEngineFactory)
+    }
+
+    func bindingEngine() throws -> WorkspaceCodemapBindingEngine {
+        try bindingEngineProvider.engine(for: self)
     }
 
     static func processWide() throws -> CodeMapArtifactRuntime {

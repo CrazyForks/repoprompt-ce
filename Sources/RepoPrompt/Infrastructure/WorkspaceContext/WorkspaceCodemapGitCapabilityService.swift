@@ -160,15 +160,18 @@ struct WorkspaceCodemapGitCapabilityServiceHooks {
     var beforeResolution: @Sendable () async -> Void
     var afterFirstAuthorityCapture: @Sendable () async -> Void
     var afterSourcePathFingerprintCapture: @Sendable () async -> Void
+    var afterAuthorityEvidenceOpen: @Sendable (URL) -> Void
 
     init(
         beforeResolution: @escaping @Sendable () async -> Void = {},
         afterFirstAuthorityCapture: @escaping @Sendable () async -> Void = {},
-        afterSourcePathFingerprintCapture: @escaping @Sendable () async -> Void = {}
+        afterSourcePathFingerprintCapture: @escaping @Sendable () async -> Void = {},
+        afterAuthorityEvidenceOpen: @escaping @Sendable (URL) -> Void = { _ in }
     ) {
         self.beforeResolution = beforeResolution
         self.afterFirstAuthorityCapture = afterFirstAuthorityCapture
         self.afterSourcePathFingerprintCapture = afterSourcePathFingerprintCapture
+        self.afterAuthorityEvidenceOpen = afterAuthorityEvidenceOpen
     }
 
     static let none = WorkspaceCodemapGitCapabilityServiceHooks()
@@ -181,6 +184,7 @@ actor WorkspaceCodemapGitCapabilityService {
             let historicalRecordCount: Int
             let activeFlightCount: Int
             let waiterCount: Int
+            let resolutionObserverCount: Int
         }
     #endif
 
@@ -252,6 +256,7 @@ actor WorkspaceCodemapGitCapabilityService {
     private let historicalRecordLimit: Int
     private var records: [WorkspaceCodemapRootEpoch: RootRecord] = [:]
     private var flights: [WorkspaceCodemapRootEpoch: RootFlight] = [:]
+    private var resolutionObservers: [UUID: Task<Void, Never>] = [:]
     private var rootEpochByWaiterID: [UUID: WorkspaceCodemapRootEpoch] = [:]
     private var historicalRecords: [WorkspaceCodemapRootEpoch: HistoricalRecord] = [:]
     private var releaseOrdinal: UInt64 = 0
@@ -341,13 +346,23 @@ actor WorkspaceCodemapGitCapabilityService {
         }
     }
 
+    func drain() async {
+        while !resolutionObservers.isEmpty {
+            let observers = Array(resolutionObservers.values)
+            for observer in observers {
+                await observer.value
+            }
+        }
+    }
+
     #if DEBUG
         func snapshotForTesting() -> Snapshot {
             Snapshot(
                 activeRecordCount: records.count,
                 historicalRecordCount: historicalRecords.count,
                 activeFlightCount: flights.count,
-                waiterCount: flights.values.reduce(0) { $0 + $1.waiters.count }
+                waiterCount: flights.values.reduce(0) { $0 + $1.waiters.count },
+                resolutionObserverCount: resolutionObservers.count
             )
         }
     #endif
@@ -411,14 +426,21 @@ actor WorkspaceCodemapGitCapabilityService {
             waiters: [waiterID: continuation]
         )
         rootEpochByWaiterID[waiterID] = request.rootEpoch
-        Task { [weak self] in
+        let observer = Task { [weak self] in
             let resolution = await task.value
-            await self?.complete(
+            guard let self else { return }
+            await complete(
                 rootEpoch: request.rootEpoch,
                 flightID: flightID,
                 resolution: resolution
             )
+            await finishResolutionObserver(flightID)
         }
+        resolutionObservers[flightID] = observer
+    }
+
+    private func finishResolutionObserver(_ flightID: UUID) {
+        resolutionObservers.removeValue(forKey: flightID)
     }
 
     private func cancelWaiter(id waiterID: UUID) {
@@ -603,7 +625,7 @@ actor WorkspaceCodemapGitCapabilityService {
                 prefix: capability.repositoryRelativeLoadedRootPrefix
             )
             guard preRepository.stableAuthority == stableAuthority else { return nil }
-            let preAttributes = try Self.digestEvidence(
+            let preAttributes = try digestEvidence(
                 urls: Self.candidateAttributeURLs(
                     layout: capability.repositoryLayout,
                     candidateRepositoryRelativePath: candidatePath
@@ -611,7 +633,7 @@ actor WorkspaceCodemapGitCapabilityService {
                 includeBoundedContents: true
             )
             try Task.checkCancellation()
-            let postAttributes = try Self.digestEvidence(
+            let postAttributes = try digestEvidence(
                 urls: Self.candidateAttributeURLs(
                     layout: capability.repositoryLayout,
                     candidateRepositoryRelativePath: candidatePath
@@ -651,6 +673,116 @@ actor WorkspaceCodemapGitCapabilityService {
             )
         } catch {
             return nil
+        }
+    }
+
+    /// Revalidates previously issued source-authority tokens against one stable repository/path window.
+    /// This reads Git metadata and no-follow path fingerprints only; it never reads source bytes.
+    func revalidateSourceAuthorities(
+        capability: GitCodemapRootCapability,
+        tokens: [WorkspaceCodemapSourceAuthorityToken]
+    ) async -> Bool {
+        guard let record = records[capability.rootEpoch],
+              case let .eligible(activeCapability) = record.state,
+              activeCapability == capability,
+              let stableAuthority = record.stableAuthority
+        else { return false }
+        if tokens.isEmpty { return true }
+
+        var candidatePaths = Set<String>()
+        for token in tokens {
+            guard token.isFactoryValidated,
+                  token.rootEpoch == capability.rootEpoch,
+                  token.repositoryAuthority == capability.repositoryAuthority,
+                  token.repositoryRelativeLoadedRootPrefix == capability.repositoryRelativeLoadedRootPrefix,
+                  let candidatePath = Self.safeRepositoryRelativePath(token.standardizedRepositoryRelativePath),
+                  candidatePath == token.standardizedRepositoryRelativePath,
+                  Self.isCandidate(
+                      candidatePath,
+                      insideLoadedRootPrefix: capability.repositoryRelativeLoadedRootPrefix
+                  ),
+                  candidatePaths.insert(candidatePath).inserted
+            else { return false }
+        }
+
+        let loadedRoot = URL(fileURLWithPath: record.binding.standardizedLoadedRootPath)
+        do {
+            var prePathFingerprints: [String: GitBlobLStatFingerprint] = [:]
+            var preAttributeGenerations: [String: String] = [:]
+            for token in tokens {
+                let path = token.standardizedRepositoryRelativePath
+                let fingerprint = try pathFingerprintClient.fingerprint(
+                    capability.repositoryLayout.workTreeRoot,
+                    path
+                )
+                guard fingerprint == token.acceptedPostPathFingerprint,
+                      fingerprint.isRegularFile
+                else { return false }
+                prePathFingerprints[path] = fingerprint
+            }
+            try Task.checkCancellation()
+
+            let preRepository = try await captureAuthority(
+                loadedRoot: loadedRoot,
+                expectedLayout: capability.repositoryLayout,
+                prefix: capability.repositoryRelativeLoadedRootPrefix
+            )
+            guard preRepository.stableAuthority == stableAuthority else { return false }
+
+            for token in tokens {
+                let path = token.standardizedRepositoryRelativePath
+                let generation = try digestEvidence(
+                    urls: Self.candidateAttributeURLs(
+                        layout: capability.repositoryLayout,
+                        candidateRepositoryRelativePath: path
+                    ),
+                    includeBoundedContents: true
+                )
+                guard generation == token.candidateAttributeGeneration else { return false }
+                preAttributeGenerations[path] = generation
+            }
+            try Task.checkCancellation()
+
+            for token in tokens {
+                let path = token.standardizedRepositoryRelativePath
+                let generation = try digestEvidence(
+                    urls: Self.candidateAttributeURLs(
+                        layout: capability.repositoryLayout,
+                        candidateRepositoryRelativePath: path
+                    ),
+                    includeBoundedContents: true
+                )
+                guard generation == preAttributeGenerations[path],
+                      generation == token.candidateAttributeGeneration
+                else { return false }
+            }
+
+            let postRepository = try await captureAuthority(
+                loadedRoot: loadedRoot,
+                expectedLayout: capability.repositoryLayout,
+                prefix: capability.repositoryRelativeLoadedRootPrefix
+            )
+            guard preRepository == postRepository,
+                  postRepository.stableAuthority == stableAuthority
+            else { return false }
+
+            for token in tokens {
+                let path = token.standardizedRepositoryRelativePath
+                let fingerprint = try pathFingerprintClient.fingerprint(
+                    capability.repositoryLayout.workTreeRoot,
+                    path
+                )
+                guard fingerprint == prePathFingerprints[path],
+                      fingerprint == token.acceptedPostPathFingerprint,
+                      fingerprint.isRegularFile
+                else { return false }
+            }
+            guard case let .eligible(currentCapability) = records[capability.rootEpoch]?.state,
+                  currentCapability == capability
+            else { return false }
+            return true
+        } catch {
+            return false
         }
     }
 
@@ -746,8 +878,10 @@ actor WorkspaceCodemapGitCapabilityService {
             return .transient(.repositoryChanging)
         } catch let error as GitBlobIdentityError {
             switch error {
-            case .invalidObjectFormat, .unsupportedGit:
+            case .invalidObjectFormat:
                 return .terminal(.unsupportedObjectFormat)
+            case .unsupportedGit:
+                return .terminal(.unsupportedGit)
             default:
                 return .transient(.runtimeUnavailable)
             }
@@ -797,7 +931,7 @@ actor WorkspaceCodemapGitCapabilityService {
             salt: namespaceSalt
         )
 
-        let layoutGeneration = try Self.digestEvidence(
+        let layoutGeneration = try digestEvidence(
             urls: [
                 currentLayout.workTreeRoot,
                 currentLayout.dotGitPath,
@@ -807,17 +941,17 @@ actor WorkspaceCodemapGitCapabilityService {
             ],
             includeBoundedContents: true
         )
-        let indexGeneration = try Self.digestEvidence(
+        let indexGeneration = try digestEvidence(
             urls: [currentLayout.gitDir.appendingPathComponent("index")],
             includeBoundedContents: false
         )
-        let metadataGeneration = try Self.digestEvidence(
+        let metadataGeneration = try digestEvidence(
             urls: Self.metadataURLs(layout: currentLayout),
             includeBoundedContents: true
         )
         let checkoutConfigurationGeneration = try Self.checkoutConfigurationDigest(
             configuration,
-            filesDigest: Self.digestEvidence(
+            filesDigest: digestEvidence(
                 urls: [
                     currentLayout.commonDir.appendingPathComponent("config"),
                     currentLayout.gitDir.appendingPathComponent("config"),
@@ -827,7 +961,7 @@ actor WorkspaceCodemapGitCapabilityService {
                 includeBoundedContents: true
             )
         )
-        let attributeGeneration = try Self.digestEvidence(
+        let attributeGeneration = try digestEvidence(
             urls: Self.attributeURLs(
                 layout: currentLayout,
                 loadedRoot: loadedRoot,
@@ -837,7 +971,7 @@ actor WorkspaceCodemapGitCapabilityService {
         )
         let sparseGeneration = try Self.sparseDigest(
             configuration,
-            filesDigest: Self.digestEvidence(
+            filesDigest: digestEvidence(
                 urls: [
                     currentLayout.gitDir.appendingPathComponent("info/sparse-checkout"),
                     currentLayout.commonDir.appendingPathComponent("info/sparse-checkout")
@@ -849,13 +983,13 @@ actor WorkspaceCodemapGitCapabilityService {
             namespace.rawValue,
             objectFormat.rawValue,
             currentLayout.commonDir.resolvingSymlinksInPath().standardizedFileURL.path,
-            Self.bindingIdentityDigest(urls: [currentLayout.commonDir])
+            bindingIdentityDigest(urls: [currentLayout.commonDir])
         ])
         let worktreeBindingEpoch = try Self.digestStrings([
             currentLayout.workTreeRoot.resolvingSymlinksInPath().standardizedFileURL.path,
             currentLayout.gitDir.resolvingSymlinksInPath().standardizedFileURL.path,
             currentLayout.dotGitPath.resolvingSymlinksInPath().standardizedFileURL.path,
-            Self.bindingIdentityDigest(urls: [
+            bindingIdentityDigest(urls: [
                 currentLayout.workTreeRoot,
                 currentLayout.dotGitPath,
                 currentLayout.gitDir
@@ -1036,67 +1170,229 @@ actor WorkspaceCodemapGitCapabilityService {
         return prefix.isEmpty || path.hasPrefix(prefix + "/")
     }
 
-    private static func digestEvidence(urls: [URL], includeBoundedContents: Bool) throws -> String {
-        var data = Data()
-        for url in Dictionary(grouping: urls, by: { $0.standardizedFileURL.path }).keys.sorted() {
-            data.append(Data(url.utf8))
-            data.append(0)
-            var statValue = stat()
-            guard lstat(url, &statValue) == 0 else {
-                if errno == ENOENT || errno == ENOTDIR {
-                    data.append(0)
-                    continue
-                }
-                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-            }
-            data.append(1)
-            let evidence = [
-                String(statValue.st_dev),
-                String(statValue.st_ino),
-                String(statValue.st_mode),
-                String(statValue.st_size),
-                String(statValue.st_mtimespec.tv_sec),
-                String(statValue.st_mtimespec.tv_nsec),
-                String(statValue.st_ctimespec.tv_sec),
-                String(statValue.st_ctimespec.tv_nsec)
-            ].joined(separator: ":")
-            data.append(Data(evidence.utf8))
-            data.append(0)
-            if includeBoundedContents, (statValue.st_mode & S_IFMT) == S_IFREG {
-                guard statValue.st_size <= 1024 * 1024 else {
-                    throw CapabilityCaptureError.authorityFileTooLarge
-                }
-                try data.append(Data(contentsOf: URL(fileURLWithPath: url), options: [.mappedIfSafe]))
-                data.append(0)
-            }
-        }
-        return hex(Data(SHA256.hash(data: data)))
+    private struct DescriptorEvidence {
+        let statValue: stat
+        let contents: Data?
     }
 
-    private static func bindingIdentityDigest(urls: [URL]) throws -> String {
+    private struct DescriptorLink {
+        let parentDescriptor: Int32
+        let name: String
+        let childStat: stat
+    }
+
+    private func digestEvidence(urls: [URL], includeBoundedContents: Bool) throws -> String {
         var data = Data()
         for path in Dictionary(grouping: urls, by: { $0.standardizedFileURL.path }).keys.sorted() {
             data.append(Data(path.utf8))
             data.append(0)
-            var statValue = stat()
-            guard lstat(path, &statValue) == 0 else {
-                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            guard let evidence = try descriptorEvidence(
+                at: URL(fileURLWithPath: path),
+                includeContents: includeBoundedContents,
+                maximumContentByteCount: 1024 * 1024,
+                missingAllowed: true
+            ) else {
+                data.append(0)
+                continue
             }
-            data.append(Data([
-                String(statValue.st_dev),
-                String(statValue.st_ino),
-                String(statValue.st_mode)
-            ].joined(separator: ":").utf8))
-            data.append(0)
-            if (statValue.st_mode & S_IFMT) == S_IFREG {
-                guard statValue.st_size <= 64 * 1024 else {
-                    throw CapabilityCaptureError.authorityFileTooLarge
-                }
-                try data.append(Data(contentsOf: URL(fileURLWithPath: path), options: [.mappedIfSafe]))
+            data.append(1)
+            appendStatEvidence(evidence.statValue, to: &data)
+            if let contents = evidence.contents {
+                data.append(contents)
                 data.append(0)
             }
         }
-        return hex(Data(SHA256.hash(data: data)))
+        return Self.hex(Data(SHA256.hash(data: data)))
+    }
+
+    private func bindingIdentityDigest(urls: [URL]) throws -> String {
+        var data = Data()
+        for path in Dictionary(grouping: urls, by: { $0.standardizedFileURL.path }).keys.sorted() {
+            data.append(Data(path.utf8))
+            data.append(0)
+            guard let evidence = try descriptorEvidence(
+                at: URL(fileURLWithPath: path),
+                includeContents: true,
+                maximumContentByteCount: 64 * 1024,
+                missingAllowed: false
+            ) else {
+                throw POSIXError(.ENOENT)
+            }
+            data.append(Data([
+                String(evidence.statValue.st_dev),
+                String(evidence.statValue.st_ino),
+                String(evidence.statValue.st_mode)
+            ].joined(separator: ":").utf8))
+            data.append(0)
+            if let contents = evidence.contents {
+                data.append(contents)
+                data.append(0)
+            }
+        }
+        return Self.hex(Data(SHA256.hash(data: data)))
+    }
+
+    private func descriptorEvidence(
+        at url: URL,
+        includeContents: Bool,
+        maximumContentByteCount: Int64,
+        missingAllowed: Bool
+    ) throws -> DescriptorEvidence? {
+        let path = Self.normalizedSystemAliasPath(url.standardizedFileURL.path)
+        guard path.hasPrefix("/"), !path.utf8.contains(0) else {
+            throw POSIXError(.EINVAL)
+        }
+        let components = path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        guard !components.isEmpty, components.count <= 1024 else {
+            throw POSIXError(.EINVAL)
+        }
+        let rootDescriptor = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+        guard rootDescriptor >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        var descriptors = [rootDescriptor]
+        var links: [DescriptorLink] = []
+        defer {
+            for descriptor in descriptors.reversed() {
+                close(descriptor)
+            }
+        }
+
+        for (index, component) in components.enumerated() {
+            let parentDescriptor = descriptors[descriptors.count - 1]
+            var linkStat = stat()
+            let status = component.withCString { name in
+                fstatat(parentDescriptor, name, &linkStat, AT_SYMLINK_NOFOLLOW)
+            }
+            guard status == 0 else {
+                if missingAllowed, errno == ENOENT || errno == ENOTDIR { return nil }
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            guard (linkStat.st_mode & S_IFMT) != S_IFLNK else {
+                throw CapabilityCaptureError.layoutChanged
+            }
+            let isLeaf = index == components.count - 1
+            if !isLeaf, (linkStat.st_mode & S_IFMT) != S_IFDIR {
+                if missingAllowed { return nil }
+                throw POSIXError(.ENOTDIR)
+            }
+            let flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK |
+                (isLeaf ? 0 : O_DIRECTORY)
+            let descriptor = component.withCString { name in
+                openat(parentDescriptor, name, flags)
+            }
+            guard descriptor >= 0 else {
+                if missingAllowed, errno == ENOENT || errno == ENOTDIR { return nil }
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            descriptors.append(descriptor)
+            var descriptorStat = stat()
+            guard fstat(descriptor, &descriptorStat) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            guard sameStableStat(linkStat, descriptorStat) else {
+                throw CapabilityCaptureError.layoutChanged
+            }
+            links.append(DescriptorLink(
+                parentDescriptor: parentDescriptor,
+                name: component,
+                childStat: descriptorStat
+            ))
+        }
+
+        let leafDescriptor = descriptors[descriptors.count - 1]
+        let preStat = links[links.count - 1].childStat
+        hooks.afterAuthorityEvidenceOpen(url)
+        var contents: Data?
+        if includeContents, (preStat.st_mode & S_IFMT) == S_IFREG {
+            guard preStat.st_size >= 0, preStat.st_size <= maximumContentByteCount else {
+                throw CapabilityCaptureError.authorityFileTooLarge
+            }
+            contents = try readBounded(
+                descriptor: leafDescriptor,
+                maximumByteCount: maximumContentByteCount
+            )
+        }
+        var postStat = stat()
+        guard fstat(leafDescriptor, &postStat) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        guard sameStableStat(preStat, postStat) else {
+            throw CapabilityCaptureError.layoutChanged
+        }
+        for link in links {
+            var current = stat()
+            let status = link.name.withCString { name in
+                fstatat(link.parentDescriptor, name, &current, AT_SYMLINK_NOFOLLOW)
+            }
+            guard status == 0,
+                  sameDescriptorIdentity(link.childStat, current),
+                  (current.st_mode & S_IFMT) != S_IFLNK
+            else {
+                throw CapabilityCaptureError.layoutChanged
+            }
+        }
+        return DescriptorEvidence(statValue: postStat, contents: contents)
+    }
+
+    private func readBounded(descriptor: Int32, maximumByteCount: Int64) throws -> Data {
+        guard lseek(descriptor, 0, SEEK_SET) >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+        while true {
+            let count = buffer.withUnsafeMutableBytes { bytes in
+                Darwin.read(descriptor, bytes.baseAddress, bytes.count)
+            }
+            if count == 0 { return data }
+            if count < 0 {
+                if errno == EINTR { continue }
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            guard Int64(data.count) <= maximumByteCount - Int64(count) else {
+                throw CapabilityCaptureError.authorityFileTooLarge
+            }
+            data.append(contentsOf: buffer.prefix(count))
+        }
+    }
+
+    private func appendStatEvidence(_ value: stat, to data: inout Data) {
+        let evidence = [
+            String(value.st_dev),
+            String(value.st_ino),
+            String(value.st_mode),
+            String(value.st_size),
+            String(value.st_mtimespec.tv_sec),
+            String(value.st_mtimespec.tv_nsec),
+            String(value.st_ctimespec.tv_sec),
+            String(value.st_ctimespec.tv_nsec)
+        ].joined(separator: ":")
+        data.append(Data(evidence.utf8))
+        data.append(0)
+    }
+
+    private func sameDescriptorIdentity(_ lhs: stat, _ rhs: stat) -> Bool {
+        lhs.st_dev == rhs.st_dev && lhs.st_ino == rhs.st_ino && lhs.st_mode == rhs.st_mode
+    }
+
+    private func sameStableStat(_ lhs: stat, _ rhs: stat) -> Bool {
+        sameDescriptorIdentity(lhs, rhs) &&
+            lhs.st_size == rhs.st_size &&
+            lhs.st_mtimespec.tv_sec == rhs.st_mtimespec.tv_sec &&
+            lhs.st_mtimespec.tv_nsec == rhs.st_mtimespec.tv_nsec &&
+            lhs.st_ctimespec.tv_sec == rhs.st_ctimespec.tv_sec &&
+            lhs.st_ctimespec.tv_nsec == rhs.st_ctimespec.tv_nsec
+    }
+
+    /// macOS exposes these immutable system aliases at the filesystem root. Normalize only
+    /// those aliases; repository-controlled symlinks remain forbidden by descriptor traversal.
+    private static func normalizedSystemAliasPath(_ path: String) -> String {
+        for (alias, target) in [("/var", "/private/var"), ("/tmp", "/private/tmp"), ("/etc", "/private/etc")] {
+            if path == alias { return target }
+            if path.hasPrefix(alias + "/") { return target + path.dropFirst(alias.count) }
+        }
+        return path
     }
 
     private static func checkoutConfigurationDigest(

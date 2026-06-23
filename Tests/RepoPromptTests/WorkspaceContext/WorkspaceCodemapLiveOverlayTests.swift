@@ -1293,6 +1293,162 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         )
     }
 
+    func testStaleManifestAdoptionRollbackCannotEraseNewCommitAfterReregistration() async throws {
+        let commitGate = OverlayFirstCommitGate()
+        let overlay = WorkspaceCodemapLiveOverlay(
+            manifestAdoptionCommitHook: { await commitGate.enter() }
+        )
+        let fixture = try await makeRootFixture(
+            name: #function,
+            files: ["Fence.swift": "struct Fence {}"],
+            overlay: overlay
+        )
+        defer { fixture.cleanup() }
+
+        let clean = try await makeCleanReady(
+            fixture: fixture,
+            path: "Fence.swift",
+            text: "struct Fence {}",
+            fileID: uuid("B2000000-0000-0000-0000-000000000002")
+        )
+        let manifest = try makeManifest(fixture: fixture, records: [clean.record])
+        let firstTicket = try await manifestTicket(fixture)
+        let firstAdoption = Task {
+            await overlay.adoptManifest(
+                ticket: firstTicket,
+                snapshot: manifest,
+                readyEntries: [clean.adoption]
+            )
+        }
+        await commitGate.waitUntilFirstCommit()
+
+        await assertTrueValue(overlay.unregister(rootEpoch: fixture.rootEpoch))
+        await assertEqualValue(
+            overlay.register(
+                capability: .eligible(fixture.authority.capability),
+                namespace: fixture.namespace,
+                catalogGeneration: fixture.catalogGeneration
+            ),
+            .registered
+        )
+        let secondTicket = try await manifestTicket(fixture)
+        assertNotEqual(firstTicket.operationID, secondTicket.operationID)
+        let secondLease = try await fixture.artifactStore.lease(handle: clean.handle)
+        await assertEqualValue(
+            overlay.adoptManifest(
+                ticket: secondTicket,
+                snapshot: manifest,
+                readyEntries: [WorkspaceCodemapLiveManifestAdoptionEntry(
+                    record: clean.record,
+                    binding: clean.binding,
+                    lease: secondLease
+                )]
+            ),
+            .adopted(readyEntryCount: 1)
+        )
+
+        await commitGate.releaseFirstCommit()
+        await assertEqualValue(firstAdoption.value, .adopted(readyEntryCount: 1))
+        await assertFalseValue(overlay.rollbackManifestAdoption(
+            ticket: firstTicket,
+            manifestGeneration: manifest.manifestGeneration
+        ))
+        let snapshot = try await unwrapValue(overlay.snapshot(rootEpoch: fixture.rootEpoch))
+        assertEqualValue(snapshot.manifestGeneration, manifest.manifestGeneration)
+        assertEqualValue(snapshot.entries.count, 1)
+    }
+
+    func testManifestAdoptionTicketCurrentRequiresExactLiveRootGeneration() async throws {
+        let fixture = try await makeRootFixture(
+            name: #function,
+            files: ["Fence.swift": "struct Fence {}"]
+        )
+        defer { fixture.cleanup() }
+
+        let ticket = try await manifestTicket(fixture)
+        await assertTrueValue(fixture.overlay.isManifestAdoptionTicketCurrent(ticket))
+
+        let wrongCatalog = WorkspaceCodemapLiveManifestAdoptionTicket(
+            operationID: ticket.operationID,
+            rootEpoch: ticket.rootEpoch,
+            catalogGeneration: ticket.catalogGeneration + 1,
+            repositoryAuthority: ticket.repositoryAuthority,
+            invalidationGeneration: ticket.invalidationGeneration
+        )
+        await assertFalseValue(fixture.overlay.isManifestAdoptionTicketCurrent(wrongCatalog))
+        let wrongAuthority = WorkspaceCodemapLiveManifestAdoptionTicket(
+            operationID: ticket.operationID,
+            rootEpoch: ticket.rootEpoch,
+            catalogGeneration: ticket.catalogGeneration,
+            repositoryAuthority: repositoryAuthority(
+                like: ticket.repositoryAuthority,
+                authorityGeneration: ticket.repositoryAuthority.authorityGeneration + 1
+            ),
+            invalidationGeneration: ticket.invalidationGeneration
+        )
+        await assertFalseValue(fixture.overlay.isManifestAdoptionTicketCurrent(wrongAuthority))
+
+        _ = await fixture.overlay.invalidatePaths(
+            rootEpoch: fixture.rootEpoch,
+            standardizedRelativePaths: ["Fence.swift"],
+            reason: .modified
+        )
+        await assertFalseValue(fixture.overlay.isManifestAdoptionTicketCurrent(ticket))
+        let freshTicket = try await manifestTicket(fixture)
+        await assertTrueValue(fixture.overlay.isManifestAdoptionTicketCurrent(freshTicket))
+
+        await assertTrueValue(fixture.overlay.unregister(rootEpoch: fixture.rootEpoch))
+        await assertFalseValue(fixture.overlay.isManifestAdoptionTicketCurrent(freshTicket))
+    }
+
+    func testManifestInvalidationGenerationExhaustionFailsClosedWithoutABA() async throws {
+        let overlay = WorkspaceCodemapLiveOverlay(initialManifestInvalidationGeneration: .max)
+        let fixture = try await makeRootFixture(
+            name: #function,
+            files: ["Fence.swift": "struct Fence {}"],
+            overlay: overlay
+        )
+        defer { fixture.cleanup() }
+
+        let ticket = try await manifestTicket(fixture)
+        await assertTrueValue(overlay.isManifestAdoptionTicketCurrent(ticket))
+        _ = await overlay.invalidatePaths(
+            rootEpoch: fixture.rootEpoch,
+            standardizedRelativePaths: ["Fence.swift"],
+            reason: .watcherGap
+        )
+
+        await assertFalseValue(overlay.isManifestAdoptionTicketCurrent(ticket))
+        await assertNilValue(overlay.beginManifestAdoption(rootEpoch: fixture.rootEpoch))
+        await assertNilValue(overlay.freeze(rootEpoch: fixture.rootEpoch))
+        let snapshot = try await unwrapValue(overlay.snapshot(rootEpoch: fixture.rootEpoch))
+        assertFalseValue(snapshot.authorityIsCurrent)
+    }
+
+    func testContributionGenerationExhaustionRevokesOldGraphSnapshotWithoutABA() async throws {
+        let overlay = WorkspaceCodemapLiveOverlay(initialContributionGeneration: .max)
+        let fixture = try await makeRootFixture(
+            name: #function,
+            files: ["Fence.swift": "struct Fence {}"],
+            overlay: overlay
+        )
+        defer { fixture.cleanup() }
+
+        let oldGraph = try await unwrapValue(overlay.graphContributions(rootEpoch: fixture.rootEpoch))
+        let ready = try await makeWorktreeReady(
+            fixture: fixture,
+            path: "Fence.swift",
+            requestGeneration: 1,
+            artifactName: "Fence"
+        )
+        _ = try await startedTicket(overlay.beginDemand(owner: .init(), token: ready.token))
+
+        await assertNilValue(overlay.consumeGraphSnapshot(oldGraph))
+        await assertNilValue(overlay.graphContributions(rootEpoch: fixture.rootEpoch))
+        await assertNilValue(overlay.freeze(rootEpoch: fixture.rootEpoch))
+        await ready.lease.close()
+    }
+
     func testManifestRevalidationNetsRetiredShadowAtCapacity() async throws {
         let policy = WorkspaceCodemapLiveOverlayPolicy(
             maximumRootCount: 1,
@@ -2301,6 +2457,56 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         await requestCompletion.lease.close()
     }
 
+    func testExactDuplicateCompletionRequiresCurrentTicketAndClosesDuplicateLease() async throws {
+        let fixture = try await makeRootFixture(
+            name: #function,
+            files: ["Duplicate.swift": "struct Duplicate {}"]
+        )
+        defer { fixture.cleanup() }
+        let ready = try await makeWorktreeReady(
+            fixture: fixture,
+            path: "Duplicate.swift",
+            requestGeneration: 1,
+            artifactName: "Duplicate"
+        )
+        let ticket = try await startedTicket(
+            fixture.overlay.beginDemand(owner: .init(), token: ready.token)
+        )
+        _ = try await acceptedReady(fixture.overlay.acceptCompletion(
+            ticket: ticket,
+            completion: ready.completion,
+            lease: ready.lease
+        ))
+        var storeAccounting = await fixture.artifactStore.accounting()
+        XCTAssertEqual(storeAccounting.activeLeaseCount, 1)
+
+        let duplicateLease = try await fixture.artifactStore.lease(handle: ready.handle)
+        storeAccounting = await fixture.artifactStore.accounting()
+        XCTAssertEqual(storeAccounting.activeLeaseCount, 2)
+        guard case .exactDuplicate = await fixture.overlay.acceptCompletion(
+            ticket: ticket,
+            completion: ready.completion,
+            lease: duplicateLease
+        ) else { return XCTFail("The exact originating ticket should be idempotent.") }
+        storeAccounting = await fixture.artifactStore.accounting()
+        XCTAssertEqual(storeAccounting.activeLeaseCount, 1)
+
+        let staleTicket = WorkspaceCodemapLiveDemandTicket(
+            token: ticket.token,
+            contributionGeneration: ticket.contributionGeneration,
+            requestID: UUID()
+        )
+        let staleLease = try await fixture.artifactStore.lease(handle: ready.handle)
+        guard case .rejected(.pendingRequestMissing) = await fixture.overlay.acceptCompletion(
+            ticket: staleTicket,
+            completion: ready.completion,
+            lease: staleLease
+        ) else { return XCTFail("A stale ticket must not become an exact duplicate after readiness.") }
+        await staleLease.close()
+        storeAccounting = await fixture.artifactStore.accounting()
+        XCTAssertEqual(storeAccounting.activeLeaseCount, 1)
+    }
+
     func testFocusedRegistrationDemandOutcomeAndInvalidationSemantics() async throws {
         let fixture = try await makeRootFixture(
             name: #function,
@@ -2676,6 +2882,16 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
         XCTAssertTrue(actual, message, file: file, line: line)
     }
 
+    private func assertNotEqual<T: Equatable>(
+        _ actual: T,
+        _ expected: T,
+        _ message: String = "",
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertNotEqual(actual, expected, message, file: file, line: line)
+    }
+
     private func assertFalseValue(
         _ actual: Bool,
         _ message: String = "",
@@ -2805,6 +3021,33 @@ final class WorkspaceCodemapLiveOverlayTests: XCTestCase {
 
     private func uuid(_ value: String) -> UUID {
         UUID(uuidString: value)!
+    }
+}
+
+private actor OverlayFirstCommitGate {
+    private var firstCommitEntered = false
+    private var firstCommitReleased = false
+    private var commitCount = 0
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func enter() async {
+        commitCount += 1
+        guard commitCount == 1 else { return }
+        firstCommitEntered = true
+        if firstCommitReleased { return }
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func waitUntilFirstCommit() async {
+        while !firstCommitEntered {
+            await Task.yield()
+        }
+    }
+
+    func releaseFirstCommit() {
+        firstCommitReleased = true
+        continuation?.resume()
+        continuation = nil
     }
 }
 

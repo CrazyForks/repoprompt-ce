@@ -788,8 +788,10 @@ actor CodeMapRootManifestStore {
         {
             throw CodeMapRootManifestStoreError.quotaExceeded
         }
-        var projectedCount = projectionScan.accounting.manifestCount +
-            (replacedByteCount == 0 && incomingByteCount > 0 ? 1 : 0)
+        var projectedCount = try Self.adding(
+            projectionScan.accounting.manifestCount,
+            replacedByteCount == 0 && incomingByteCount > 0 ? 1 : 0
+        )
         var projectedBytes = projectionScan.accounting.manifestByteCount
         projectedBytes = projectedBytes >= replacedByteCount ? projectedBytes - replacedByteCount : 0
         projectedBytes = try Self.adding(projectedBytes, incomingByteCount)
@@ -826,7 +828,7 @@ actor CodeMapRootManifestStore {
             if try Self.secureRemove(parent: shard, name: entry.digest, descriptor: descriptor) {
                 projectedCount -= 1
                 projectedBytes = projectedBytes >= entry.byteCount ? projectedBytes - entry.byteCount : 0
-                evicted += 1
+                evicted = Self.addingSaturating(evicted, 1)
             }
         }
         guard projectedCount <= policy.maximumManifestCount,
@@ -839,7 +841,7 @@ actor CodeMapRootManifestStore {
         guard scanAuthorityIsCurrent(layout: layout, scan: finalScan) else {
             throw CodeMapRootManifestStoreError.insecureDirectory
         }
-        scan.evictedManifestCount += evicted
+        scan.evictedManifestCount = try Self.adding(scan.evictedManifestCount, evicted)
         return ManifestReconciliationOutcome(
             result: CodeMapRootManifestMaintenanceResult(
                 examinedCount: scan.examinedCount,
@@ -1010,9 +1012,9 @@ actor CodeMapRootManifestStore {
                 Darwin.close(descriptor)
                 switch inspection {
                 case let .valid(snapshot, identity):
-                    result.manifestCount += 1
+                    result.manifestCount = try Self.adding(result.manifestCount, 1)
                     result.manifestByteCount = try Self.adding(result.manifestByteCount, UInt64(identity.size))
-                    result.recordCount = min(Int.max, result.recordCount + snapshot.records.count)
+                    result.recordCount = Self.addingSaturating(result.recordCount, snapshot.records.count)
                     result.validEntries.append(
                         ManifestMaintenanceEntry(
                             shard: shardName,
@@ -1556,6 +1558,17 @@ actor CodeMapRootManifestStore {
 
     private static func unlock(_ descriptor: Int32) {
         while flock(descriptor, LOCK_UN) != 0, errno == EINTR {}
+    }
+
+    private static func adding(_ lhs: Int, _ rhs: Int) throws -> Int {
+        let (result, overflow) = lhs.addingReportingOverflow(rhs)
+        guard !overflow else { throw CodeMapRootManifestStoreError.quotaExceeded }
+        return result
+    }
+
+    private static func addingSaturating(_ lhs: Int, _ rhs: Int) -> Int {
+        let (result, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? .max : result
     }
 
     private static func adding(_ lhs: UInt64, _ rhs: UInt64) throws -> UInt64 {

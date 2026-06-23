@@ -143,6 +143,19 @@ struct WorkspaceCodemapLiveDemandReservation: Hashable, Sendable {
     let reservationID: UUID
 }
 
+struct WorkspaceCodemapLiveDemandPreflightTicket: Hashable, Sendable {
+    let rootEpoch: WorkspaceCodemapRootEpoch
+    let owner: WorkspaceCodemapLiveDemandOwner
+    let reservationID: UUID
+}
+
+enum WorkspaceCodemapLiveDemandPreflightDisposition: Sendable {
+    case reserved(WorkspaceCodemapLiveDemandPreflightTicket)
+    case ready(WorkspaceCodemapLiveReadySnapshot)
+    case busy(WorkspaceCodemapLiveOverlayBusyReason)
+    case rejected(WorkspaceCodemapLiveDemandRejection)
+}
+
 enum WorkspaceCodemapLiveDemandRejection: Equatable, Sendable {
     case rootNotRegistered
     case rootAuthorityInvalid
@@ -203,6 +216,7 @@ enum WorkspaceCodemapLiveUnavailableDisposition: Equatable, Sendable {
 }
 
 struct WorkspaceCodemapLiveManifestAdoptionTicket: Hashable, Sendable {
+    let operationID: UUID
     let rootEpoch: WorkspaceCodemapRootEpoch
     let catalogGeneration: UInt64
     let repositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken

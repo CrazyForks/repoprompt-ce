@@ -91,6 +91,100 @@ final class CodeMapArtifactRuntimeTests: XCTestCase {
         XCTAssertEqual(factoryCount.value, 1)
     }
 
+    func testBindingEngineProviderIsInertAndMemoizesOneEngineAcrossConcurrentCallers() throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let callerCount = 32
+        let factoryCount = RuntimeProviderTestCounter()
+        let results = BindingEngineProviderTestResults()
+        let overlapGate = RuntimeProviderOverlapGate(expectedCallerCount: callerCount)
+        let runtime = try CodeMapArtifactRuntime(
+            rootURL: root,
+            bindingEngineFactory: { runtime in
+                factoryCount.increment()
+                overlapGate.factoryEnteredAndWaitForRelease()
+                return Self.makeBindingEngine(runtime: runtime)
+            }
+        )
+        XCTAssertEqual(factoryCount.value, 0)
+
+        let callers = startBindingEngineCallers(
+            count: callerCount,
+            runtime: runtime,
+            overlapGate: overlapGate,
+            results: results
+        )
+        let overlapObserved = overlapGate.waitForDeterministicOverlap()
+        let overlapSnapshot = overlapGate.snapshot
+        overlapGate.releaseFactory()
+        XCTAssertTrue(overlapObserved)
+        XCTAssertEqual(overlapSnapshot.callerCount, callerCount)
+        XCTAssertEqual(overlapSnapshot.factoryEntryCount, 1)
+        XCTAssertEqual(callers.wait(timeout: .now() + 10), .success)
+
+        let snapshot = results.snapshot()
+        XCTAssertEqual(factoryCount.value, 1)
+        XCTAssertEqual(snapshot.engines.count, callerCount)
+        XCTAssertTrue(snapshot.errors.isEmpty)
+        let first = try XCTUnwrap(snapshot.engines.first)
+        XCTAssertTrue(snapshot.engines.allSatisfy { $0 === first })
+        XCTAssertTrue(try runtime.bindingEngine() === first)
+    }
+
+    func testBindingEngineProviderMemoizesUnconfiguredFailureWithoutFallback() throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let factoryCount = RuntimeProviderTestCounter()
+        let runtime = try CodeMapArtifactRuntime(
+            rootURL: root,
+            bindingEngineFactory: { _ in
+                factoryCount.increment()
+                throw WorkspaceCodemapBindingEngineProviderError.unconfigured
+            }
+        )
+        XCTAssertEqual(factoryCount.value, 0)
+
+        for _ in 0 ..< 2 {
+            XCTAssertThrowsError(try runtime.bindingEngine()) {
+                XCTAssertEqual(
+                    $0 as? WorkspaceCodemapBindingEngineProviderError,
+                    .unconfigured
+                )
+            }
+        }
+        XCTAssertEqual(factoryCount.value, 1)
+    }
+
+    func testEachRuntimeOwnsItsOwnMemoizedBindingEngine() throws {
+        let firstRoot = try makeSecureRoot()
+        let secondRoot = try makeSecureRoot()
+        defer {
+            try? FileManager.default.removeItem(at: firstRoot)
+            try? FileManager.default.removeItem(at: secondRoot)
+        }
+        let factoryCount = RuntimeProviderTestCounter()
+        let factory: WorkspaceCodemapBindingEngineProvider.Factory = { runtime in
+            factoryCount.increment()
+            return Self.makeBindingEngine(runtime: runtime)
+        }
+        let firstRuntime = try CodeMapArtifactRuntime(
+            rootURL: firstRoot,
+            bindingEngineFactory: factory
+        )
+        let secondRuntime = try CodeMapArtifactRuntime(
+            rootURL: secondRoot,
+            bindingEngineFactory: factory
+        )
+
+        let firstEngine = try firstRuntime.bindingEngine()
+        let secondEngine = try secondRuntime.bindingEngine()
+
+        XCTAssertTrue(try firstRuntime.bindingEngine() === firstEngine)
+        XCTAssertTrue(try secondRuntime.bindingEngine() === secondEngine)
+        XCTAssertFalse(firstEngine === secondEngine)
+        XCTAssertEqual(factoryCount.value, 2)
+    }
+
     func testInsecureRuntimeRootFailsWithoutConstructingAlternateStores() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("CodeMapRuntimeInsecure-\(UUID().uuidString)", isDirectory: true)
@@ -236,6 +330,45 @@ final class CodeMapArtifactRuntimeTests: XCTestCase {
             }
         }
         return callers
+    }
+
+    private func startBindingEngineCallers(
+        count: Int,
+        runtime: CodeMapArtifactRuntime,
+        overlapGate: RuntimeProviderOverlapGate,
+        results: BindingEngineProviderTestResults
+    ) -> DispatchGroup {
+        let callers = DispatchGroup()
+        for _ in 0 ..< count {
+            callers.enter()
+            Thread.detachNewThread {
+                defer { callers.leave() }
+                overlapGate.callerWillRequestRuntime()
+                do {
+                    try results.record(engine: runtime.bindingEngine())
+                } catch {
+                    results.record(error: error)
+                }
+            }
+        }
+        return callers
+    }
+
+    private static func makeBindingEngine(
+        runtime: CodeMapArtifactRuntime
+    ) -> WorkspaceCodemapBindingEngine {
+        WorkspaceCodemapBindingEngine(
+            runtime: runtime,
+            capabilityService: WorkspaceCodemapGitCapabilityService(
+                namespaceSalt: Data(
+                    repeating: 0x5A,
+                    count: GitBlobRepositoryNamespace.saltByteCount
+                )
+            ),
+            sourceReader: WorkspaceCodemapValidatedSourceReaderClient { _, _, _, _ in
+                throw CancellationError()
+            }
+        )
     }
 
     private func assertNamespacesDoNotCollide(
@@ -387,5 +520,34 @@ private final class RuntimeProviderTestResults: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return Snapshot(runtimes: runtimes, errors: errors)
+    }
+}
+
+private final class BindingEngineProviderTestResults: @unchecked Sendable {
+    struct Snapshot {
+        let engines: [WorkspaceCodemapBindingEngine]
+        let errors: [Error]
+    }
+
+    private let lock = NSLock()
+    private var engines: [WorkspaceCodemapBindingEngine] = []
+    private var errors: [Error] = []
+
+    func record(engine: WorkspaceCodemapBindingEngine) {
+        lock.lock()
+        engines.append(engine)
+        lock.unlock()
+    }
+
+    func record(error: Error) {
+        lock.lock()
+        errors.append(error)
+        lock.unlock()
+    }
+
+    func snapshot() -> Snapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return Snapshot(engines: engines, errors: errors)
     }
 }

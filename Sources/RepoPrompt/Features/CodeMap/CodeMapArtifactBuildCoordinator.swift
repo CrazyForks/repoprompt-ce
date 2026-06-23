@@ -140,7 +140,6 @@ enum CodeMapArtifactCoordinatorLocatorPublication: Equatable {
     case notNeededExistingAssociation
     case inserted
     case alreadyPresent
-    case skippedCorruptRecord
     case failed
 }
 
@@ -518,7 +517,6 @@ struct CodeMapArtifactBuildCoordinatorCounters: Equatable {
     let locatorInserted: UInt64
     let locatorAlreadyPresent: UInt64
     let locatorFailed: UInt64
-    let locatorSkippedCorrupt: UInt64
     let duplicateBuilds: UInt64
     let staleCompletionDrops: UInt64
     let droppedHookEvents: UInt64
@@ -544,6 +542,7 @@ struct CodeMapArtifactBuildCoordinatorAccounting: Equatable {
     let activeBuildCount: Int
     let waiterCount: Int
     let retainedInputByteCount: Int
+    let ownerAdmissionHistoryCount: Int
     let pendingHookEventCount: Int
     let hookDispatcherIsDraining: Bool
     let policy: CodeMapArtifactBuildCoordinatorPolicy
@@ -602,7 +601,7 @@ actor CodeMapArtifactBuildCoordinator {
         let id: UUID
         let ownerID: UUID
         let priority: CodeMapArtifactBuildPriority
-        let ordinal: UInt64
+        var ordinal: UInt64
         let joinedExistingFlight: Bool
         let locatorIdentity: GitBlobCodeMapLocatorIdentity?
         let locatorIntent: LocatorIntent?
@@ -686,7 +685,6 @@ actor CodeMapArtifactBuildCoordinator {
         var locatorInserted: UInt64 = 0
         var locatorAlreadyPresent: UInt64 = 0
         var locatorFailed: UInt64 = 0
-        var locatorSkippedCorrupt: UInt64 = 0
         var duplicateBuilds: UInt64 = 0
         var staleCompletionDrops: UInt64 = 0
         var failures: UInt64 = 0
@@ -730,13 +728,15 @@ actor CodeMapArtifactBuildCoordinator {
         builder: CodeMapArtifactBuilderClient = CodeMapArtifactBuilderClient(),
         policy: CodeMapArtifactBuildCoordinatorPolicy = .default,
         clock: CodeMapArtifactBuildCoordinatorClock = .continuous,
-        hooks: CodeMapArtifactBuildCoordinatorHooks = .none
+        hooks: CodeMapArtifactBuildCoordinatorHooks = .none,
+        initialOrdinal: UInt64 = 1
     ) {
         self.artifactStore = artifactStore
         self.locatorStore = locatorStore
         self.builder = builder
         self.policy = policy
         self.clock = clock
+        nextOrdinal = max(1, initialOrdinal)
         hookDispatcher = CodeMapArtifactBuildCoordinatorHookDispatcher(
             hooks: hooks,
             maximumPendingEventCount: policy.maximumPendingHookEventCount
@@ -745,6 +745,17 @@ actor CodeMapArtifactBuildCoordinator {
 
     func resolve(_ request: CodeMapArtifactBuildRequest) async throws -> CodeMapArtifactBuildCoordinatorResult {
         increment(&counters.requests)
+        do {
+            return try await resolveRequest(request)
+        } catch is CancellationError {
+            increment(&counters.waiterCancellations)
+            throw CancellationError()
+        }
+    }
+
+    private func resolveRequest(
+        _ request: CodeMapArtifactBuildRequest
+    ) async throws -> CodeMapArtifactBuildCoordinatorResult {
         try Task.checkCancellation()
 
         switch request.target {
@@ -860,6 +871,7 @@ actor CodeMapArtifactBuildCoordinator {
             activeBuildCount: activeBuildCount,
             waiterCount: waiterCount,
             retainedInputByteCount: retainedInputByteCount,
+            ownerAdmissionHistoryCount: ownerLastAdmission.count,
             pendingHookEventCount: hookAccounting.pendingEventCount,
             hookDispatcherIsDraining: hookAccounting.isDraining,
             policy: policy,
@@ -1094,7 +1106,9 @@ actor CodeMapArtifactBuildCoordinator {
             let descriptor = schedulingDescriptor(for: flight)
             ownerLastAdmission[descriptor.ownerID] = takeOrdinal()
             if descriptor.isDemand {
-                consecutiveDemandAdmissions += 1
+                if consecutiveDemandAdmissions < policy.maximumConsecutiveDemandAdmissions {
+                    consecutiveDemandAdmissions += 1
+                }
             } else {
                 consecutiveDemandAdmissions = 0
             }
@@ -1462,7 +1476,6 @@ actor CodeMapArtifactBuildCoordinator {
         guard let flight = flights[key], let waiter = flight.waiters.removeValue(forKey: id) else { return }
         releaseLocatorIntent(for: waiter, from: flight)
         waiterCount -= 1
-        increment(&counters.waiterCancellations)
         waiter.continuation.resume(throwing: CancellationError())
         guard flight.waiters.isEmpty else { return }
         increment(&counters.lastWaiterCancellations)
@@ -1660,14 +1673,61 @@ actor CodeMapArtifactBuildCoordinator {
     }
 
     private func takeOrdinal() -> UInt64 {
+        ensureOrdinalCapacity()
         let value = nextOrdinal
-        nextOrdinal = nextOrdinal == UInt64.max ? 1 : nextOrdinal + 1
+        if let next = addingChecked(nextOrdinal, 1) {
+            nextOrdinal = next
+        }
         return value
+    }
+
+    private func ensureOrdinalCapacity() {
+        guard nextOrdinal == .max else { return }
+        pruneOwnerHistory()
+
+        var waiterOrdinal: UInt64 = 1
+        let waiterOrder = flights.values.flatMap { flight in
+            flight.waiters.values.map { (flight, $0) }
+        }.sorted { lhs, rhs in
+            if lhs.1.ordinal != rhs.1.ordinal { return lhs.1.ordinal < rhs.1.ordinal }
+            return lhs.1.id.uuidString < rhs.1.id.uuidString
+        }
+        for (flight, waiter) in waiterOrder {
+            guard var current = flight.waiters[waiter.id] else { continue }
+            current.ordinal = waiterOrdinal
+            flight.waiters[waiter.id] = current
+            guard let next = addingChecked(waiterOrdinal, 1) else { return }
+            waiterOrdinal = next
+        }
+
+        var flightOrdinal: UInt64 = 1
+        for flight in flights.values.sorted(by: { lhs, rhs in
+            if lhs.enqueueOrdinal != rhs.enqueueOrdinal { return lhs.enqueueOrdinal < rhs.enqueueOrdinal }
+            return lhs.key.storageDigestHex < rhs.key.storageDigestHex
+        }) {
+            flight.enqueueOrdinal = flightOrdinal
+            guard let next = addingChecked(flightOrdinal, 1) else { return }
+            flightOrdinal = next
+        }
+
+        var ownerOrdinal: UInt64 = 1
+        for (owner, _) in ownerLastAdmission.sorted(by: { lhs, rhs in
+            if lhs.value != rhs.value { return lhs.value < rhs.value }
+            return lhs.key.uuidString < rhs.key.uuidString
+        }) {
+            ownerLastAdmission[owner] = ownerOrdinal
+            guard let next = addingChecked(ownerOrdinal, 1) else { return }
+            ownerOrdinal = next
+        }
+        nextOrdinal = max(waiterOrdinal, max(flightOrdinal, ownerOrdinal))
     }
 
     private func pruneOwnerHistory() {
         let activeOwners = Set(flights.values.flatMap { $0.waiters.values.map(\.ownerID) })
         ownerLastAdmission = ownerLastAdmission.filter { activeOwners.contains($0.key) }
+        if flights.isEmpty, queuedBuildKeys.isEmpty {
+            consecutiveDemandAdmissions = 0
+        }
     }
 
     private func recordQueueTiming(_ value: UInt64) {
@@ -1720,7 +1780,6 @@ actor CodeMapArtifactBuildCoordinator {
             locatorInserted: counters.locatorInserted,
             locatorAlreadyPresent: counters.locatorAlreadyPresent,
             locatorFailed: counters.locatorFailed,
-            locatorSkippedCorrupt: counters.locatorSkippedCorrupt,
             duplicateBuilds: counters.duplicateBuilds,
             staleCompletionDrops: counters.staleCompletionDrops,
             droppedHookEvents: droppedHookEvents,
@@ -1749,6 +1808,11 @@ actor CodeMapArtifactBuildCoordinator {
 
     private static func duration(from start: UInt64, to end: UInt64) -> UInt64 {
         end >= start ? end - start : 0
+    }
+
+    private func addingChecked(_ lhs: UInt64, _ rhs: UInt64) -> UInt64? {
+        let (value, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? nil : value
     }
 
     private func addingSaturating(_ lhs: UInt64, _ rhs: UInt64) -> UInt64 {

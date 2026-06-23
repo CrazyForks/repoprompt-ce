@@ -4,6 +4,7 @@ import Foundation
 
 struct GitBlobIdentityServiceHooks {
     var afterGitCollection: @Sendable () async -> Void
+    var afterPathSecurityComponentOpen: @Sendable (String) -> Void = { _ in }
 
     static let none = GitBlobIdentityServiceHooks(afterGitCollection: {})
 }
@@ -106,6 +107,13 @@ actor GitBlobIdentityService {
                 )
             }
             layout = resolved
+        } catch GitBlobIdentityError.invalidObjectFormat {
+            return Attempt(
+                batch: unsupportedBatch(paths: relativePaths, reason: .invalidObjectFormat),
+                unstable: false
+            )
+        } catch GitBlobIdentityError.unsupportedGit {
+            return Attempt(batch: unsupportedBatch(paths: relativePaths, reason: .unsupportedGit), unstable: false)
         } catch {
             return Attempt(batch: unsupportedBatch(paths: relativePaths, reason: .unsupportedGit), unstable: false)
         }
@@ -123,7 +131,7 @@ actor GitBlobIdentityService {
         }
         let requestedRepositoryPaths = repositoryPaths.compactMap(\.self)
         let preSecurity = relativePaths.map { path in
-            Self.pathSecurityState(workspaceRoot: workspaceRoot, relativePath: path)
+            pathSecurityState(workspaceRoot: workspaceRoot, relativePath: path)
         }
         let preFileFingerprints = preSecurity.map(Self.fingerprint)
         let preMetadata = Self.repositoryMetadataFingerprint(
@@ -153,6 +161,13 @@ actor GitBlobIdentityService {
                 at: layout.workTreeRoot,
                 repositoryRelativePaths: requestedRepositoryPaths
             )
+        } catch GitBlobIdentityError.invalidObjectFormat {
+            return Attempt(
+                batch: unsupportedBatch(paths: relativePaths, reason: .invalidObjectFormat),
+                unstable: false
+            )
+        } catch GitBlobIdentityError.unsupportedGit {
+            return Attempt(batch: unsupportedBatch(paths: relativePaths, reason: .unsupportedGit), unstable: false)
         } catch {
             return Attempt(batch: unsupportedBatch(paths: relativePaths, reason: .unsupportedGit), unstable: false)
         }
@@ -182,7 +197,7 @@ actor GitBlobIdentityService {
         }
 
         let postSecurity = relativePaths.map { path in
-            Self.pathSecurityState(workspaceRoot: workspaceRoot, relativePath: path)
+            pathSecurityState(workspaceRoot: workspaceRoot, relativePath: path)
         }
         let postFileFingerprints = postSecurity.map(Self.fingerprint)
         let postMetadata = postLayout.map {
@@ -269,7 +284,7 @@ actor GitBlobIdentityService {
     ) -> Attempt {
         let classifications = relativePaths.indices.map { index -> GitBlobIdentityClassification in
             guard validity[index] else { return Self.invalidPathClassification(relativePaths[index]) }
-            let security = Self.pathSecurityState(
+            let security = pathSecurityState(
                 workspaceRoot: workspaceRoot,
                 relativePath: relativePaths[index]
             )
@@ -545,22 +560,46 @@ actor GitBlobIdentityService {
         return String(workspace.dropFirst(prefix.count))
     }
 
-    private static func pathSecurityState(
+    private func pathSecurityState(
         workspaceRoot: URL,
         relativePath: String
     ) -> PathSecurityState {
-        guard isValidRelativePath(relativePath) else { return .missing }
+        guard Self.isValidRelativePath(relativePath) else { return .missing }
         let components = relativePath.split(separator: "/").map(String.init)
-        var current = workspaceRoot
+        let rootDescriptor = open(
+            workspaceRoot.path,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
+        )
+        guard rootDescriptor >= 0 else { return .missing }
+        var directoryDescriptor = rootDescriptor
+        defer {
+            if directoryDescriptor != rootDescriptor { close(directoryDescriptor) }
+            close(rootDescriptor)
+        }
+
         for (index, component) in components.enumerated() {
-            current.appendPathComponent(component)
-            guard let fingerprint = lstatFingerprint(at: current) else { return .missing }
-            if fingerprint.isSymbolicLink {
-                return index == components.count - 1 ? .symlinkLeaf(fingerprint) : .symlinkComponent
+            var value = stat()
+            guard fstatat(directoryDescriptor, component, &value, AT_SYMLINK_NOFOLLOW) == 0 else {
+                return .missing
             }
-            if index == components.count - 1 {
+            let fingerprint = Self.lstatFingerprint(value)
+            let isLeaf = index == components.count - 1
+            if fingerprint.isSymbolicLink {
+                return isLeaf ? .symlinkLeaf(fingerprint) : .symlinkComponent
+            }
+            if isLeaf {
                 return fingerprint.isRegularFile ? .regular(fingerprint) : .nonRegular(fingerprint)
             }
+            guard (value.st_mode & S_IFMT) == S_IFDIR else { return .missing }
+            let nextDescriptor = openat(
+                directoryDescriptor,
+                component,
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+            )
+            guard nextDescriptor >= 0 else { return .missing }
+            if directoryDescriptor != rootDescriptor { close(directoryDescriptor) }
+            directoryDescriptor = nextDescriptor
+            hooks.afterPathSecurityComponentOpen(components[0 ... index].joined(separator: "/"))
         }
         return .missing
     }
@@ -575,7 +614,11 @@ actor GitBlobIdentityService {
     private static func lstatFingerprint(at url: URL) -> GitBlobLStatFingerprint? {
         var value = stat()
         guard lstat(url.path, &value) == 0 else { return nil }
-        return GitBlobLStatFingerprint(
+        return lstatFingerprint(value)
+    }
+
+    private static func lstatFingerprint(_ value: stat) -> GitBlobLStatFingerprint {
+        GitBlobLStatFingerprint(
             device: UInt64(value.st_dev),
             inode: UInt64(value.st_ino),
             mode: UInt16(value.st_mode),

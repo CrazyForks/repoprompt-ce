@@ -269,6 +269,7 @@ enum GitBlobUnsupportedReason: String, Codable {
     case gitlink
     case nonRegularFile
     case unsupportedGit
+    case invalidObjectFormat
     case invalidPath
     case unknownIndexMode
 }
