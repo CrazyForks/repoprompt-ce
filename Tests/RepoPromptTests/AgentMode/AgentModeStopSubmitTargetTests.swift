@@ -4,6 +4,23 @@ import XCTest
 
 @MainActor
 final class AgentModeStopSubmitTargetTests: XCTestCase {
+    func testComposerSubmitTargetIsUnavailableDuringWorkspaceSwitchInFlight() {
+        let vm = makeViewModel()
+        let tabID = UUID()
+        let session = vm.session(for: tabID)
+        vm.test_setCurrentTabIDOverride(tabID)
+        defer { vm.test_setCurrentTabIDOverride(nil) }
+
+        XCTAssertNotNil(vm.makeComposerSubmitTarget(tabID: tabID, session: session))
+
+        vm.test_setWorkspaceSwitchInFlight(true)
+        XCTAssertNil(vm.makeComposerSubmitTarget(tabID: tabID, session: session))
+        XCTAssertNil(vm.makeComposerProps(tabID: tabID).submitTarget)
+
+        vm.test_setWorkspaceSwitchInFlight(false)
+        XCTAssertNotNil(vm.makeComposerSubmitTarget(tabID: tabID, session: session))
+    }
+
     func testComposerCancelTargetUsesExplicitTabSessionIdentity() throws {
         let vm = makeViewModel()
         let runningTabID = UUID()
