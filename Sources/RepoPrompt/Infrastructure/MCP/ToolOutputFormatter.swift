@@ -1724,6 +1724,16 @@ extension ToolOutputFormatter {
         // Preferred DTO decoding
         if let dto = value.decode(ToolResultDTOs.ReadFileReply.self) {
             let displayPath = dto.displayPath ?? path
+            if let errorCode = dto.errorCode, dto.retryable == true {
+                let text = readFileRetryableFailure(
+                    path: displayPath,
+                    error: dto.errorMessage ?? dto.message ?? "Read failed with a retryable workspace error.",
+                    errorCode: errorCode,
+                    retryAfterMilliseconds: dto.retryAfterMilliseconds,
+                    worktreeScope: dto.worktreeScope
+                )
+                return [.text(text)]
+            }
             let text = readFile(
                 path: displayPath,
                 first: dto.firstLine,
@@ -1776,6 +1786,33 @@ extension ToolOutputFormatter {
         }
         // Final fallback: present JSON
         return formatGeneric(value: value)
+    }
+
+    private static func readFileRetryableFailure(
+        path: String,
+        error: String,
+        errorCode: String,
+        retryAfterMilliseconds: Int?,
+        worktreeScope: ToolResultDTOs.WorktreeScopeDTO?
+    ) -> String {
+        let status = switch errorCode {
+        case "workspace_freshness_timeout":
+            "Workspace freshness timed out"
+        default:
+            "Retryable read failure"
+        }
+        var out: [String] = []
+        out.append("## File Read ⚠️")
+        out.append("- **Path**: `\(path)`")
+        out.append("- **Status**: \(status)")
+        out.append("- **Code**: \(errorCode)")
+        out.append("- **Retryable**: yes")
+        if let retryAfterMilliseconds {
+            out.append("- **Retry after**: \(retryAfterMilliseconds) ms")
+        }
+        out.append("- **Message**: \(error)")
+        out.append(contentsOf: worktreeScopeLines(worktreeScope, operation: .readFile))
+        return out.joined(separator: "\n")
     }
 
     static func formatChatLog(value: Value, emitResources: Bool) -> [MCP.Tool.Content] {

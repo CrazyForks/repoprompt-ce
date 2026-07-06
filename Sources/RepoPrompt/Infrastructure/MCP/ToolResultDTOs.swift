@@ -713,6 +713,10 @@ enum ToolResultDTOs {
         let message: String?
         let displayPath: String?
         let worktreeScope: WorktreeScopeDTO?
+        let errorMessage: String?
+        let errorCode: String?
+        let retryable: Bool?
+        let retryAfterMilliseconds: Int?
 
         init(
             content: String,
@@ -721,7 +725,11 @@ enum ToolResultDTOs {
             lastLine: Int,
             message: String? = nil,
             displayPath: String? = nil,
-            worktreeScope: WorktreeScopeDTO? = nil
+            worktreeScope: WorktreeScopeDTO? = nil,
+            errorMessage: String? = nil,
+            errorCode: String? = nil,
+            retryable: Bool? = nil,
+            retryAfterMilliseconds: Int? = nil
         ) {
             self.content = content
             self.totalLines = totalLines
@@ -730,6 +738,10 @@ enum ToolResultDTOs {
             self.message = message
             self.displayPath = displayPath
             self.worktreeScope = worktreeScope
+            self.errorMessage = errorMessage
+            self.errorCode = errorCode
+            self.retryable = retryable
+            self.retryAfterMilliseconds = retryAfterMilliseconds
         }
 
         private enum CodingKeys: String, CodingKey {
@@ -740,6 +752,10 @@ enum ToolResultDTOs {
             case message
             case displayPath = "display_path"
             case worktreeScope = "worktree_scope"
+            case errorMessage = "error"
+            case errorCode = "error_code"
+            case retryable
+            case retryAfterMilliseconds = "retry_after_ms"
         }
     }
 

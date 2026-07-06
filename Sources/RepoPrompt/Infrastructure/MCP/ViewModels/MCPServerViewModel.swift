@@ -5694,7 +5694,11 @@ final class MCPServerViewModel: ObservableObject {
         try Task.checkCancellation()
         EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.rootRefsLookup, rootRefsLookup)
 
-        try await readableService.awaitFreshnessForExplicitRequest(path, rootRefs: roots)
+        try await readableService.awaitFreshnessForExplicitRequest(
+            path,
+            rootRefs: roots,
+            timeout: MCPTimeoutPolicy.workspaceFreshnessWaitTimeout
+        )
         try Task.checkCancellation()
 
         let resolution = await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.resolveReadableFile) {

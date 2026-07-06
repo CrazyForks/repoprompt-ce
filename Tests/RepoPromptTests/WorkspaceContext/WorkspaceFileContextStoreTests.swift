@@ -3188,6 +3188,79 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             await store.stopWatchingRoot(id: rootID)
         }
 
+        func testReadFreshnessTimeoutThrowsBeforeCanonicalFlightCompletes() async throws {
+            let root = try makeTemporaryRoot(name: "ReadFreshnessTimeout")
+            let fileURL = root.appendingPathComponent("Seed.swift")
+            try write("seed", to: fileURL)
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            await resetScopedIngressBarrierAfterSeededLoad(store, rootID: record.id)
+            let flushGate = AsyncGate()
+            await store.setScopedIngressBarrierWillFlushHandler { observedRootID in
+                guard observedRootID == record.id else { return }
+                await flushGate.markStartedAndWaitForRelease()
+            }
+
+            let completed = AsyncSignal()
+            let request = Task { () -> WorkspaceAppliedIngressWaitError? in
+                let observedError: WorkspaceAppliedIngressWaitError?
+                do {
+                    let service = WorkspaceReadableFileService(store: store)
+                    try await service.awaitFreshnessForExplicitRequest(
+                        fileURL.path,
+                        fallbackScope: .visibleWorkspace,
+                        timeout: .milliseconds(25)
+                    )
+                    observedError = nil
+                } catch let error as WorkspaceAppliedIngressWaitError {
+                    observedError = error
+                } catch {
+                    observedError = nil
+                }
+                await completed.mark()
+                return observedError
+            }
+            let flushStarted = await waitForAsyncCondition {
+                await flushGate.startCount() == 1
+            }
+            XCTAssertTrue(flushStarted)
+            let timedOutPromptly = await waitForAsyncCondition {
+                await completed.isMarked()
+            }
+            XCTAssertTrue(timedOutPromptly)
+
+            await flushGate.release()
+            let error = await request.value
+            XCTAssertEqual(error, .timedOut)
+            let settled = await waitForAsyncCondition {
+                let roots = await store.readSearchRootDiagnosticsSnapshot()
+                return roots.first { $0.rootID == record.id }?.barrier.active == nil
+            }
+            XCTAssertTrue(settled)
+            await store.setScopedIngressBarrierWillFlushHandler(nil)
+        }
+
+        func testTimedExplicitFreshnessReturnsSamplesWhenBarrierCompletes() async throws {
+            let root = try makeTemporaryRoot(name: "ReadFreshnessTimeoutSuccess")
+            let fileURL = root.appendingPathComponent("Seed.swift")
+            try write("seed", to: fileURL)
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            await resetScopedIngressBarrierAfterSeededLoad(store, rootID: record.id)
+            let service = WorkspaceReadableFileService(store: store)
+
+            try await service.awaitFreshnessForExplicitRequest(
+                fileURL.path,
+                fallbackScope: .visibleWorkspace,
+                timeout: .seconds(1)
+            )
+            let stats = await store.scopedIngressBarrierStatsForTesting(rootID: record.id)
+            let roots = await store.readSearchRootDiagnosticsSnapshot()
+            let settledRoot = try XCTUnwrap(roots.first { $0.rootID == record.id })
+            XCTAssertEqual(stats.launchCount, 1)
+            XCTAssertNotNil(settledRoot.barrier.lastCompleted)
+        }
+
         func testCancelledReadFreshnessJoinThrowsBeforeCanonicalFlightCompletes() async throws {
             let root = try makeTemporaryRoot(name: "ReadFreshnessCancellation")
             let fileURL = root.appendingPathComponent("Seed.swift")
