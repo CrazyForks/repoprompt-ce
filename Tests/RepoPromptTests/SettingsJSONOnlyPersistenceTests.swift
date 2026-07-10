@@ -1718,7 +1718,9 @@ private final class CountingGlobalSettingsFileStore: GlobalSettingsFileStoring {
     let fileURL: URL
     var document: GlobalSettingsDocument
     var saveCount = 0
-    var blockReason: GlobalSettingsPersistenceBlockReason? { nil }
+    var blockReason: GlobalSettingsPersistenceBlockReason? {
+        nil
+    }
 
     init(document: GlobalSettingsDocument) {
         fileURL = FileManager.default.temporaryDirectory

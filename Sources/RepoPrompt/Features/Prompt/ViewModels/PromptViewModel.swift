@@ -522,8 +522,8 @@ class PromptViewModel: ObservableObject {
         }
     }
 
-	/// Persist the visible Context Builder selection to the active Agent Models profile even
-	/// when the user re-selects the same runtime fallback and observers do not fire.
+    /// Persist the visible Context Builder selection to the active Agent Models profile even
+    /// when the user re-selects the same runtime fallback and observers do not fire.
     func commitContextBuilderSettings() {
         persistContextBuilderSelectionToEffectiveProfile()
         postRecommendationsShouldRefresh(reason: "contextBuilderSettingsCommitted")
