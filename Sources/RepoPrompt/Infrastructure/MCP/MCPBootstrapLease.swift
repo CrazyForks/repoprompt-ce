@@ -46,6 +46,17 @@ enum MCPBootstrapReadinessError: Error, Equatable, Sendable {
     case routingUnavailable
 }
 
+extension MCPBootstrapReadinessError: LocalizedError {
+    var errorDescription: String? {
+        switch self {
+        case .provisioningUnavailable:
+            "RepoPrompt MCP provisioning could not be completed: the RepoPrompt MCP server entry could not be created or updated in the Codex configuration, so the agent cannot start with RepoPrompt tools."
+        case .routingUnavailable:
+            "RepoPrompt MCP routing was not confirmed: the run's routing wait ended without an established MCP connection (timeout or routing failure)."
+        }
+    }
+}
+
 /// Unified lease actor for the MCP bootstrap policy and routing lifecycle.
 ///
 /// Policy installation remains serialized across shared MCP client types. PID-owned policies
