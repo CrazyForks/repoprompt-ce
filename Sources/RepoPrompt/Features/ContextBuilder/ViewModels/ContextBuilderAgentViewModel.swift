@@ -2602,6 +2602,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
                 debugLog("System prompt length: \(message.systemPrompt.count)")
                 debugLog("User message length: \(message.userMessage.count)")
+                await record.reportProgress(.providerProcessStarting)
                 let stream = try await provider.streamAgentMessage(message, runID: runID)
                 guard !Task.isCancelled, acceptsEvents(from: record) else {
                     await lease.failAndCleanup()
@@ -2614,7 +2615,25 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 )
 
                 let routed = await lease.releaseWhenRouted(
-                    timeoutMs: ContextBuilderDefaults.mcpRoutingTimeoutMilliseconds
+                    timeoutMs: ContextBuilderDefaults.mcpRoutingTimeoutMilliseconds,
+                    progressReporter: { [weak record] progress in
+                        guard let record else { return }
+                        let phase: ContextBuilderMCPProgressPhase = switch progress {
+                        case .waitingForChildConnection:
+                            .waitingForChildConnection
+                        case .childConnectionObserved:
+                            .childConnectionObserved
+                        case .waitingForRouting:
+                            .waitingForRouting
+                        case .routingConfirmed:
+                            .routingConfirmed
+                        case .routingTimeoutBeforeConnection:
+                            .routingTimeoutBeforeConnection
+                        case .routingTimeoutAfterConnection:
+                            .routingTimeoutAfterConnection
+                        }
+                        await record.reportProgress(phase)
+                    }
                 )
                 guard !Task.isCancelled, acceptsEvents(from: record) else { return .cancelled }
                 debugLog("Routing result for run \(runID): routed=\(routed)")

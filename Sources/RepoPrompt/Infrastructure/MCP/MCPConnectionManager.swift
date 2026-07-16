@@ -163,21 +163,59 @@ struct MCPResponseDeliverySnapshot: Equatable {
 /// Request-scoped standard MCP progress state. The progress token is supplied by
 /// the caller in `tools/call` metadata and the sequence increases once per emitted
 /// notification for the lifetime of that request.
-final class MCPRequestProgressState: @unchecked Sendable {
-    let token: ProgressToken
-
-    private let lock = NSLock()
+actor MCPRequestProgressState {
+    private let token: ProgressToken
     private var sequence: Double = 0
+    private var acceptsProgress = true
+    private var deliveryTail: Task<Void, Never>?
+    private var inFlightDeliveryCount = 0
+    private var drainContinuations: [CheckedContinuation<Void, Never>] = []
 
     init(token: ProgressToken) {
         self.token = token
     }
 
-    func nextSequence() -> Double {
-        lock.lock()
-        defer { lock.unlock() }
+    /// Assigns the next sequence and enqueues it on the connection actor before
+    /// this actor can accept another emission. This preserves wire-enqueue order
+    /// across concurrent heartbeat, soft-bound, and phase emitters.
+    func send(
+        through connection: any MCPServerConnection,
+        message: String?
+    ) async {
+        guard acceptsProgress else { return }
         sequence += 1
-        return sequence
+        let progress = sequence
+        inFlightDeliveryCount += 1
+        let precedingDelivery = deliveryTail
+        let delivery = Task {
+            await precedingDelivery?.value
+            await connection.sendMCPProgress(
+                token: token,
+                progress: progress,
+                message: message
+            )
+        }
+        deliveryTail = delivery
+        await delivery.value
+        inFlightDeliveryCount -= 1
+        resumeDrainContinuationsIfNeeded()
+    }
+
+    /// Closes the active-request progress lifetime and waits for every accepted
+    /// notification to finish delivery before the final tool result is returned.
+    func invalidateAndDrain() async {
+        acceptsProgress = false
+        guard inFlightDeliveryCount > 0 else { return }
+        await withCheckedContinuation { continuation in
+            drainContinuations.append(continuation)
+        }
+    }
+
+    private func resumeDrainContinuationsIfNeeded() {
+        guard !acceptsProgress, inFlightDeliveryCount == 0 else { return }
+        let continuations = drainContinuations
+        drainContinuations = []
+        continuations.forEach { $0.resume() }
     }
 }
 
@@ -9258,10 +9296,8 @@ actor ServerNetworkManager {
         #endif
         guard let mgr = connections[connectionID] else { return }
         if let standardProgressState {
-            let sequence = standardProgressState.nextSequence()
-            await mgr.sendMCPProgress(
-                token: standardProgressState.token,
-                progress: sequence,
+            await standardProgressState.send(
+                through: mgr,
                 message: "\(tool) [\(stage)]: \(message)"
             )
         } else if supportsRepoPromptControl {
@@ -9711,6 +9747,14 @@ actor ServerNetworkManager {
                 )
             #endif
             return .rejected(runID: policyRunID, reason: "session_token_bound_to_other_run")
+        }
+
+        // This is the authoritative child-observation boundary: the connection has
+        // matched and reserved the exact run-owned name/PID policy and passed existing
+        // run-affinity checks, but run-route installation has not started. Observation
+        // remains sticky if a later route installation is rolled back.
+        if requireRunRouting, let runID = policy.runID {
+            await MCPRoutingWaiter.notifyChildConnectionObserved(runID: runID)
         }
 
         let restorePoint = PendingPolicyRestorePoint(
@@ -10784,6 +10828,10 @@ actor ServerNetworkManager {
             let capturedProgressState = params._meta?.progressToken.map {
                 MCPRequestProgressState(token: $0)
             }
+            func finalizeToolResult(_ result: CallTool.Result) async -> CallTool.Result {
+                await capturedProgressState?.invalidateAndDrain()
+                return result
+            }
 
             // Snapshot routing state before entering the per-connection limiter.
             // Keep the snapshot local to this call so app-wide tools do not share
@@ -10814,10 +10862,12 @@ actor ServerNetworkManager {
             // Connection lanes provide bounded FIFO admission only. Shared-state correctness is
             // enforced below by explicit window/app/repository resource ownership.
             guard let admissionClass = Self.admissionClass(forCanonicalToolName: toolName) else {
-                return Self.executionContractToolErrorResult(
-                    rawJSON: capturedRawJSON,
-                    code: "tool_execution_admission_unclassified",
-                    message: "No static admission classification exists for tool '\(toolName)'."
+                return await finalizeToolResult(
+                    Self.executionContractToolErrorResult(
+                        rawJSON: capturedRawJSON,
+                        code: "tool_execution_admission_unclassified",
+                        message: "No static admission classification exists for tool '\(toolName)'."
+                    )
                 )
             }
             let callLane = admissionClass.connectionLane
@@ -10831,14 +10881,16 @@ actor ServerNetworkManager {
             endPreLimiterEnvelopeIfNeeded()
             guard let limiterResolution else {
                 connectionLog("tools/call \(toolName): rejected because connection limiter is unavailable")
-                return Self.executionContractToolErrorResult(
-                    rawJSON: capturedRawJSON,
-                    code: "tool_execution_connection_terminal",
-                    message: "The MCP connection is closing."
+                return await finalizeToolResult(
+                    Self.executionContractToolErrorResult(
+                        rawJSON: capturedRawJSON,
+                        code: "tool_execution_connection_terminal",
+                        message: "The MCP connection is closing."
+                    )
                 )
             }
             connectionLog("tools/call \(toolName): entering limiter lane=\(callLane.rawValue)")
-            return await EditFlowPerf.measure(
+            let result = await EditFlowPerf.measure(
                 EditFlowPerf.Stage.MCPToolCall.limiterEnvelope,
                 EditFlowPerf.Dimensions(toolName: toolName)
             ) {
@@ -12083,6 +12135,7 @@ actor ServerNetworkManager {
                     } // PermitBodyEnvelope wrapper
                 } // withPermit wrapper
             } // LimiterEnvelope wrapper
+            return await finalizeToolResult(result)
         }
     }
 

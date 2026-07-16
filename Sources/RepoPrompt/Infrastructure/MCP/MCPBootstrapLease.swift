@@ -6,6 +6,19 @@ private func acpLeaseLog(_ message: @autoclosure () -> String) {
     print(message())
 }
 
+enum MCPBootstrapRoutingProgress: String {
+    case waitingForChildConnection = "waiting_for_child_connection"
+    case childConnectionObserved = "child_connection_observed"
+    case waitingForRouting = "waiting_for_routing"
+    case routingConfirmed = "routing_confirmed"
+    case routingTimeoutBeforeConnection = "routing_timeout_before_connection"
+    case routingTimeoutAfterConnection = "routing_timeout_after_connection"
+}
+
+typealias MCPBootstrapRoutingProgressReporter = @MainActor @Sendable (
+    MCPBootstrapRoutingProgress
+) async -> Void
+
 /// Specification describing the MCP bootstrap requirements for a single run.
 /// Used by both agent-mode and headless discovery paths.
 struct MCPBootstrapLeaseSpec {
@@ -271,12 +284,33 @@ actor MCPBootstrapLease {
     /// PID-owned policies have already released the gate but retain this routing/policy cleanup.
     /// If routing fails/times out, clears the pending policy entry.
     @discardableResult
-    func releaseWhenRouted(timeoutMs: Int = 10000) async -> Bool {
+    func releaseWhenRouted(
+        timeoutMs: Int = 10000,
+        progressReporter: MCPBootstrapRoutingProgressReporter? = nil
+    ) async -> Bool {
         if hasReleased {
             acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) releaseWhenRouted() ignored because lease already released")
             return false
         }
         hasReleased = true
+
+        let ownedGateBeforeWait = ownsGate
+        async let pendingReleaseResult = AgentRunCoordinator.shared.releaseGateWhenRouted(
+            runID: spec.runID,
+            gateID: spec.gateID,
+            timeoutMs: timeoutMs
+        )
+        await progressReporter?(.waitingForChildConnection)
+        let connectionObservationTask = progressReporter.map { progressReporter in
+            Task {
+                guard await MCPRoutingWaiter.waitUntilChildConnectionObserved(
+                    runID: spec.runID
+                ) else { return false }
+                await progressReporter(.childConnectionObserved)
+                await progressReporter(.waitingForRouting)
+                return true
+            }
+        }
 
         acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) releaseWhenRouted() waiting for routing client=\(spec.clientName ?? "<none>") timeoutMs=\(timeoutMs)")
         #if DEBUG
@@ -290,18 +324,26 @@ actor MCPBootstrapLease {
                 ]
             )
         #endif
-        let ownedGateBeforeWait = ownsGate
-        let releaseResult = await AgentRunCoordinator.shared.releaseGateWhenRouted(
-            runID: spec.runID,
-            gateID: spec.gateID,
-            timeoutMs: timeoutMs
+        let releaseResult = await pendingReleaseResult
+        let childConnectionWasObserved = await MCPRoutingWaiter.childConnectionWasObserved(
+            runID: spec.runID
         )
         ownsGate = false
         let routed = releaseResult.routed
         if ownedGateBeforeWait || releaseResult.gateRelease.released {
+            let gateReleaseReason = switch releaseResult.routingOutcome {
+            case .routed:
+                "routing_completed"
+            case .cancelled:
+                "routing_cancelled"
+            case .failed:
+                "routing_failed"
+            case .timedOut:
+                "routing_timeout"
+            }
             await recordGateRelease(
                 releaseResult.gateRelease,
-                reason: routed ? "routing_completed" : (Task.isCancelled ? "routing_cancelled" : "routing_timeout_or_failure")
+                reason: gateReleaseReason
             )
         }
         acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) releaseWhenRouted() completed routed=\(routed)")
@@ -326,6 +368,37 @@ actor MCPBootstrapLease {
         }
         if routingRegistered {
             await cleanupRoutingOnce()
+        }
+
+        let shouldReportConnectionObservation = switch releaseResult.routingOutcome {
+        case .routed:
+            childConnectionWasObserved
+        case let .timedOut(childConnectionObserved):
+            childConnectionObserved
+        case .failed, .cancelled:
+            false
+        }
+        if shouldReportConnectionObservation {
+            let observationWasReported = await connectionObservationTask?.value ?? false
+            if !observationWasReported {
+                await progressReporter?(.childConnectionObserved)
+                await progressReporter?(.waitingForRouting)
+            }
+        } else {
+            connectionObservationTask?.cancel()
+            await connectionObservationTask?.value
+        }
+        switch releaseResult.routingOutcome {
+        case .routed:
+            await progressReporter?(.routingConfirmed)
+        case let .timedOut(childConnectionObserved):
+            await progressReporter?(
+                childConnectionObserved
+                    ? .routingTimeoutAfterConnection
+                    : .routingTimeoutBeforeConnection
+            )
+        case .failed, .cancelled:
+            break
         }
 
         return routed

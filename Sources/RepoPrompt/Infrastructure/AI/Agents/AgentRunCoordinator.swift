@@ -25,8 +25,12 @@ struct AgentRunSpec {
 /// This centralises policy installation and provider orchestration for headless runs.
 final class AgentRunCoordinator {
     struct GateRoutingReleaseResult {
-        let routed: Bool
+        let routingOutcome: MCPRoutingWaitOutcome
         let gateRelease: HeadlessAgentConnectionGate.ReleaseResult
+
+        var routed: Bool {
+            routingOutcome.routed
+        }
     }
 
     static let shared = AgentRunCoordinator()
@@ -155,23 +159,32 @@ final class AgentRunCoordinator {
 
         // Event-driven wait with cancellation support:
         // On task cancellation, we signal failure immediately so the wait doesn't block until timeout.
-        let routed = await withTaskCancellationHandler {
-            await MCPRoutingWaiter.waitUntilRouted(runID: runID, timeoutSeconds: timeoutSeconds)
+        let observedRoutingOutcome = await withTaskCancellationHandler {
+            await MCPRoutingWaiter.waitForRoutingOutcome(
+                runID: runID,
+                timeoutSeconds: timeoutSeconds
+            )
         } onCancel: {
             // Expedite: tell the waiter this run will never route (task was cancelled)
             MCPRoutingWaiter.signalFailed(runID)
         }
+        let routingOutcome: MCPRoutingWaitOutcome = Task.isCancelled
+            ? .cancelled
+            : observedRoutingOutcome
 
         let gateKey = gateID ?? runID
         let gateRelease = await HeadlessAgentConnectionGate.completeIfActiveWithDiagnostics(gateKey)
 
-        if routed {
+        if routingOutcome.routed {
             log.info("Gate release after routing event: runID=\(runID.uuidString) gateID=\(gateKey.uuidString) released=\(gateRelease.released)")
         } else {
-            log.info("Gate release after timeout/failure/cancel: runID=\(runID.uuidString) gateID=\(gateKey.uuidString) released=\(gateRelease.released)")
+            log.info("Gate release after routing outcome \(String(describing: routingOutcome)): runID=\(runID.uuidString) gateID=\(gateKey.uuidString) released=\(gateRelease.released)")
         }
 
-        return GateRoutingReleaseResult(routed: routed, gateRelease: gateRelease)
+        return GateRoutingReleaseResult(
+            routingOutcome: routingOutcome,
+            gateRelease: gateRelease
+        )
     }
 }
 
