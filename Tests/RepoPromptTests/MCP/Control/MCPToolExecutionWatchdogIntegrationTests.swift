@@ -1985,6 +1985,18 @@ import XCTest
                         }
                     }
                     XCTAssertTrue(lateTraceArrived)
+                    let ownershipStateArrived = await Self.waitUntil {
+                        EditFlowPerf.debugCaptureSnapshot(finish: false).lifecycleEvents.contains {
+                            $0.eventName == "MCP.ToolCall.PublicationOwnershipState"
+                                && $0.sanitizedDimensions.contains("tool=get_code_structure")
+                                && $0.sanitizedDimensions.contains("outcome=detached_settled")
+                                && $0.sanitizedDimensions.contains("providerActive=false")
+                                && $0.sanitizedDimensions.contains("networkScopeActive=false")
+                                && $0.sanitizedDimensions.contains("permitActive=false")
+                                && $0.sanitizedDimensions.contains("publicationPending=false")
+                        }
+                    }
+                    XCTAssertTrue(ownershipStateArrived)
 
                     let finalEvents = recorder.snapshot().filter { $0.invocationID == detachedEvent.invocationID }
                     let settledEvent = try XCTUnwrap(finalEvents.first { $0.phase == .detachedSettled })
