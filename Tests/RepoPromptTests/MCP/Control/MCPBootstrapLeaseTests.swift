@@ -358,7 +358,7 @@ final class MCPBootstrapLeaseTests: XCTestCase {
             ),
             policyInstaller: { _ in await policyRecorder.recordInstall() },
             policyClearer: { _ in await policyRecorder.recordClear() },
-            committedRouteConfirmer: { _ in true }
+            routeAuthorityResolver: { _ in .committed }
         )
         let acquired = await lease.acquire()
         XCTAssertTrue(acquired)
@@ -409,7 +409,7 @@ final class MCPBootstrapLeaseTests: XCTestCase {
             ),
             policyInstaller: { _ in await policyRecorder.recordInstall() },
             policyClearer: { _ in await policyRecorder.recordClear() },
-            committedRouteConfirmer: { _ in false }
+            routeAuthorityResolver: { _ in .revocationFenced }
         )
         let acquired = await lease.acquire()
         XCTAssertTrue(acquired)

@@ -474,6 +474,7 @@ extension AgentModeViewModel {
         @Published var contextUsageSnapshot: ContextUsageSnapshot? = nil
         var contextCompactedAt: Date?
         var codexNeedsReconnect: Bool = false
+        var codexNativeStartupDisposition: CodexNativeStartupDisposition?
         var codexResumeTimeoutState: CodexResumeTimeoutState = .init()
         var codexToolPreferencesGeneration: Int = 0
         var codexController: (any CodexSessionControlling)? {

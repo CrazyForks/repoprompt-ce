@@ -459,6 +459,12 @@ extension AgentModeViewModel {
         var requiresColdTeardownOnCancel: Bool = false
     }
 
+    enum CodexNativeStartupDisposition: Equatable {
+        case fresh
+        case resumed
+        case resumeFellBackToFresh
+    }
+
     struct CodexResumeTimeoutState: Equatable {
         var conversationID: String?
         var rolloutPath: String?

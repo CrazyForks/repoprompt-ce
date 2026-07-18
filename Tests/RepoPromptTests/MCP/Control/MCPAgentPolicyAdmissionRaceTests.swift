@@ -14,6 +14,8 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
             await manager.debugResumePendingPolicyObservation()
             await manager.debugResumePendingPolicyRouteInstallation()
             await manager.debugResumePendingPolicyCommit()
+            await manager.debugResumeConfirmOrFence()
+            await manager.debugResumeConfirmOrFenceBeforeRevocation()
         #endif
         try await super.tearDown()
     }
@@ -1243,6 +1245,398 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
             await MCPRoutingWaiter.cleanup(runID: runID)
         #else
             throw XCTSkip("Pending policy commit diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    @MainActor
+    func testConfirmOrFenceReobservesCommitThatLandsAfterInitialFalseSample() async throws {
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                let window = makeWindow()
+                defer { WindowStatesManager.shared.unregisterWindowState(window) }
+                let runID = UUID()
+                let connectionID = UUID()
+                let liveConnection = MCPPolicyAuthorityTestConnection()
+                await manager.debugRegisterConnectionForSocketFixture(
+                    connectionID: connectionID,
+                    connection: liveConnection,
+                    clientName: clientName,
+                    sessionToken: "confirm-before-fence-\(runID.uuidString)"
+                )
+                await installPolicy(runID: runID, windowID: window.windowID)
+                await manager.registerExpectedAgentPID(getpid(), for: clientName, runID: runID)
+                await manager.debugSuspendNextPendingPolicyCommit()
+
+                let application = Task {
+                    await manager.debugApplyPendingPolicy(
+                        clientName: clientName,
+                        connectionID: connectionID,
+                        clientPid: Int(getpid()),
+                        bootstrapClientName: "repoprompt_ce_cli_debug",
+                        pidGateTimeout: 0.25,
+                        requireRunRouting: true
+                    )
+                }
+                let commitSuspended = await waitUntil { await self.manager.debugIsPendingPolicyCommitSuspended() }
+                XCTAssertTrue(commitSuspended)
+
+                await manager.debugSuspendNextConfirmOrFence()
+                let decisionTask = Task {
+                    await manager.confirmCommittedRunRouteOrFenceRevocation(
+                        runID: runID,
+                        windowID: window.windowID,
+                        tabID: nil
+                    )
+                }
+                let confirmSuspended = await waitUntil { await self.manager.debugIsConfirmOrFenceSuspended() }
+                XCTAssertTrue(confirmSuspended)
+
+                await manager.debugResumePendingPolicyCommit()
+                let applicationResult = await application.value
+                XCTAssertEqual(applicationResult.outcome, "applied")
+                await manager.debugResumeConfirmOrFence()
+                let decision = await decisionTask.value
+                XCTAssertEqual(decision, .committed)
+                let routeIsCommitted = await manager.isRunRouteAuthoritativelyCommitted(
+                    runID: runID,
+                    windowID: window.windowID,
+                    tabID: nil
+                )
+                XCTAssertTrue(routeIsCommitted)
+
+                await cleanup(
+                    runID: runID,
+                    connectionID: connectionID,
+                    windowID: window.windowID,
+                    expectedPID: getpid()
+                )
+            }
+        #else
+            throw XCTSkip("Conditional route revocation diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    @MainActor
+    func testConfirmOrFenceRetriesCommitThatLandsAfterNilMainActorMapping() async throws {
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                let window = makeWindow()
+                defer { WindowStatesManager.shared.unregisterWindowState(window) }
+                let runID = UUID()
+                let connectionID = UUID()
+                let liveConnection = MCPPolicyAuthorityTestConnection()
+                await manager.debugRegisterConnectionForSocketFixture(
+                    connectionID: connectionID,
+                    connection: liveConnection,
+                    clientName: clientName,
+                    sessionToken: "late-main-actor-commit-\(runID.uuidString)"
+                )
+                await installPolicy(runID: runID, windowID: window.windowID)
+                await manager.registerExpectedAgentPID(getpid(), for: clientName, runID: runID)
+                await manager.debugSuspendNextPendingPolicyCommit()
+
+                let application = Task {
+                    await manager.debugApplyPendingPolicy(
+                        clientName: clientName,
+                        connectionID: connectionID,
+                        clientPid: Int(getpid()),
+                        bootstrapClientName: "repoprompt_ce_cli_debug",
+                        pidGateTimeout: 0.25,
+                        requireRunRouting: true
+                    )
+                }
+                let commitSuspended = await waitUntil { await self.manager.debugIsPendingPolicyCommitSuspended() }
+                XCTAssertTrue(commitSuspended)
+
+                await manager.debugSuspendNextConfirmOrFenceBeforeRevocation()
+                let decisionTask = Task {
+                    await manager.confirmCommittedRunRouteOrFenceRevocation(
+                        runID: runID,
+                        windowID: window.windowID,
+                        tabID: nil
+                    )
+                }
+                let beforeRevocationSuspended = await waitUntil {
+                    await self.manager.debugIsConfirmOrFenceBeforeRevocationSuspended()
+                }
+                XCTAssertTrue(beforeRevocationSuspended)
+
+                await manager.debugResumePendingPolicyCommit()
+                let applicationResult = await application.value
+                XCTAssertEqual(applicationResult.outcome, "applied")
+                await manager.debugResumeConfirmOrFenceBeforeRevocation()
+                let decision = await decisionTask.value
+                XCTAssertEqual(decision, .committed)
+                let routeIsCommitted = await manager.isRunRouteAuthoritativelyCommitted(
+                    runID: runID,
+                    windowID: window.windowID,
+                    tabID: nil
+                )
+                XCTAssertTrue(routeIsCommitted)
+
+                await cleanup(
+                    runID: runID,
+                    connectionID: connectionID,
+                    windowID: window.windowID,
+                    expectedPID: getpid()
+                )
+            }
+        #else
+            throw XCTSkip("Conditional route revocation diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    @MainActor
+    func testConfirmOrFenceLateCandidateSkipsStaleTerminalPredecessorMapping() async throws {
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                let window = makeWindow()
+                defer { WindowStatesManager.shared.unregisterWindowState(window) }
+                let runID = UUID()
+
+                // Construct a displaced predecessor exactly as a reconnect/handover
+                // leaves it before its scheduled removal completes: the MainActor run
+                // route no longer points at it, its transport is terminal, but its
+                // actor-side run mapping still resolves to the run. Seed that
+                // actor-side state directly instead of applying a full predecessor
+                // policy and letting the successor displace it — displacement arms an
+                // asynchronous pending-policy replacement cleanup task that races
+                // this test's observation window and can remove the stale mapping
+                // before the late-candidate probe runs.
+                let staleConnectionID = UUID()
+                let staleConnection = MCPPolicyAuthorityTestConnection()
+                await manager.debugRegisterConnectionForSocketFixture(
+                    connectionID: staleConnectionID,
+                    connection: staleConnection,
+                    clientName: clientName,
+                    sessionToken: "late-candidate-stale-\(runID.uuidString)"
+                )
+                await manager.debugSeedConnectionRunRouting(
+                    connectionID: staleConnectionID,
+                    runID: runID,
+                    purpose: .agentModeRun,
+                    windowID: window.windowID
+                )
+                await manager.debugPublishTransportTerminalForTesting(connectionID: staleConnectionID)
+                let staleMappedRunIDBeforeSuccessor = await manager.runIDForConnection(staleConnectionID)
+                XCTAssertEqual(staleMappedRunIDBeforeSuccessor, runID)
+
+                let successorConnectionID = UUID()
+                let successorConnection = MCPPolicyAuthorityTestConnection()
+                await manager.debugRegisterConnectionForSocketFixture(
+                    connectionID: successorConnectionID,
+                    connection: successorConnection,
+                    clientName: clientName,
+                    sessionToken: "late-candidate-successor-\(runID.uuidString)"
+                )
+                await installPolicy(runID: runID, windowID: window.windowID)
+                await manager.registerExpectedAgentPID(getpid(), for: clientName, runID: runID)
+                await manager.debugSuspendNextPendingPolicyCommit()
+
+                let application = Task {
+                    await manager.debugApplyPendingPolicy(
+                        clientName: clientName,
+                        connectionID: successorConnectionID,
+                        clientPid: Int(getpid()),
+                        bootstrapClientName: "repoprompt_ce_cli_debug",
+                        pidGateTimeout: 0.25,
+                        requireRunRouting: true
+                    )
+                }
+                let commitSuspended = await waitUntil { await self.manager.debugIsPendingPolicyCommitSuspended() }
+                XCTAssertTrue(commitSuspended)
+
+                await manager.debugSuspendNextConfirmOrFenceBeforeRevocation()
+                let decisionTask = Task {
+                    await manager.confirmCommittedRunRouteOrFenceRevocation(
+                        runID: runID,
+                        windowID: window.windowID,
+                        tabID: nil
+                    )
+                }
+                let beforeRevocationSuspended = await waitUntil {
+                    await self.manager.debugIsConfirmOrFenceBeforeRevocationSuspended()
+                }
+                XCTAssertTrue(beforeRevocationSuspended)
+
+                await manager.debugResumePendingPolicyCommit()
+                let applicationResult = await application.value
+                XCTAssertEqual(applicationResult.outcome, "applied")
+
+                // Both mappings must be visible when the late-candidate probe runs:
+                // the stale terminal predecessor and the committed successor. The
+                // probe must not let the stale mapping mask the committed route.
+                let staleMappedRunID = await manager.runIDForConnection(staleConnectionID)
+                XCTAssertEqual(staleMappedRunID, runID)
+                let staleIsTerminal = await manager.debugIsTransportTerminalForTesting(
+                    connectionID: staleConnectionID
+                )
+                XCTAssertTrue(staleIsTerminal)
+                let successorMappedRunID = await manager.runIDForConnection(successorConnectionID)
+                XCTAssertEqual(successorMappedRunID, runID)
+
+                await manager.debugResumeConfirmOrFenceBeforeRevocation()
+                let decision = await decisionTask.value
+                XCTAssertEqual(decision, .committed)
+                // The stale terminal mapping is still present after the decision, so
+                // the late-candidate probe observed both mappings and itself skipped
+                // the terminal predecessor — the committed decision did not depend on
+                // background cleanup removing the stale mapping first.
+                let staleMappedRunIDAfterDecision = await manager.runIDForConnection(staleConnectionID)
+                XCTAssertEqual(staleMappedRunIDAfterDecision, runID)
+                let staleIsTerminalAfterDecision = await manager.debugIsTransportTerminalForTesting(
+                    connectionID: staleConnectionID
+                )
+                XCTAssertTrue(staleIsTerminalAfterDecision)
+                // The committed authority is the successor's route, not the stale
+                // predecessor's.
+                XCTAssertEqual(window.mcpServer.connectionIDByRunID[runID], successorConnectionID)
+                let routeIsCommitted = await manager.isRunRouteAuthoritativelyCommitted(
+                    runID: runID,
+                    windowID: window.windowID,
+                    tabID: nil
+                )
+                XCTAssertTrue(routeIsCommitted)
+
+                await manager.removeConnection(staleConnectionID)
+                await cleanup(
+                    runID: runID,
+                    connectionID: successorConnectionID,
+                    windowID: window.windowID,
+                    expectedPID: getpid()
+                )
+            }
+        #else
+            throw XCTSkip("Conditional route revocation diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    @MainActor
+    func testConfirmOrFencePreventsSuspendedCommitAfterRevocationFence() async throws {
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                let window = makeWindow()
+                defer { WindowStatesManager.shared.unregisterWindowState(window) }
+                let runID = UUID()
+                let connectionID = UUID()
+                let liveConnection = MCPPolicyAuthorityTestConnection()
+                await manager.debugRegisterConnectionForSocketFixture(
+                    connectionID: connectionID,
+                    connection: liveConnection,
+                    clientName: clientName,
+                    sessionToken: "fence-before-commit-\(runID.uuidString)"
+                )
+                await installPolicy(runID: runID, windowID: window.windowID)
+                await manager.registerExpectedAgentPID(getpid(), for: clientName, runID: runID)
+                await manager.debugSuspendNextPendingPolicyCommit()
+
+                let application = Task {
+                    await manager.debugApplyPendingPolicy(
+                        clientName: clientName,
+                        connectionID: connectionID,
+                        clientPid: Int(getpid()),
+                        bootstrapClientName: "repoprompt_ce_cli_debug",
+                        pidGateTimeout: 0.25,
+                        requireRunRouting: true
+                    )
+                }
+                let commitSuspended = await waitUntil { await self.manager.debugIsPendingPolicyCommitSuspended() }
+                XCTAssertTrue(commitSuspended)
+
+                let decision = await manager.confirmCommittedRunRouteOrFenceRevocation(
+                    runID: runID,
+                    windowID: window.windowID,
+                    tabID: nil
+                )
+                XCTAssertEqual(decision, .revocationFenced)
+                await manager.revokeClientConnectionPolicy(
+                    for: clientName,
+                    windowID: window.windowID,
+                    runID: runID
+                )
+                await manager.debugResumePendingPolicyCommit()
+                let applicationResult = await application.value
+                XCTAssertEqual(applicationResult.outcome, "rejected:stale_connection")
+                let routeIsCommitted = await manager.isRunRouteAuthoritativelyCommitted(
+                    runID: runID,
+                    windowID: window.windowID,
+                    tabID: nil
+                )
+                XCTAssertFalse(routeIsCommitted)
+
+                await cleanup(
+                    runID: runID,
+                    connectionID: connectionID,
+                    windowID: window.windowID,
+                    expectedPID: getpid()
+                )
+            }
+        #else
+            throw XCTSkip("Conditional route revocation diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    @MainActor
+    func testTransportTerminalPublicationPreventsCommittedRouteConfirmation() async throws {
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                let window = makeWindow()
+                defer { WindowStatesManager.shared.unregisterWindowState(window) }
+                let runID = UUID()
+                let connectionID = UUID()
+                let liveConnection = MCPPolicyAuthorityTestConnection()
+                await manager.debugRegisterConnectionForSocketFixture(
+                    connectionID: connectionID,
+                    connection: liveConnection,
+                    clientName: clientName,
+                    sessionToken: "terminal-before-confirm-\(runID.uuidString)"
+                )
+                await installPolicy(runID: runID, windowID: window.windowID)
+                await manager.registerExpectedAgentPID(getpid(), for: clientName, runID: runID)
+                let application = await manager.debugApplyPendingPolicy(
+                    clientName: clientName,
+                    connectionID: connectionID,
+                    clientPid: Int(getpid()),
+                    bootstrapClientName: "repoprompt_ce_cli_debug",
+                    pidGateTimeout: 0.25,
+                    requireRunRouting: true
+                )
+                XCTAssertEqual(application.outcome, "applied")
+                let routeWasCommitted = await manager.isRunRouteAuthoritativelyCommitted(
+                    runID: runID,
+                    windowID: window.windowID,
+                    tabID: nil
+                )
+                XCTAssertTrue(routeWasCommitted)
+
+                await manager.debugPublishTransportTerminalForTesting(connectionID: connectionID)
+                let terminalRouteIsCommitted = await manager.isRunRouteAuthoritativelyCommitted(
+                    runID: runID,
+                    windowID: window.windowID,
+                    tabID: nil
+                )
+                XCTAssertFalse(terminalRouteIsCommitted)
+                let terminalDecision = await manager.confirmCommittedRunRouteOrFenceRevocation(
+                    runID: runID,
+                    windowID: window.windowID,
+                    tabID: nil
+                )
+                XCTAssertEqual(terminalDecision, .revocationFenced)
+
+                await cleanup(
+                    runID: runID,
+                    connectionID: connectionID,
+                    windowID: window.windowID,
+                    expectedPID: getpid()
+                )
+                await manager.debugPublishTransportTerminalForTesting(connectionID: connectionID)
+                let terminalMarkerWasReinserted = await manager.debugIsTransportTerminalForTesting(
+                    connectionID: connectionID
+                )
+                XCTAssertFalse(terminalMarkerWasReinserted)
+            }
+        #else
+            throw XCTSkip("Transport terminal routing authority requires DEBUG helpers.")
         #endif
     }
 

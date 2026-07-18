@@ -146,6 +146,61 @@ final class CodexMCPRoutingReadinessTests: XCTestCase {
         }
     }
 
+    func testResumeFallbackToFreshRoutingFailureUsesStartPrefixAndDeduplicates() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            let controller = RoutingReadinessFakeCodexController(failFirstResumeForMissingRollout: true)
+            let recorder = TerminalPublicationRecorder()
+            let coordinator = makeCoordinator(controller: controller, recorder: recorder, routeOnPolicyInstall: false)
+
+            let session = makeCodexSession()
+            session.setItemsSilently(
+                [
+                    .user("earlier", sequenceIndex: 0),
+                    .assistant("earlier reply", sequenceIndex: 1)
+                ],
+                reason: .persistedSessionHydration
+            )
+            session.codexConversationID = "missing-rollout-thread"
+            session.codexRolloutPath = "/missing/rollout.jsonl"
+            session.codexNeedsReconnect = true
+            session.beginRunAttempt(source: "test.routing-readiness.resume-fallback-fail")
+
+            let outcome = await coordinator.sendCodexNativeMessage(
+                session: session,
+                text: "next turn",
+                attachments: []
+            )
+            if let runID = session.runID {
+                trackedRunIDs.append(runID)
+            }
+
+            XCTAssertEqual(controller.startAttemptWasResume, [true, false])
+            XCTAssertEqual(controller.startUserTurnCount, 0)
+            XCTAssertEqual(outcome, .failed(message: "Codex native send failed: session not ready"))
+            XCTAssertEqual(recorder.publishedStates, [.failed])
+
+            let startReadinessErrors = session.items.filter {
+                $0.kind == .error
+                    && $0.text.hasPrefix("Codex native start failed:")
+                    && $0.text.contains("RepoPrompt MCP routing was not confirmed")
+            }
+            XCTAssertEqual(startReadinessErrors.count, 1)
+            XCTAssertFalse(
+                session.items.contains { $0.kind == .error && $0.text.hasPrefix("Codex native resume failed:") },
+                "a successful fresh fallback must not be labeled as a resume failure"
+            )
+            #if DEBUG
+                XCTAssertTrue(
+                    CodexAgentModeCoordinator.debugIsCodexNativeSessionFailureText(
+                        "Codex native start failed: RepoPrompt MCP routing was not confirmed",
+                        disposition: .resumed
+                    ),
+                    "a stale resumed disposition must still deduplicate a later fresh-start failure"
+                )
+            #endif
+        }
+    }
+
     // MARK: - Cancellation cannot cross the first-turn boundary
 
     func testCancellationDuringRoutingWaitDoesNotReachFirstTurn() async throws {
@@ -379,8 +434,15 @@ private final class RunIDBox: @unchecked Sendable {
 /// calls so a test can prove the first turn never fired when routing fails closed.
 private final class RoutingReadinessFakeCodexController: CodexSessionControllerTurnDispatchTestDefaults, @unchecked Sendable {
     private let lock = NSLock()
+    private let failFirstResumeForMissingRollout: Bool
+    private var didFailResume = false
     private var started = false
     private var turnCount = 0
+    private var resumeAttempts: [Bool] = []
+
+    init(failFirstResumeForMissingRollout: Bool = false) {
+        self.failFirstResumeForMissingRollout = failFirstResumeForMissingRollout
+    }
 
     var hasActiveThread: Bool {
         lock.lock()
@@ -394,10 +456,28 @@ private final class RoutingReadinessFakeCodexController: CodexSessionControllerT
         return turnCount
     }
 
+    var startAttemptWasResume: [Bool] {
+        lock.lock()
+        defer { lock.unlock() }
+        return resumeAttempts
+    }
+
     private func markStarted() {
         lock.lock()
         started = true
         lock.unlock()
+    }
+
+    private func recordStartAttempt(existing: CodexNativeSessionController.SessionRef?) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let isResume = existing != nil
+        resumeAttempts.append(isResume)
+        let shouldFail = failFirstResumeForMissingRollout && isResume && !didFailResume
+        if shouldFail {
+            didFailResume = true
+        }
+        return shouldFail
     }
 
     /// A never-finishing stream: a stream that ends would trip the coordinator's unexpected-stream-end
@@ -427,12 +507,19 @@ private final class RoutingReadinessFakeCodexController: CodexSessionControllerT
     }
 
     func startOrResume(
-        existing _: CodexNativeSessionController.SessionRef?,
+        existing: CodexNativeSessionController.SessionRef?,
         baseInstructions _: String,
         model: String?,
         reasoningEffort: String?,
         serviceTier _: String?
     ) async throws -> CodexNativeSessionController.SessionRef {
+        if recordStartAttempt(existing: existing) {
+            throw NSError(
+                domain: "CodexMCPRoutingReadinessTests",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "failed to load rollout: no such file"]
+            )
+        }
         markStarted()
         return CodexNativeSessionController.SessionRef(conversationID: "fake", rolloutPath: nil, model: model, reasoningEffort: reasoningEffort)
     }
