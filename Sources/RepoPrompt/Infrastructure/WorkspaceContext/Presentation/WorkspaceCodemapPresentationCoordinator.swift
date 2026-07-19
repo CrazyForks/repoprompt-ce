@@ -132,6 +132,14 @@ enum WorkspaceCodemapStructureExecutionPhase: Equatable {
     case publicationRevalidation
 }
 
+struct WorkspaceCodemapPresentationAttempt<Context> {
+    let context: Context
+    let intent: WorkspaceCodemapOperationPresentationIntent
+    let rootScope: WorkspaceLookupRootScope
+    let logicalRootDisplayNamesByRootID: [UUID: String]
+    let requestedCodemapCount: Int?
+}
+
 struct WorkspaceCodemapPresentationCoordinator {
     private struct AutomaticPreparation {
         let candidates: [WorkspaceCodemapOperationPresentationCandidate]
@@ -221,47 +229,95 @@ struct WorkspaceCodemapPresentationCoordinator {
             try Task.checkCancellation()
             return value
         }
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: policy.maximumTotalWait)
-        var lastStaleReason: WorkspaceCodemapOperationPublicationStaleReason?
-
-        for attempt in 0 ... 1 {
-            try Task.checkCancellation()
-            let ownership = WorkspaceCodemapOperationPresentationOwnership()
-            do {
-                let result = try await makePresentation(
+        return try await withPresentation(
+            prepareAttempt: {
+                WorkspaceCodemapPresentationAttempt(
+                    context: (),
                     intent: intent,
                     rootScope: rootScope,
                     logicalRootDisplayNamesByRootID: logicalRootDisplayNamesByRootID,
+                    requestedCodemapCount: nil
+                )
+            }
+        ) { _, presentation in
+            try await operation(presentation)
+        }
+    }
+
+    func withPresentation<Context, Value>(
+        prepareAttempt: () async throws -> WorkspaceCodemapPresentationAttempt<Context>,
+        operation: (Context, WorkspaceCodemapOperationPresentation) async throws -> Value
+    ) async throws -> Value {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: policy.maximumTotalWait)
+        var lastStaleReason: WorkspaceCodemapOperationPublicationStaleReason?
+        var initialRequestedCodemapCount: Int?
+        var lastAttempt: WorkspaceCodemapPresentationAttempt<Context>?
+
+        for attempt in 0 ... 1 {
+            try Task.checkCancellation()
+            let prepared = try await prepareAttempt()
+            lastAttempt = prepared
+            if initialRequestedCodemapCount == nil {
+                initialRequestedCodemapCount = prepared.requestedCodemapCount
+            }
+            let ownership = WorkspaceCodemapOperationPresentationOwnership()
+            do {
+                var result = try await makePresentation(
+                    intent: prepared.intent,
+                    rootScope: prepared.rootScope,
+                    logicalRootDisplayNamesByRootID: prepared.logicalRootDisplayNamesByRootID,
                     ownership: ownership,
                     clock: clock,
                     deadline: deadline
                 )
+                if let reason = lastStaleReason,
+                   let requestedCount = initialRequestedCodemapCount
+                {
+                    result = preservingPriorStaleCoverage(
+                        result,
+                        reason: reason,
+                        requestedCodemapCount: requestedCount
+                    )
+                }
                 if let reason = retryableStaleReason(in: result.issues) {
                     lastStaleReason = reason
-                    await release(ownership)
-                    if attempt == 0, clock.now < deadline { continue }
-                    let value = try await operation(incompletePublication(reason: reason))
-                    try Task.checkCancellation()
-                    return value
+                    if attempt == 0, clock.now < deadline {
+                        await release(ownership)
+                        continue
+                    }
+                    guard initialRequestedCodemapCount != nil,
+                          !result.orderedEntries.isEmpty
+                    else {
+                        await release(ownership)
+                        let value = try await operation(
+                            prepared.context,
+                            incompletePublication(reason: reason)
+                        )
+                        try Task.checkCancellation()
+                        return value
+                    }
                 }
                 if let reason = lastStaleReason,
                    result.publicationReceipt == nil,
                    result.orderedEntries.isEmpty
                 {
                     await release(ownership)
-                    let value = try await operation(incompletePublication(reason: reason))
+                    let value = try await operation(
+                        prepared.context,
+                        incompletePublication(reason: reason)
+                    )
                     try Task.checkCancellation()
                     return value
                 }
-                let value = try await operation(result)
+                let value = try await operation(prepared.context, result)
                 try Task.checkCancellation()
                 if let receipt = result.publicationReceipt {
                     await beforePublicationRevalidation(receipt)
                     try Task.checkCancellation()
                     let disposition = await store.revalidateCodemapOperationPresentationForPublication(
                         receipt,
-                        rootScope: rootScope
+                        rootScope: prepared.rootScope
                     )
                     switch disposition {
                     case .current:
@@ -271,7 +327,10 @@ struct WorkspaceCodemapPresentationCoordinator {
                         lastStaleReason = reason
                         await release(ownership)
                         if attempt == 0, clock.now < deadline { continue }
-                        let fallbackValue = try await operation(incompletePublication(reason: reason))
+                        let fallbackValue = try await operation(
+                            prepared.context,
+                            incompletePublication(reason: reason)
+                        )
                         try Task.checkCancellation()
                         return fallbackValue
                     }
@@ -284,7 +343,15 @@ struct WorkspaceCodemapPresentationCoordinator {
                 throw error
             }
         }
-        let value = try await operation(incompletePublication(reason: lastStaleReason ?? .rootScope))
+        let prepared: WorkspaceCodemapPresentationAttempt<Context> = if let lastAttempt {
+            lastAttempt
+        } else {
+            try await prepareAttempt()
+        }
+        let value = try await operation(
+            prepared.context,
+            incompletePublication(reason: lastStaleReason ?? .rootScope)
+        )
         try Task.checkCancellation()
         return value
     }
@@ -1500,6 +1567,30 @@ struct WorkspaceCodemapPresentationCoordinator {
             coverage: .unavailable([issue]),
             issues: [issue],
             publicationReceipt: nil
+        )
+    }
+
+    private func preservingPriorStaleCoverage(
+        _ presentation: WorkspaceCodemapOperationPresentation,
+        reason: WorkspaceCodemapOperationPublicationStaleReason,
+        requestedCodemapCount: Int
+    ) -> WorkspaceCodemapOperationPresentation {
+        guard presentation.orderedEntries.count < requestedCodemapCount else {
+            return presentation
+        }
+        let issue = WorkspaceCodemapOperationIssue.publicationStale(reason)
+        let issues = presentation.issues.contains(issue)
+            ? presentation.issues
+            : presentation.issues + [issue]
+        let coverage: WorkspaceCodemapOperationPresentationCoverage = presentation.orderedEntries.isEmpty
+            ? .unavailable(issues)
+            : .partial(issues)
+        return WorkspaceCodemapOperationPresentation(
+            id: presentation.id,
+            orderedEntries: presentation.orderedEntries,
+            coverage: coverage,
+            issues: issues,
+            publicationReceipt: presentation.publicationReceipt
         )
     }
 

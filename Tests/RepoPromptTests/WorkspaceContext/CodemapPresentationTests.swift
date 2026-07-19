@@ -1035,6 +1035,157 @@ final class CodemapPresentationTests: WorkspaceFileContextStoreCodemapSeamTestSu
         }
     }
 
+    func testPreparedRetryWithEmptyIntentPreservesUnavailablePublicationStaleCoverage() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositoryFixture.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Feature.swift": "protocol FeatureProtocol { func feature() -> String }\nstruct Feature: FeatureProtocol { func feature() -> String { \"feature\" } }\n"
+            ]
+        )
+        let fixture = try CodemapStoreFixture(name: #function)
+        addTeardownBlock {
+            await fixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        let store = fixture.makeStore()
+        let loaded = try await store.loadRoot(path: root.path)
+        let loadedFiles = await store.files(inRoot: loaded.id)
+        let file = try XCTUnwrap(loadedFiles.first)
+        let ready = try await readyArtifactDemand(store: store, forFileID: file.id)
+        addTeardownBlock { _ = await store.cancelCodemapArtifactDemand(ready.ticket) }
+        let preparationCount = CodemapLockedCounter()
+        let publicationCount = CodemapLockedCounter()
+        let coordinator = WorkspaceCodemapPresentationCoordinator(
+            store: store,
+            beforePublicationRevalidation: { _ in
+                publicationCount.increment()
+                if publicationCount.value == 1 {
+                    await store.unloadRoot(id: loaded.id)
+                }
+            }
+        )
+
+        let presentation = try await coordinator.withPresentation(
+            prepareAttempt: {
+                preparationCount.increment()
+                let intent: WorkspaceCodemapOperationPresentationIntent = preparationCount.value == 1
+                    ? .exact(fileIDs: [file.id], completeRootSet: false)
+                    : .none
+                return WorkspaceCodemapPresentationAttempt(
+                    context: (),
+                    intent: intent,
+                    rootScope: .allLoaded,
+                    logicalRootDisplayNamesByRootID: [:],
+                    requestedCodemapCount: preparationCount.value == 1 ? 1 : 0
+                )
+            }
+        ) { _, presentation in
+            presentation
+        }
+
+        XCTAssertTrue(presentation.orderedEntries.isEmpty)
+        guard case .unavailable = presentation.coverage else {
+            return XCTFail("A stale requested codemap cannot become complete when retry intent is empty")
+        }
+        XCTAssertTrue(presentation.issues.contains {
+            if case .publicationStale = $0 { return true }
+            return false
+        })
+        XCTAssertEqual(preparationCount.value, 2)
+        XCTAssertEqual(publicationCount.value, 1)
+    }
+
+    func testPreparedRetryPreservesValidSiblingAsPartialAfterTargetRevocation() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let revokedRoot = try repositoryFixture.makeRepository(
+            named: "revoked",
+            files: [
+                "Sources/Revoked.swift": "protocol RevokedProtocol { func revoked() }\nstruct Revoked: RevokedProtocol { func revoked() {} }\n"
+            ]
+        )
+        let stableRoot = try repositoryFixture.makeRepository(
+            named: "stable",
+            files: [
+                "Sources/Stable.swift": "protocol StableProtocol { func stable() }\nstruct Stable: StableProtocol { func stable() {} }\n"
+            ]
+        )
+        let fixture = try CodemapStoreFixture(name: #function)
+        addTeardownBlock {
+            await fixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        let store = fixture.makeStore()
+        let revokedLoaded = try await store.loadRoot(path: revokedRoot.path)
+        let stableLoaded = try await store.loadRoot(path: stableRoot.path)
+        let revokedFiles = await store.files(inRoot: revokedLoaded.id)
+        let stableFiles = await store.files(inRoot: stableLoaded.id)
+        let revoked = try XCTUnwrap(revokedFiles.first)
+        let stable = try XCTUnwrap(stableFiles.first)
+        async let revokedDemand = readyArtifactDemand(
+            store: store,
+            forFileID: revoked.id,
+            timeout: .seconds(60)
+        )
+        async let stableDemand = readyArtifactDemand(
+            store: store,
+            forFileID: stable.id,
+            timeout: .seconds(60)
+        )
+        let (revokedReady, stableReady) = try await (revokedDemand, stableDemand)
+        addTeardownBlock {
+            _ = await store.cancelCodemapArtifactDemand(revokedReady.ticket)
+            _ = await store.cancelCodemapArtifactDemand(stableReady.ticket)
+        }
+        let preparationCount = CodemapLockedCounter()
+        let publicationCount = CodemapLockedCounter()
+        let coordinator = WorkspaceCodemapPresentationCoordinator(
+            store: store,
+            policy: WorkspaceCodemapPresentationRequestPolicy(
+                maximumReadinessRounds: 20,
+                maximumTotalWait: .seconds(10)
+            ),
+            beforePublicationRevalidation: { receipt in
+                publicationCount.increment()
+                guard publicationCount.value == 1,
+                      let revokedTicket = receipt.demandTickets.first(where: {
+                          $0.fileID == revoked.id
+                      })
+                else { return }
+                _ = await store.cancelCodemapArtifactDemand(revokedTicket)
+            }
+        )
+
+        let presentation = try await coordinator.withPresentation(
+            prepareAttempt: {
+                preparationCount.increment()
+                let fileIDs = preparationCount.value == 1 ? [revoked.id, stable.id] : [stable.id]
+                return WorkspaceCodemapPresentationAttempt(
+                    context: (),
+                    intent: .exact(fileIDs: fileIDs, completeRootSet: false),
+                    rootScope: .allLoaded,
+                    logicalRootDisplayNamesByRootID: [:],
+                    requestedCodemapCount: fileIDs.count
+                )
+            }
+        ) { _, presentation in
+            presentation
+        }
+
+        guard case .partial = presentation.coverage else {
+            return XCTFail(
+                "A valid sibling must remain partial after another requested codemap is revoked; coverage=\(presentation.coverage), entries=\(presentation.orderedEntries.map(\.fileID)), issues=\(presentation.issues), preparations=\(preparationCount.value), publications=\(publicationCount.value)"
+            )
+        }
+        XCTAssertEqual(presentation.orderedEntries.map(\.fileID), [stable.id])
+        XCTAssertTrue(presentation.issues.contains {
+            if case .publicationStale = $0 { return true }
+            return false
+        })
+        XCTAssertEqual(preparationCount.value, 2)
+        XCTAssertGreaterThanOrEqual(publicationCount.value, 1)
+    }
+
     func testOperationPresentationCancellationDuringPendingWaitReleasesOwnedDemandOnce() async throws {
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositoryFixture.makeRepository(
