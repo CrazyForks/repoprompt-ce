@@ -698,26 +698,29 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                 initialTab,
                 inWorkspaceID: activeWorkspace.id
             ))
-            window.promptManager.promptText = initialTab.promptText
 
             let committedPrompt = "Committed prompt"
             let committedSelection = StoredSelection(selectedPaths: [selectedFile.path])
             let commitGate = ContextBuilderRunGate()
+            let storedOnlyUpdateRecorder = ContextBuilderStoredOnlyUpdateRecorder()
             let committedSnapshotRecorder = ContextBuilderCommittedSnapshotRecorder()
             let followUpRecorder = ContextBuilderFollowUpInvocationRecorder()
             window.contextBuilderAgentViewModel.installRunTestHooks(
                 ContextBuilderAgentViewModel.RunTestHooks(
                     beforeProcessingProviderEvent: { [weak window] result, _ in
                         guard result.type == "content", let window else { return }
-                        await MainActor.run {
-                            guard var tab = window.workspaceManager.composeTab(for: identity) else { return }
+                        let updateSucceeded = await MainActor.run {
+                            guard var tab = window.workspaceManager.composeTab(for: identity) else {
+                                return false
+                            }
                             tab.promptText = committedPrompt
                             tab.selection = committedSelection
-                            _ = window.workspaceManager.updateComposeTabStoredOnly(
+                            return window.workspaceManager.updateComposeTabStoredOnly(
                                 tab,
                                 inWorkspaceID: identity.workspaceID
                             )
                         }
+                        await storedOnlyUpdateRecorder.record(updateSucceeded)
                     },
                     providerEventDisposition: nil,
                     teardownCompleted: nil,
@@ -774,6 +777,8 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
             let followUpInvocation = await followUpRecorder.snapshot()
             XCTAssertNil(followUpInvocation)
 
+            let storedOnlyUpdateResults = await storedOnlyUpdateRecorder.snapshot()
+            XCTAssertEqual(storedOnlyUpdateResults, [true])
             let storedTab = try XCTUnwrap(window.workspaceManager.composeTab(for: identity))
             XCTAssertEqual(storedTab.promptText, committedPrompt)
             XCTAssertEqual(storedTab.selection, committedSelection)
@@ -1453,6 +1458,18 @@ private actor ContextBuilderIngressBarrierFlushRecorder {
 
     func count(for rootID: UUID) -> Int {
         countsByRootID[rootID, default: 0]
+    }
+}
+
+private actor ContextBuilderStoredOnlyUpdateRecorder {
+    private var results: [Bool] = []
+
+    func record(_ result: Bool) {
+        results.append(result)
+    }
+
+    func snapshot() -> [Bool] {
+        results
     }
 }
 
