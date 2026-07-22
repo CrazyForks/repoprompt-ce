@@ -463,7 +463,7 @@ struct AgentMCPStartWorktreeCoordinator {
         let logicalRoot = try await logicalRoot(
             for: repo,
             explicitLogicalRoot: explicitLogicalRoot,
-            visibleRoots: visibleRoots
+            visibleRoots: discoveryRoots
         )
         return RepositoryContext(
             repo: repo,

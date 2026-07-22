@@ -2680,6 +2680,41 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             XCTAssertEqual(binding["logical_root_path"]?.stringValue, primaryFixture.repo.path, testCase.label)
             XCTAssertEqual(binding["worktree_root_path"]?.stringValue, descriptor.path, testCase.label)
         }
+
+        let nestedFixture = try makeGitFixture()
+        let nestedPrimary = nestedFixture.repo.appendingPathComponent("NestedPrimary", isDirectory: true)
+        try FileManager.default.createDirectory(at: nestedPrimary, withIntermediateDirectories: true)
+        let nestedWindow = try await lifecycleFixture.makeWindow(
+            roots: [nestedPrimary, nestedFixture.repo],
+            loadRoots: false
+        )
+        let loadedParent = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+            in: nestedWindow,
+            path: nestedFixture.repo.path
+        )
+        let loadedNestedPrimary = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+            in: nestedWindow,
+            path: nestedPrimary.path
+        )
+        let loadedRoots = await nestedWindow.promptManager.workspaceFileContextStore.rootRefs(scope: .visibleWorkspace)
+        XCTAssertEqual(loadedRoots.map(\.id), [loadedParent.id, loadedNestedPrimary.id])
+        XCTAssertEqual(nestedWindow.workspaceManager.activeWorkspace?.repoPaths.first, nestedPrimary.path)
+
+        let nestedService = makeAgentRunStartService(window: nestedWindow, sourceTabID: nil)
+        let nestedValue = try await nestedService.execute(args: [
+            "op": .string("start"),
+            "message": .string("git-style repository selector preserves declared nested primary root"),
+            "detach": .bool(true),
+            "timeout": .int(0),
+            "worktree": .string("@main"),
+            "worktree_repo_root": .string("@main")
+        ])
+        let nestedObject = try XCTUnwrap(nestedValue.objectValue)
+        let nestedBindings = try XCTUnwrap(nestedObject["worktree_bindings"]?.arrayValue)
+        let nestedBinding = try XCTUnwrap(nestedBindings.first?.objectValue)
+        XCTAssertEqual(nestedBindings.count, 1)
+        XCTAssertEqual(nestedBinding["logical_root_path"]?.stringValue, nestedPrimary.path)
+        XCTAssertEqual(nestedBinding["worktree_root_path"]?.stringValue, nestedPrimary.path)
     }
 
     func testAgentStartWorktreeSelectorsRejectCrossRepositoryMatchesForImplicitAndExplicitPrimaryRoot() async throws {
