@@ -10,6 +10,7 @@ import os
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -45,6 +46,7 @@ TARGET_ARCHITECTURES = {
     "aarch64-apple-darwin": "arm64",
     "x86_64-apple-darwin": "x86_64",
 }
+EXPECTED_DIRECTORY_MODE = 0o755
 
 
 class ContractError(RuntimeError):
@@ -233,15 +235,23 @@ def parse_codesign_metadata(details: str) -> dict[str, list[str]]:
     return fields
 
 
+def verify_directory_mode(path: Path, context: str) -> None:
+    mode = stat.S_IMODE(path.stat().st_mode)
+    if mode != EXPECTED_DIRECTORY_MODE:
+        raise ContractError(f"{context} directory mode must be 0755, got {mode:04o}: {path}")
+
+
 def snapshot_tree(root: Path) -> dict[str, dict[str, Any]]:
     if not root.is_dir() or root.is_symlink():
         raise ContractError(f"package root is not a real directory: {root}")
+    verify_directory_mode(root, "package root")
     snapshot: dict[str, dict[str, Any]] = {}
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root).as_posix()
         if path.is_symlink():
             raise ContractError(f"package contains an unsupported symbolic link: {relative}")
         if path.is_dir():
+            verify_directory_mode(path, f"package directory {relative}")
             snapshot[relative] = {"path": relative, "kind": "directory"}
         elif path.is_file():
             snapshot[relative] = {
@@ -390,6 +400,7 @@ def acquire_target(
     final.parent.mkdir(parents=True, exist_ok=True)
     temp = Path(tempfile.mkdtemp(prefix=f".{target}.", dir=final.parent))
     try:
+        temp.chmod(EXPECTED_DIRECTORY_MODE)
         expected_paths = {entry["path"] for entry in package["tree"]}
         safe_extract(archive, temp, expected_paths)
         verify_package(temp, target, manifest, lipo, codesign)
@@ -410,6 +421,7 @@ def verify_bundle(
 ) -> None:
     if not root.is_dir() or root.is_symlink():
         raise ContractError(f"Codex bundle root is not a real directory: {root}")
+    verify_directory_mode(root, "Codex bundle root")
     actual_targets = {path.name for path in root.iterdir()}
     expected_targets = set(targets)
     if actual_targets != expected_targets:
@@ -435,10 +447,13 @@ def stage_bundle(args: argparse.Namespace, manifest: dict[str, Any]) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     temp = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent))
     try:
+        temp.chmod(EXPECTED_DIRECTORY_MODE)
         for target in targets:
             source = cache_root / manifest["version"] / target
             verify_package(source, target, manifest, args.lipo, args.codesign)
-            shutil.copytree(source, temp / target)
+            staged_target = temp / target
+            shutil.copytree(source, staged_target)
+            staged_target.chmod(EXPECTED_DIRECTORY_MODE)
         verify_bundle(temp, targets, manifest, args.lipo, args.codesign)
         os.replace(temp, destination)
     except Exception:

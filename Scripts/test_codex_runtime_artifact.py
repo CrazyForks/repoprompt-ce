@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -21,6 +22,10 @@ TOOL = ROOT / "Scripts" / "codex_runtime_artifact.py"
 
 def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def directory_mode(path: Path) -> int:
+    return stat.S_IMODE(path.stat().st_mode)
 
 
 def write_executable(path: Path, content: str) -> None:
@@ -274,6 +279,46 @@ fi
             "ARCH=x86_64",
         )
         self.run_tool("verify-bundle", "--arch", "all", "--bundle", str(self.bundle))
+
+    def test_acquired_and_staged_package_roots_are_mode_0755(self) -> None:
+        self.acquire_all()
+        targets = ("aarch64-apple-darwin", "x86_64-apple-darwin")
+        for target in targets:
+            self.assertEqual(directory_mode(self.cache / "0.144.6" / target), 0o755)
+
+        self.run_tool(
+            "stage-bundle", "--arch", "all", "--cache-root", str(self.cache),
+            "--bundle", str(self.bundle),
+        )
+
+        self.assertEqual(directory_mode(self.bundle), 0o755)
+        for target in targets:
+            self.assertEqual(directory_mode(self.bundle / target), 0o755)
+
+    def test_verification_rejects_mode_0700_directories(self) -> None:
+        self.acquire_all()
+        package = self.cache / "0.144.6" / "aarch64-apple-darwin"
+        package.chmod(0o700)
+        invalid_package = self.run_tool(
+            "verify", "--arch", "arm64", "--package", str(package), expected=1,
+        )
+        self.assertIn("directory mode must be 0755", invalid_package.stderr)
+        self.assertIn("got 0700", invalid_package.stderr)
+        package.chmod(0o755)
+
+        self.run_tool(
+            "stage-bundle", "--arch", "all", "--cache-root", str(self.cache),
+            "--bundle", str(self.bundle),
+        )
+        for directory in (self.bundle, self.bundle / "x86_64-apple-darwin" / "codex-resources"):
+            with self.subTest(directory=directory.relative_to(self.bundle)):
+                directory.chmod(0o700)
+                invalid_bundle = self.run_tool(
+                    "verify-bundle", "--arch", "all", "--bundle", str(self.bundle), expected=1,
+                )
+                self.assertIn("directory mode must be 0755", invalid_bundle.stderr)
+                self.assertIn("got 0700", invalid_bundle.stderr)
+                directory.chmod(0o755)
 
     def test_verify_universal_bundle_rejects_missing_or_extra_target(self) -> None:
         self.acquire_all()
