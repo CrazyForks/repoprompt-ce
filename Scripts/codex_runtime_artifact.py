@@ -228,7 +228,7 @@ def parse_codesign_metadata(details: str) -> dict[str, list[str]]:
         if "=" not in line:
             continue
         key, value = line.split("=", 1)
-        if key in {"Identifier", "TeamIdentifier", "Authority"}:
+        if key in {"Identifier", "TeamIdentifier", "Authority", "Timestamp"}:
             fields.setdefault(key, []).append(value)
     return fields
 
@@ -320,7 +320,8 @@ def verify_package(
             )
         if not re.search(r"^CodeDirectory .*flags=.*\([^)]*\bruntime\b[^)]*\)", details, re.MULTILINE):
             raise ContractError(f"{target}: {policy['path']} is missing the hardened-runtime signing flag")
-        if not re.search(r"^Timestamp=.+", details, re.MULTILINE):
+        timestamps = fields.get("Timestamp", [])
+        if len(timestamps) != 1 or not timestamps[0].strip() or timestamps[0].strip().casefold() == "none":
             raise ContractError(f"{target}: {policy['path']} is missing a trusted signing timestamp")
 
 

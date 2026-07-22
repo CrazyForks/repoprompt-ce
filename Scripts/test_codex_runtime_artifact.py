@@ -74,7 +74,7 @@ Authority=$authority
 TeamIdentifier=$team_identifier
 EOF
 if [[ "${FAKE_OMIT_TIMESTAMP:-0}" != "1" ]]; then
-    printf 'Timestamp=Jul 18, 2026 at 22:31:39\n' >&2
+    printf 'Timestamp=%s\n' "${FAKE_TIMESTAMP:-Jul 18, 2026 at 22:31:39}" >&2
 fi
 """,
         )
@@ -479,6 +479,22 @@ fi
             env={"FAKE_OMIT_TIMESTAMP": "1"}, expected=1,
         )
         self.assertIn("trusted signing timestamp", no_timestamp.stderr)
+
+    def test_none_signing_timestamps_are_rejected(self) -> None:
+        self.acquire_all()
+        package = self.cache / "0.144.6" / "aarch64-apple-darwin"
+        for timestamp in ("none", "  NoNe  "):
+            with self.subTest(timestamp=timestamp):
+                result = self.run_tool(
+                    "verify",
+                    "--arch",
+                    "arm64",
+                    "--package",
+                    str(package),
+                    env={"FAKE_TIMESTAMP": timestamp},
+                    expected=1,
+                )
+                self.assertIn("trusted signing timestamp", result.stderr)
 
     def test_signing_metadata_prefix_collisions_are_rejected(self) -> None:
         self.acquire_all()
